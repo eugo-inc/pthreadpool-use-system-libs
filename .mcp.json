@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "GitHits": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "githits@latest",
+        "mcp",
+        "start"
+      ]
+    },
+    "eugo-kb": {
+      "command": "docker",
+      "args": [
+        "exec",
+        "-i",
+        "eugo-kb-tools",
+        "/opt/miniforge3/envs/eugo_kb/bin/eugo-mcp"
+      ]
+    }
+  }
+}
