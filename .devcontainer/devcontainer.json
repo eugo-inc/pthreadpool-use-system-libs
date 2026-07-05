@@ -1,0 +1,43 @@
+{
+    "name": "${localWorkspaceFolderBasename} (eugo toolchain)",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "options": [
+            "--platform=linux/arm64"
+        ]
+    },
+    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    "runArgs": [
+        "--platform=linux/arm64",
+        "--shm-size=12g",
+        "--runtime=nvidia",
+        "--cap-add=SYS_PTRACE",
+        "--security-opt=seccomp=unconfined"
+    ],
+    "mounts": [
+        "source=eugo-claude-config,target=/root/.claude,type=volume",
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+    ],
+    "postCreateCommand": "git config --global --add safe.directory ${containerWorkspaceFolder}; bash .devcontainer/post-create.sh",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "llvm-vs-code-extensions.vscode-clangd",
+                "ms-vscode.cmake-tools",
+                "mesonbuild.mesonbuild",
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-python.debugpy",
+                "charliermarsh.ruff",
+                "tamasfe.even-better-toml",
+                "redhat.vscode-yaml",
+                "anthropic.claude-code",
+                "github.vscode-pull-request-github"
+            ],
+            "settings": {
+                "C_Cpp.intelliSenseEngine": "disabled",
+                "terminal.integrated.defaultProfile.linux": "bash"
+            }
+        }
+    }
+}
