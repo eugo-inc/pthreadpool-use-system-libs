@@ -1,7 +1,7 @@
 # CLAUDE.md
 
-Eugo fork of google/pthreadpool, branch `eugo-main` (older skill text says
-`master`; trust git). Reason to exist: `USE_SYSTEM_*` CMake options + an
+Eugo fork of google/pthreadpool, branch `eugo-main`.
+Reason to exist: `USE_SYSTEM_*` CMake options + an
 installed package config (`lib*/cmake/pthreadpool/pthreadpool-config.cmake`,
 written by `INSTALL(EXPORT ...)` at CMakeLists.txt:223-226; the file
 configured from `cmake/pthreadpool-config.cmake.in` stays in the build dir,

@@ -1,6 +1,6 @@
 ---
 name: eugo-upstream-merge
-description: Merge upstream google/pthreadpool into the Eugo fork eugo-inc/pthreadpool-use-system-libs (branch master). Covers the fork's divergence inventory, the merge-commit-only recipe, and the protomolecule commit-pin bump. Activates on "merge upstream", "upstream sync", "pthreadpool sync", "update pthreadpool fork", "bump pthreadpool".
+description: Merge upstream google/pthreadpool into the Eugo fork eugo-inc/pthreadpool-use-system-libs (branch eugo-main). Covers the fork's divergence inventory, the merge-commit-only recipe, and the protomolecule commit-pin bump. Activates on "merge upstream", "upstream sync", "pthreadpool sync", "update pthreadpool fork", "bump pthreadpool".
 ---
 
 # Merging upstream pthreadpool into eugo-inc/pthreadpool-use-system-libs
@@ -9,10 +9,10 @@ description: Merge upstream google/pthreadpool into the Eugo fork eugo-inc/pthre
 
 - Upstream is https://github.com/google/pthreadpool (`main`). It was originally
   Maratyszcza/pthreadpool; Google took over and GitHub support re-parented this fork.
-- Canonical branch here is `master` (no eugo-main). Prior syncs are merge commits
+- Canonical branch here is `eugo-main`. Prior syncs are merge commits
   from `google:main` (e.g. `be3c5e9`, `8c5da84`).
 - Consumer: `protomolecule/dependencies/native/pthreadpool` (meta.json pins
-  `kind: git_commit`, `branch: master`, currently `8c5da84`). The pin decouples
+  `kind: git_commit`, `branch: eugo-main`, currently `8c5da84`). The pin decouples
   merge from adoption: merging/pushing here changes nothing downstream until the
   meta.json commit is bumped. Its `setup` downloads the GitHub archive tarball for
   the pinned commit, so the commit MUST be pushed to GitHub before it is pinned.
@@ -56,7 +56,7 @@ same adoption PR.
 git clone git@github.com:eugo-inc/pthreadpool-use-system-libs.git && cd pthreadpool-use-system-libs
 git remote add upstream https://github.com/google/pthreadpool.git
 git fetch upstream
-git checkout -b <user>/feat/MM-DD-YY-merge-upstream master
+git checkout -b <user>/feat/MM-DD-YY-merge-upstream eugo-main
 git merge upstream/main        # resolve conflicts per inventory above
 ```
 
@@ -65,15 +65,15 @@ git merge upstream/main        # resolve conflicts per inventory above
   side everywhere else (src/, include/, BUILD.bazel, tests).
 - Sanity check: configure with `-DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_LIBRARY_TYPE=shared`
   and confirm the install tree contains `lib/cmake/pthreadpool/pthreadpool-config.cmake`.
-- Open a PR to `master` and land it with the MERGE-COMMIT method only. Squash
+- Open a PR to `eugo-main` and land it with the MERGE-COMMIT method only. Squash
   destroys the upstream ancestry that future `git merge upstream/main` relies on.
 
 ## Post-merge adoption (protomolecule)
 
-1. Push the merged `master` to GitHub FIRST -- the setup script curls
+1. Push the merged `eugo-main` to GitHub FIRST -- the setup script curls
    `https://github.com/eugo-inc/pthreadpool-use-system-libs/archive/<commit>.tar.gz`;
    an unpushed commit 404s the build.
 2. Bump `protomolecule/dependencies/native/pthreadpool/meta.json` -> `version.commit`
-   to the new merge-commit SHA on `master`.
+   to the new merge-commit SHA on `eugo-main`.
 3. Verify the four `eugo_patch_or_die` regexes in `setup` still match, and rebuild
    the coupled set if versions moved: cpuinfo, FP16, XNNPACK, then pytorch.

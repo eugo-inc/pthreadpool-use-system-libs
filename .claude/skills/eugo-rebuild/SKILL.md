@@ -23,7 +23,7 @@ pin bump + rebuilding consumers).
 
 Nothing reaches any eugo build until BOTH happen:
 
-1. The commit is pushed to GitHub `master` (the protomolecule `setup` curls the
+1. The commit is pushed to GitHub `eugo-main` (the protomolecule `setup` curls the
    archive tarball for the pinned commit - unpushed SHAs 404).
 2. `protomolecule/dependencies/native/pthreadpool/meta.json` `version.commit`
    is bumped to that SHA.

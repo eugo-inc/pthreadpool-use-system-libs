@@ -18,7 +18,7 @@ is a failed build, even if `libpthreadpool.so` compiled fine.
 Ground truth: `protomolecule/dependencies/native/pthreadpool/{meta.json,setup}`.
 
 1. **Fetch**: curls `https://github.com/eugo-inc/pthreadpool-use-system-libs/archive/<commit>.tar.gz`
-   for the commit pinned in `meta.json` (`version.commit`, branch `master`).
+   for the commit pinned in `meta.json` (`version.commit`, branch `eugo-main`).
    Unpushed commits 404 - always push before bumping the pin.
 2. **Patch**: four `eugo_patch_or_die` regexes rewrite the "Language options"
    block: `SET(CMAKE_C_STANDARD 11)` -> `${EUGO_C_STANDARD}`, extensions NO -> YES,
