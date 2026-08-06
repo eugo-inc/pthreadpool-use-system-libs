@@ -1,11 +1,24 @@
 # eugo toolchain dev container for eugo-inc forks — develop/build the fork with the eugo
 # toolchain (clang/cmake/meson/cuda) + GPU + Claude Code/MCP. Image coords are ARGs; override
-# via devcontainer.json build.args. Pulling this image needs ECR access to account 411727469413.
-ARG EUGO_ECR_ACCOUNT=411727469413
+# via devcontainer.json build.args.
+#
+# EUGO_ECR_ACCOUNT is deliberately DEFAULT-LESS (2026-07-27). This file is PUBLISHED VERBATIM into
+# eugo-inc forks by `open-fork-prs.sh`, several of which are (or were) public — a baked-in default
+# put our AWS account id in 7 public repos across 13 branches before anyone noticed. Supply it from
+# your environment: `export EUGO_ECR_ACCOUNT=…`, which devcontainer.json forwards via
+# `${localEnv:EUGO_ECR_ACCOUNT}`. An unset value fails the build loudly at the FROM line, which is
+# the intended behaviour — a missing account is an operator setup error, not something to guess.
+#
+# 2026-08-06: EUGO_IMAGE_REPO / _TAG / _DIGEST are now DEFAULT-LESS for the same reason. They used to
+# hardcode one internal repository and tag by name, which (a) is exactly what `build.sh`'s identifier gate
+# refuses to publish, and (b) went stale the moment the fleet repinned onto a different registry account,
+# so `open-fork-prs.sh` would have pushed the OLD base back over forks that had already moved. Supply all
+# four from your environment; an unset value fails loudly at FROM, which is the intended behaviour.
+ARG EUGO_ECR_ACCOUNT
 ARG EUGO_ECR_REGION=us-east-1
-ARG EUGO_IMAGE_REPO=slava_mega_test
-ARG EUGO_IMAGE_TAG=ray-meson-perf-debug
-ARG EUGO_IMAGE_DIGEST=sha256:c2b359973236d8ccf042f69abf60324cc7a26a51e1bdb93b5ccb3cf4cc95fff7
+ARG EUGO_IMAGE_REPO
+ARG EUGO_IMAGE_TAG
+ARG EUGO_IMAGE_DIGEST
 FROM ${EUGO_ECR_ACCOUNT}.dkr.ecr.${EUGO_ECR_REGION}.amazonaws.com/${EUGO_IMAGE_REPO}:${EUGO_IMAGE_TAG}@${EUGO_IMAGE_DIGEST}
 
 # The base already ships node/npm (for the GitHits MCP) but not the Docker CLI — add the static
@@ -16,11 +29,14 @@ RUN <<EOT
 set -eux
 curl -fsSL "https://download.docker.com/linux/static/stable/aarch64/docker-${DOCKER_CLI_VERSION}.tgz" \
   | tar xz -C /usr/local/bin --strip-components=1 docker/docker
-# The base's BASH_ENV sources /usr/local/bin/eugo_shared.inc, which is a DANGLING symlink in a
-# fork (the eugo scripts aren't present) — every non-interactive shell warns. Replace it with an
-# empty no-op file (rm the dangling link first; writing through it would ENOENT).
-rm -f /usr/local/bin/eugo_shared.inc
-: > /usr/local/bin/eugo_shared.inc
+# The base's BASH_ENV sources /usr/local/bin/eugo_shared.inc. On some bases that is a DANGLING symlink
+# (the eugo scripts aren't present in a fork) and every non-interactive shell warns; on the umbrella
+# images it is a REAL ~70 KB helper library, so blanking it unconditionally destroys a shipped file.
+# No-op it ONLY in the dangling case (`-L` and not `-e` == symlink with no target).
+if [ -L /usr/local/bin/eugo_shared.inc ] && [ ! -e /usr/local/bin/eugo_shared.inc ]; then
+  rm -f /usr/local/bin/eugo_shared.inc
+  : > /usr/local/bin/eugo_shared.inc
+fi
 docker --version
 node --version
 EOT
