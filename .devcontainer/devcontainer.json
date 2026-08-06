@@ -2,6 +2,12 @@
     "name": "${localWorkspaceFolderBasename} (eugo toolchain)",
     "build": {
         "dockerfile": "Dockerfile",
+        "args": {
+            "EUGO_ECR_ACCOUNT": "${localEnv:EUGO_ECR_ACCOUNT}",
+            "EUGO_IMAGE_REPO": "${localEnv:EUGO_IMAGE_REPO}",
+            "EUGO_IMAGE_TAG": "${localEnv:EUGO_IMAGE_TAG}",
+            "EUGO_IMAGE_DIGEST": "${localEnv:EUGO_IMAGE_DIGEST}"
+        },
         "options": [
             "--platform=linux/arm64"
         ]
