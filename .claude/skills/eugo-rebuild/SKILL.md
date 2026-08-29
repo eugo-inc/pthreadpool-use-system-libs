@@ -42,4 +42,11 @@ params:
 
 - Merging or committing here is always safe for downstream; the pin decouples adoption. Conversely, a local rebuild proves nothing about downstream until the pin moves.
 - The bazel/confu/configure.py files are upstream's build flows we never consume — keep them in sync with upstream on merges, never build with them.
+
+<!-- migrated verbatim from .claude/skills/eugo-rebuild/SKILL.md @ f119580 (athena wave 2, 2026-08-29) -->
+### Related
+
+- eugo-build-and-test - canonical flags, artifact checklist, consumer smoke
+- eugo-cmake-review - pre-commit checklist for build-file changes
+- eugo-upstream-merge - merge recipe + full pin-bump/adoption flow
 <!-- eugo:keep:end -->

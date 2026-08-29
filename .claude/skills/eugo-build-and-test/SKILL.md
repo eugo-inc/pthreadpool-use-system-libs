@@ -43,4 +43,11 @@ params:
 
 - A build that does not produce `lib/cmake/pthreadpool/pthreadpool-config.cmake` is a FAILED build even if `libpthreadpool.so` compiled fine — the config is the fork's whole product (pytorch's `find_package(pthreadpool CONFIG REQUIRED)` only resolves because of it).
 - Outside the eugo container `FIND_PACKAGE(FXdiv REQUIRED)` fails: install FXdiv the protomolecule way (native/fxdiv, from the ConnorBaker/FXdiv fork that adds an installable CMake config — upstream FXdiv has none) or drop `USE_SYSTEM_FXDIV` for a compile-only check (network required; bypasses the system-libs path this fork exists to provide).
+
+<!-- migrated verbatim from .claude/skills/eugo-build-and-test/SKILL.md @ f119580 (athena wave 2, 2026-08-29) -->
+### Related
+
+- eugo-rebuild - what a given diff actually requires
+- eugo-cmake-review - pre-commit checklist for CMakeLists.txt changes
+- eugo-upstream-merge - divergence inventory + the protomolecule pin-bump flow
 <!-- eugo:keep:end -->
