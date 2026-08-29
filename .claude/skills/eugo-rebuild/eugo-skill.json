@@ -1,0 +1,25 @@
+{
+  "owner": "pthreadpool-use-system-libs",
+  "group": "eugo",
+  "managed_by": "adapter",
+  "adapts": "eugo-rebuild-base",
+  "base_tree_hash": "963b7aeb586317144e102b3c8841bd83987a08bc93c6735c3508f6c56ca4d710",
+  "base_source_commit": "807102309c4527a91ab2f3aa651a464e4beca0e0",
+  "generated_by": "eugo-skills pull --as-adapter",
+  "generated_at": "2026-08-29T15:28:21+00:00",
+  "params": {
+    "configure_cmd": "the canonical-flag configure from eugo-build-and-test (`cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=\"$PWD/out\" -DPTHREADPOOL_LIBRARY_TYPE=shared -DPTHREADPOOL_SYNC_PRIMITIVE=futex -DPTHREADPOOL_ALLOW_DEPRECATED_API=ON -DUSE_SYSTEM_LIBS=ON -DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_BUILD_TESTS=OFF -DPTHREADPOOL_BUILD_BENCHMARKS=OFF`)",
+    "test_cmd": "`ctest --test-dir build` with `-DPTHREADPOOL_BUILD_TESTS=ON -DUSE_SYSTEM_GOOGLETEST=ON` for src/include changes; the /tmp/ptp-smoke consumer `find_package(pthreadpool CONFIG REQUIRED)` build from eugo-build-and-test for the export",
+    "invariants": [
+      "decision table (first matching row wins): docs, .devcontainer/, .mcp.json, .claude/, .github/ -> nothing (not part of the built artifact); `CMakeLists.txt`, `cmake/*.cmake`, `cmake/pthreadpool-config.cmake.in` -> configure check with the canonical flags, then full build + install-tree check, and run eugo-cmake-review; `src/**`, `include/**` -> full build with tests ON + `ctest --test-dir build`; `test/**`, `bench/**`, `examples/**` only -> build with tests/benchmarks ON and run them (does not affect the shipped library); `BUILD.bazel`, `MODULE.bazel`, `WORKSPACE`, `confu.yaml`, `configure.py` -> nothing for eugo (we only consume the CMake flow; keep in sync with upstream on merges)."
+    ],
+    "fork_name": "eugo-inc/pthreadpool-use-system-libs, branch eugo-main (fork of google/pthreadpool)",
+    "build_system": "cmake + ninja; the local build takes seconds, so the cheap/expensive split is not compile time — it is whether the change must propagate downstream (push + protomolecule pin bump + rebuilding the coupled consumers)",
+    "build_cmd": "`cmake --build build && cmake --install build`, then the install-tree check (`test -f out/lib*/cmake/pthreadpool/pthreadpool-config.cmake`)",
+    "pins": [
+      "protomolecule/dependencies/native/pthreadpool/meta.json `version.commit` — nothing reaches any eugo build until BOTH the commit is pushed to GitHub eugo-main (the setup curls the archive tarball; unpushed SHAs 404) AND the pin is bumped; a local rebuild proves nothing downstream until the pin moves. If the `SET(CMAKE_C_STANDARD 11)` / `SET(CMAKE_*_EXTENSIONS NO)` lines were touched, verify the four `eugo_patch_or_die` regexes in the protomolecule setup still match BEFORE bumping.",
+      "after a pin bump, rebuild the coupled set if their pinned versions moved together (pytorch `.eugo/system_dependencies.md`): cpuinfo, FP16, XNNPACK, then pytorch."
+    ]
+  },
+  "aliases": []
+}

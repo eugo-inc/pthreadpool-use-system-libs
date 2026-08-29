@@ -4,19 +4,24 @@
       "command": "npx",
       "args": [
         "-y",
-        "githits@latest",
+        "githits@0.11.2",
         "mcp",
         "start"
       ]
     },
     "eugo-kb": {
-      "command": "docker",
+      "command": "bash",
       "args": [
-        "exec",
-        "-i",
-        "eugo-kb-tools",
-        "/opt/miniforge3/envs/eugo_kb/bin/eugo-mcp"
-      ]
+        "-c",
+        "B=\"\"; HF=\"\"; for F in \"${CLAUDE_PROJECT_DIR:-.}/.claude/eugo-mcp-headers.txt\" \"$HOME/.config/eugo/mcp-headers.txt\"; do if [ -z \"$B\" ] && [ -f \"$F\" ]; then B=\"$(sed -n 's/^Authorization: *Bearer *//p' \"$F\" | head -n 1)\"; HF=\"$F\"; fi; done; [ -n \"$B\" ] || B=\"$EUGO_MCP_TOKEN\"; if docker exec eugo-kb-tools true >/dev/null 2>&1; then if [ -n \"$B\" ]; then E=\"${XDG_RUNTIME_DIR:-$HOME/.config/eugo}/eugo-mcp-stdio.env\"; mkdir -p \"$(dirname \"$E\")\" 2>/dev/null; (umask 077; printf 'EUGO_MCP_BEARER=%s\\n' \"$B\" > \"$E\") 2>/dev/null && exec docker exec -i --env-file \"$E\" eugo-kb-tools /opt/miniforge3/envs/eugo_kb/bin/eugo-mcp; fi; exec docker exec -i eugo-kb-tools /opt/miniforge3/envs/eugo_kb/bin/eugo-mcp; fi; if [ -n \"$HF\" ]; then exec npx -y mcp-remote@0.8.2 https://kb.eugo.io:8443/mcp --header-file \"$HF\"; fi; exec npx -y mcp-remote@0.8.2 https://kb.eugo.io:8443/mcp --header 'Authorization: Bearer ${EUGO_MCP_TOKEN}'"
+      ],
+      "env": {
+        "EUGO_MCP_TOKEN": "${EUGO_MCP_TOKEN:-}"
+      }
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/"
     }
   }
 }

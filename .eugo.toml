@@ -1,0 +1,106 @@
+# pthreadpool-use-system-libs — eugo-skills consumer config (hub: eugo-inc/athena).
+#
+# [skills.adapters."<name>"] carries the fork-specific values the four fork-kit
+# adapters render into their "## 2. Parameters" block; the workflow lives in the
+# matching *-base skill served by the eugo-kb MCP server. Regenerate with:
+#   eugo-skills fork-kit --into . --from <athena>
+# Lessons the params cannot carry live in each adapter's
+# <!-- eugo:keep:start/end --> region, preserved verbatim on regeneration.
+# This fork carries NO @EUGO_CHANGE markers — the divergence is CMakeLists.txt +
+# cmake/pthreadpool-config.cmake.in, catalogued in the eugo-upstream-merge adapter.
+
+[skills.adapters."eugo-build-and-test"]
+fork_name = "eugo-inc/pthreadpool-use-system-libs, branch eugo-main (fork of google/pthreadpool, upstream main; originally Maratyszcza/pthreadpool — Google took over and GitHub re-parented this fork)"
+build_system = "cmake + ninja — the fork exists for ONE reason: upstream cannot use a system FXdiv and does not install a CMake package config; our CMakeLists.txt adds `USE_SYSTEM_*` options and export/install machinery so consumers can `find_package(pthreadpool CONFIG REQUIRED)` (pytorch does, via `USE_SYSTEM_PTHREADPOOL=ON`). A build that does not produce `lib/cmake/pthreadpool/pthreadpool-config.cmake` is a FAILED build even if libpthreadpool.so compiled"
+configure_cmd = "`cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=\"$PWD/out\" -DPTHREADPOOL_LIBRARY_TYPE=shared -DPTHREADPOOL_SYNC_PRIMITIVE=futex -DPTHREADPOOL_ALLOW_DEPRECATED_API=ON -DUSE_SYSTEM_LIBS=ON -DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_BUILD_TESTS=OFF -DPTHREADPOOL_BUILD_BENCHMARKS=OFF` in the eugo container (it has the system FXdiv package — protomolecule native/fxdiv, from the ConnorBaker/FXdiv fork that adds an installable CMake config; outside the container `FIND_PACKAGE(FXdiv REQUIRED)` fails — install FXdiv the same way, or drop USE_SYSTEM_FXDIV to let CMake download it: network required and it bypasses the system-libs path, fine for compile checks only)"
+build_cmd = "`cmake --build build && cmake --install build` after the configure above (the whole build takes seconds — never skip it). protomolecule flow (`dependencies/native/pthreadpool/{meta.json,setup}`): (1) curl `https://github.com/eugo-inc/pthreadpool-use-system-libs/archive/<commit>.tar.gz` for meta.json's version.commit (unpushed commits 404 — push before bumping); (2) four `eugo_patch_or_die` regexes rewrite the \"Language options\" block — `SET(CMAKE_C_STANDARD 11)` -> `${EUGO_C_STANDARD}`, extensions NO -> YES, same for CXX (NORMAL variables that would otherwise shadow the -DCMAKE_*_STANDARD cache entries from EUGO_CMAKE_COMMON_OPTIONS); (3) `PTHREADPOOL_ENABLE_FASTPATH=ON` on x86_64, OFF on aarch64; (4) `cmake .. ${EUGO_CMAKE_COMMON_OPTIONS}` + the canonical flags (`-DPTHREADPOOL_LIBRARY_TYPE=shared -DPTHREADPOOL_SYNC_PRIMITIVE=futex -DPTHREADPOOL_ALLOW_DEPRECATED_API=ON -DUSE_SYSTEM_LIBS=ON -DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_BUILD_TESTS=OFF -DPTHREADPOOL_BUILD_BENCHMARKS=OFF`), then `ninja && ninja install`"
+test_cmd = "unit tests: add `-DPTHREADPOOL_BUILD_TESTS=ON -DUSE_SYSTEM_GOOGLETEST=ON` and run `ctest --test-dir build` (two suites: `pthreadpool`, `pthreadpool-cxx`). Consumer smoke — proves the export resolves, which is the fork's job: in /tmp/ptp-smoke write a CMakeLists.txt (`cmake_minimum_required(VERSION 3.5)`, `project(s C)`, `find_package(pthreadpool CONFIG REQUIRED)`, `add_executable(s s.c)`, `target_link_libraries(s pthreadpool)`) and `s.c` (`#include <pthreadpool.h>` / `int main(void){pthreadpool_t p=pthreadpool_create(2);pthreadpool_destroy(p);return 0;}`), then `cmake -B b -G Ninja -DCMAKE_PREFIX_PATH=<install-prefix> && cmake --build b && ./b/s`"
+artifacts_note = "install-tree checklist under the prefix (libdir may be lib or lib64): `lib*/libpthreadpool.so`; `include/pthreadpool.h`; `lib*/cmake/pthreadpool/pthreadpool-config.cmake` AND `pthreadpoolTargets.cmake` (the config is generated from `cmake/pthreadpool-config.cmake.in`, which must keep its `find_dependency(FXdiv)` line)"
+invariants = [
+  "the four protomolecule patch anchors `SET(CMAKE_C_STANDARD 11)`, `SET(CMAKE_C_EXTENSIONS NO)`, `SET(CMAKE_CXX_STANDARD 11)`, `SET(CMAKE_CXX_EXTENSIONS NO)` must match `eugo_patch_or_die` exactly — a reworked Language-options block fails the downstream build loudly at patch time; update the setup regexes in the same adoption PR.",
+  "the canonical flag set must keep working: PTHREADPOOL_LIBRARY_TYPE=shared, PTHREADPOOL_SYNC_PRIMITIVE=futex (Linux), PTHREADPOOL_ALLOW_DEPRECATED_API=ON, USE_SYSTEM_LIBS=ON + USE_SYSTEM_FXDIV=ON, tests/benchmarks OFF, PTHREADPOOL_ENABLE_FASTPATH overridable per arch (ON x86_64 / OFF aarch64).",
+  "`cmake/pthreadpool-config.cmake.in` keeps `find_dependency(FXdiv)` — removing it breaks pytorch's `find_package(pthreadpool CONFIG REQUIRED)` at pytorch-configure time, not here.",
+]
+pins = [
+  "protomolecule/dependencies/native/pthreadpool/meta.json `version.commit` (kind git_commit, branch eugo-main) — the setup curls the archive tarball for the pinned commit, so push to GitHub eugo-main BEFORE bumping; merging here changes nothing downstream until the pin moves.",
+  "version coupling (pytorch `.eugo/system_dependencies.md` §3): XNNPACK <-> cpuinfo <-> pthreadpool <-> FP16 — a pthreadpool bump may force XNNPACK and friends to move together; rebuild the coupled set in order cpuinfo, FP16, XNNPACK, then pytorch (USE_SYSTEM_PTHREADPOOL=ON, @EUGO_CHANGE in pytorch cmake/Dependencies.cmake).",
+]
+
+[skills.adapters."eugo-rebuild"]
+fork_name = "eugo-inc/pthreadpool-use-system-libs, branch eugo-main (fork of google/pthreadpool)"
+build_system = "cmake + ninja; the local build takes seconds, so the cheap/expensive split is not compile time — it is whether the change must propagate downstream (push + protomolecule pin bump + rebuilding the coupled consumers)"
+configure_cmd = "the canonical-flag configure from eugo-build-and-test (`cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=\"$PWD/out\" -DPTHREADPOOL_LIBRARY_TYPE=shared -DPTHREADPOOL_SYNC_PRIMITIVE=futex -DPTHREADPOOL_ALLOW_DEPRECATED_API=ON -DUSE_SYSTEM_LIBS=ON -DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_BUILD_TESTS=OFF -DPTHREADPOOL_BUILD_BENCHMARKS=OFF`)"
+build_cmd = "`cmake --build build && cmake --install build`, then the install-tree check (`test -f out/lib*/cmake/pthreadpool/pthreadpool-config.cmake`)"
+test_cmd = "`ctest --test-dir build` with `-DPTHREADPOOL_BUILD_TESTS=ON -DUSE_SYSTEM_GOOGLETEST=ON` for src/include changes; the /tmp/ptp-smoke consumer `find_package(pthreadpool CONFIG REQUIRED)` build from eugo-build-and-test for the export"
+pins = [
+  "protomolecule/dependencies/native/pthreadpool/meta.json `version.commit` — nothing reaches any eugo build until BOTH the commit is pushed to GitHub eugo-main (the setup curls the archive tarball; unpushed SHAs 404) AND the pin is bumped; a local rebuild proves nothing downstream until the pin moves. If the `SET(CMAKE_C_STANDARD 11)` / `SET(CMAKE_*_EXTENSIONS NO)` lines were touched, verify the four `eugo_patch_or_die` regexes in the protomolecule setup still match BEFORE bumping.",
+  "after a pin bump, rebuild the coupled set if their pinned versions moved together (pytorch `.eugo/system_dependencies.md`): cpuinfo, FP16, XNNPACK, then pytorch.",
+]
+invariants = [
+  "decision table (first matching row wins): docs, .devcontainer/, .mcp.json, .claude/, .github/ -> nothing (not part of the built artifact); `CMakeLists.txt`, `cmake/*.cmake`, `cmake/pthreadpool-config.cmake.in` -> configure check with the canonical flags, then full build + install-tree check, and run eugo-cmake-review; `src/**`, `include/**` -> full build with tests ON + `ctest --test-dir build`; `test/**`, `bench/**`, `examples/**` only -> build with tests/benchmarks ON and run them (does not affect the shipped library); `BUILD.bazel`, `MODULE.bazel`, `WORKSPACE`, `confu.yaml`, `configure.py` -> nothing for eugo (we only consume the CMake flow; keep in sync with upstream on merges).",
+]
+
+[skills.adapters."eugo-upstream-merge"]
+fork_name = "eugo-inc/pthreadpool-use-system-libs, branch eugo-main (fork of google/pthreadpool — prior syncs are merge commits from google:main, e.g. be3c5e9, 8c5da84)"
+upstream_remote = "https://github.com/google/pthreadpool.git (remote name `upstream`)"
+upstream_ref = "upstream/main"
+invariants = [
+  "divergence inventory (protect in conflicts): (1) `CMakeLists.txt` — the reason the fork exists (from Maratyszcza PR #27 / ConnorBaker's use-system-libs work, adapted): `OPTION(USE_SYSTEM_LIBS / USE_SYSTEM_FXDIV / USE_SYSTEM_GOOGLETEST / USE_SYSTEM_GOOGLEBENCHMARK ...)` near the top; `FIND_PACKAGE(FXdiv REQUIRED)` / `FIND_PACKAGE(GTest)` / `FIND_PACKAGE(benchmark)` branches guarding each Download*.cmake path plus `AND NOT USE_SYSTEM_*` guards on the ADD_SUBDIRECTORY fallbacks; the export/install machinery — `pthreadpool_interface` gets BUILD_INTERFACE/INSTALL_INTERFACE includes and is installed into `${CMAKE_PROJECT_NAME}Targets`, `CONFIGURE_PACKAGE_CONFIG_FILE` + `INSTALL(EXPORT ...)` emit `lib/cmake/pthreadpool/pthreadpool-config.cmake`; (2) `cmake/pthreadpool-config.cmake.in` — eugo-added: `find_dependency(FXdiv)` then includes pthreadpoolTargets.cmake; (3) `.devcontainer/` (Dockerfile, devcontainer.json, post-create.sh), `.mcp.json`, `.claude/`, `.eugo.toml` — eugo infra, no upstream counterpart, keep ours; (4) NO `@EUGO_CHANGE` annotations exist in this repo — the divergence is only discoverable via `git log` and this inventory.",
+  "fragile coupling with the consumer: protomolecule's `setup` runs `eugo_patch_or_die` regexes against `SET(CMAKE_C_STANDARD 11)`, `SET(CMAKE_C_EXTENSIONS NO)`, `SET(CMAKE_CXX_STANDARD 11)`, `SET(CMAKE_CXX_EXTENSIONS NO)` in CMakeLists.txt; if upstream reworks those lines the downstream build fails loudly at patch time — update the setup regexes in the same adoption PR.",
+  "pytorch consumes the installed package via `USE_SYSTEM_PTHREADPOOL=ON` -> `find_package(pthreadpool CONFIG REQUIRED)` (@EUGO_CHANGE in pytorch cmake/Dependencies.cmake); that CONFIG file only exists because of this fork.",
+]
+pins = [
+  "protomolecule/dependencies/native/pthreadpool/meta.json `version.commit` (kind git_commit, branch eugo-main) — push the merged eugo-main to GitHub FIRST (the setup curls the archive tarball; an unpushed commit 404s), then bump to the new merge-commit SHA, verify the four eugo_patch_or_die regexes still match, and rebuild the coupled set if versions moved: cpuinfo, FP16, XNNPACK, then pytorch (XNNPACK <-> cpuinfo <-> pthreadpool <-> FP16 coupling, pytorch .eugo/system_dependencies.md §3 — check XNNPACK's pinned commit expectations).",
+]
+build_cmd = "configure with `-DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_LIBRARY_TYPE=shared` (the canonical flags from eugo-build-and-test) and build + install"
+test_cmd = "confirm the install tree contains `lib*/cmake/pthreadpool/pthreadpool-config.cmake`; the /tmp/ptp-smoke consumer build; `ctest --test-dir build` with tests ON for src/include conflicts"
+merge_notes = [
+  "`git remote add upstream https://github.com/google/pthreadpool.git && git fetch upstream && git checkout -b <user>/feat/MM-DD-YY-merge-upstream eugo-main && git merge upstream/main` — merge, never rebase; conflicts concentrate in CMakeLists.txt: re-apply the USE_SYSTEM_* and export/install blocks around whatever upstream restructured; adopt upstream's side everywhere else (src/, include/, BUILD.bazel, tests).",
+  "PR to eugo-main, landed with the MERGE-COMMIT method only — squash destroys the upstream ancestry that future `git merge upstream/main` relies on.",
+]
+
+[skills.adapters."eugo-cmake-review"]
+divergence_inline = "NOT USED — this fork carries NO `@EUGO_CHANGE` annotations at all; every divergence lives in `CMakeLists.txt` + `cmake/pthreadpool-config.cmake.in` and is tracked ONLY by the inventory in the eugo-upstream-merge adapter (a diff that adds, removes or moves a divergence updates that inventory in the same commit). If a marker is ever introduced, use `# @EUGO_CHANGE: <why>`."
+divergence_block_open = "NOT USED (no marker vocabulary in this fork — see divergence_inline); a future block form would be `# @EUGO_CHANGE: @begin <why>`"
+divergence_block_close = "NOT USED (no marker vocabulary in this fork); a future block form would be `# @EUGO_CHANGE: @end`"
+preserved_upstream_marker = "none — upstream's shapes are adopted wherever possible (every divergent line is merge-conflict debt); upstream's download paths are kept live under the ELSE branch of each `USE_SYSTEM_*` guard rather than commented out, so the fork still builds standalone like upstream does"
+legacy_marker_forms = ""
+audit_cmd = ""
+snapshot_path = ""
+snapshot_cmd = ""
+catalog_doc = "the divergence inventory in this repo's `eugo-upstream-merge` adapter (§2 invariants) — this fork has no CLAUDE.md catalog, no markers, no audit script and no snapshot; keep that inventory current in the same commit as any divergence change"
+non_negotiables = '''
+1. **USE_SYSTEM_* options intact.** `USE_SYSTEM_LIBS` (default OFF, upstream-friendly) plus `USE_SYSTEM_FXDIV` / `USE_SYSTEM_GOOGLETEST` / `USE_SYSTEM_GOOGLEBENCHMARK`, each defaulting to `${USE_SYSTEM_LIBS}`. Do not flip defaults to ON — the fork must still build standalone like upstream does.
+2. **Both branches of every dep guarded.** Each dependency has `FIND_PACKAGE(... REQUIRED)` under `USE_SYSTEM_*`, and the download path (`CONFIGURE_FILE(cmake/Download*.cmake ...)` + `EXECUTE_PROCESS`) only in the ELSE branch. The `ADD_SUBDIRECTORY` fallbacks further down must keep their `NOT TARGET x AND NOT USE_SYSTEM_*` guards — dropping one silently vendors a dep even in system mode.
+3. **Export/install machinery must not regress** (why the fork exists): `pthreadpool_interface` keeps `$<BUILD_INTERFACE:...>` / `$<INSTALL_INTERFACE:include>` includes and is installed into `${CMAKE_PROJECT_NAME}Targets`; `CONFIGURE_PACKAGE_CONFIG_FILE` + `INSTALL(EXPORT ...)` emit `${CMAKE_INSTALL_LIBDIR}/cmake/pthreadpool/pthreadpool-config.cmake`; `cmake/pthreadpool-config.cmake.in` keeps `find_dependency(FXdiv)` — removing it breaks pytorch's `find_package(pthreadpool CONFIG REQUIRED)` at pytorch-configure time, not here.
+4. **Consumer regex coupling.** protomolecule's `setup` patches these EXACT lines with `eugo_patch_or_die`: `SET(CMAKE_C_STANDARD 11)`, `SET(CMAKE_C_EXTENSIONS NO)`, `SET(CMAKE_CXX_STANDARD 11)`, `SET(CMAKE_CXX_EXTENSIONS NO)`. If a diff (or an upstream merge) reworks the "Language options" block, the downstream build fails loudly at patch time — update the setup regexes in the same adoption PR that bumps the pin.
+5. **Flags that must keep working** (the canonical protomolecule invocation uses them): `PTHREADPOOL_LIBRARY_TYPE=shared`, `PTHREADPOOL_SYNC_PRIMITIVE=futex`, `PTHREADPOOL_ALLOW_DEPRECATED_API=ON`, `PTHREADPOOL_ENABLE_FASTPATH` overridable per-arch (ON x86_64 / OFF aarch64).
+6. **Stay close to upstream.** Every divergent line is merge-conflict debt for the next `git merge upstream/main`. Prefer the smallest diff that works; adopt upstream shapes where possible.
+'''
+preflight_checks = '''
+```bash
+# System mode (eugo container; needs system FXdiv)
+cmake -B build-sys -G Ninja -DUSE_SYSTEM_LIBS=ON -DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_LIBRARY_TYPE=shared -DPTHREADPOOL_BUILD_TESTS=OFF -DPTHREADPOOL_BUILD_BENCHMARKS=OFF -DCMAKE_INSTALL_PREFIX="$PWD/out"
+cmake --build build-sys && cmake --install build-sys
+test -f out/lib*/cmake/pthreadpool/pthreadpool-config.cmake || echo "REGRESSION"
+# Upstream-default mode (network; proves we did not break standalone builds)
+cmake -B build-def -G Ninja
+grep -n 'SET(CMAKE_C_STANDARD 11)\|SET(CMAKE_C_EXTENSIONS NO)\|SET(CMAKE_CXX_STANDARD 11)\|SET(CMAKE_CXX_EXTENSIONS NO)' CMakeLists.txt   # all four anchors present
+```
+If both configures pass and the config file lands in the install tree, the change is safe to commit. Anything touching the divergence inventory finishes with the eugo-upstream-merge adapter's sanity notes.
+'''
+failure_modes = '''
+| Signature | Cause / fix |
+|---|---|
+| `REGRESSION` from the install-tree test (no `pthreadpool-config.cmake`) | The `CONFIGURE_PACKAGE_CONFIG_FILE` / `INSTALL(EXPORT ...)` machinery was lost — restore it; this is the fork's whole purpose. |
+| `FIND_PACKAGE(FXdiv REQUIRED)` fails at configure | Outside the eugo container (no system FXdiv) — build in the container, install FXdiv the protomolecule way, or drop `USE_SYSTEM_FXDIV` for a compile-only check. |
+| pytorch configure: `find_package(pthreadpool CONFIG REQUIRED)` fails on FXdiv | `find_dependency(FXdiv)` missing from `cmake/pthreadpool-config.cmake.in`. |
+| protomolecule build dies at patch time on pthreadpool | One of the four `SET(CMAKE_*_STANDARD 11)` / `SET(CMAKE_*_EXTENSIONS NO)` anchors was reworked — update the setup regexes in the adoption PR. |
+| a dep vendored in system mode | An `ADD_SUBDIRECTORY` fallback lost its `NOT TARGET x AND NOT USE_SYSTEM_*` guard. |
+'''
+related_skills = '''
+- `eugo-build-and-test` — canonical flags, the artifact checklist, the consumer smoke test.
+- `eugo-rebuild` — whether a change forces a downstream pin bump and the coupled-set rebuild order.
+- `eugo-upstream-merge` — the divergence inventory (keep it current) and the merge-commit-only recipe.
+- protomolecule `dependencies/native/pthreadpool/setup` — the four patch regexes this checklist protects.
+'''

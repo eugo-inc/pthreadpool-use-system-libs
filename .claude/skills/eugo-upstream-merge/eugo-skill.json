@@ -1,0 +1,30 @@
+{
+  "owner": "pthreadpool-use-system-libs",
+  "group": "eugo",
+  "managed_by": "adapter",
+  "adapts": "eugo-upstream-merge-base",
+  "base_tree_hash": "a475d86d303df234d7b1bd73ad3ba88e199ffd9d7106da62cdb6837e973c046d",
+  "base_source_commit": "807102309c4527a91ab2f3aa651a464e4beca0e0",
+  "generated_by": "eugo-skills pull --as-adapter",
+  "generated_at": "2026-08-29T15:28:21+00:00",
+  "params": {
+    "upstream_ref": "upstream/main",
+    "build_cmd": "configure with `-DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_LIBRARY_TYPE=shared` (the canonical flags from eugo-build-and-test) and build + install",
+    "test_cmd": "confirm the install tree contains `lib*/cmake/pthreadpool/pthreadpool-config.cmake`; the /tmp/ptp-smoke consumer build; `ctest --test-dir build` with tests ON for src/include conflicts",
+    "merge_notes": [
+      "`git remote add upstream https://github.com/google/pthreadpool.git && git fetch upstream && git checkout -b <user>/feat/MM-DD-YY-merge-upstream eugo-main && git merge upstream/main` — merge, never rebase; conflicts concentrate in CMakeLists.txt: re-apply the USE_SYSTEM_* and export/install blocks around whatever upstream restructured; adopt upstream's side everywhere else (src/, include/, BUILD.bazel, tests).",
+      "PR to eugo-main, landed with the MERGE-COMMIT method only — squash destroys the upstream ancestry that future `git merge upstream/main` relies on."
+    ],
+    "fork_name": "eugo-inc/pthreadpool-use-system-libs, branch eugo-main (fork of google/pthreadpool — prior syncs are merge commits from google:main, e.g. be3c5e9, 8c5da84)",
+    "upstream_remote": "https://github.com/google/pthreadpool.git (remote name `upstream`)",
+    "invariants": [
+      "divergence inventory (protect in conflicts): (1) `CMakeLists.txt` — the reason the fork exists (from Maratyszcza PR #27 / ConnorBaker's use-system-libs work, adapted): `OPTION(USE_SYSTEM_LIBS / USE_SYSTEM_FXDIV / USE_SYSTEM_GOOGLETEST / USE_SYSTEM_GOOGLEBENCHMARK ...)` near the top; `FIND_PACKAGE(FXdiv REQUIRED)` / `FIND_PACKAGE(GTest)` / `FIND_PACKAGE(benchmark)` branches guarding each Download*.cmake path plus `AND NOT USE_SYSTEM_*` guards on the ADD_SUBDIRECTORY fallbacks; the export/install machinery — `pthreadpool_interface` gets BUILD_INTERFACE/INSTALL_INTERFACE includes and is installed into `${CMAKE_PROJECT_NAME}Targets`, `CONFIGURE_PACKAGE_CONFIG_FILE` + `INSTALL(EXPORT ...)` emit `lib/cmake/pthreadpool/pthreadpool-config.cmake`; (2) `cmake/pthreadpool-config.cmake.in` — eugo-added: `find_dependency(FXdiv)` then includes pthreadpoolTargets.cmake; (3) `.devcontainer/` (Dockerfile, devcontainer.json, post-create.sh), `.mcp.json`, `.claude/`, `.eugo.toml` — eugo infra, no upstream counterpart, keep ours; (4) NO `@EUGO_CHANGE` annotations exist in this repo — the divergence is only discoverable via `git log` and this inventory.",
+      "fragile coupling with the consumer: protomolecule's `setup` runs `eugo_patch_or_die` regexes against `SET(CMAKE_C_STANDARD 11)`, `SET(CMAKE_C_EXTENSIONS NO)`, `SET(CMAKE_CXX_STANDARD 11)`, `SET(CMAKE_CXX_EXTENSIONS NO)` in CMakeLists.txt; if upstream reworks those lines the downstream build fails loudly at patch time — update the setup regexes in the same adoption PR.",
+      "pytorch consumes the installed package via `USE_SYSTEM_PTHREADPOOL=ON` -> `find_package(pthreadpool CONFIG REQUIRED)` (@EUGO_CHANGE in pytorch cmake/Dependencies.cmake); that CONFIG file only exists because of this fork."
+    ],
+    "pins": [
+      "protomolecule/dependencies/native/pthreadpool/meta.json `version.commit` (kind git_commit, branch eugo-main) — push the merged eugo-main to GitHub FIRST (the setup curls the archive tarball; an unpushed commit 404s), then bump to the new merge-commit SHA, verify the four eugo_patch_or_die regexes still match, and rebuild the coupled set if versions moved: cpuinfo, FP16, XNNPACK, then pytorch (XNNPACK <-> cpuinfo <-> pthreadpool <-> FP16 coupling, pytorch .eugo/system_dependencies.md §3 — check XNNPACK's pinned commit expectations)."
+    ]
+  },
+  "aliases": []
+}

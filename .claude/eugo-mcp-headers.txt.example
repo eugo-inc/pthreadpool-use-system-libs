@@ -1,0 +1,1 @@
+Authorization: Bearer <this repo's token on this machine — copy this file to eugo-mcp-headers.txt (git-ignored) and paste the token; see docs/skills/CONSUMING.md>
