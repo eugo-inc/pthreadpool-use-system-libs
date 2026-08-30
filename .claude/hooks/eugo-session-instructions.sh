@@ -79,10 +79,13 @@ fetch_into() {
   return 1
 }
 
-write_rules_from() { # atomic: tmp in the same dir, then rename
+write_rules_from() { # atomic: tmp in the same dir, then rename; WORLD-READABLE —
+  # on a shared checkout other accounts' sessions must load this file, and the
+  # mktemp source is 0600 (cp preserves it; measured 2026-08-30 on two live trees).
   mkdir -p "$RULES_DIR" 2>/dev/null || return 1
+  chmod 755 "$RULES_DIR" 2>/dev/null
   local tmp="$RULES_DIR/.eugo-central.md.$$.tmp"
-  cp "$1" "$tmp" 2>/dev/null && mv -f "$tmp" "$RULES" 2>/dev/null
+  cp "$1" "$tmp" 2>/dev/null && chmod 644 "$tmp" 2>/dev/null && mv -f "$tmp" "$RULES" 2>/dev/null
 }
 
 REASON="unknown"

@@ -2,12 +2,12 @@
   "version": 1,
   "installs": {
     "eugo-session-hooks": {
-      "tree_hash": "0b714fd1a0a6dc1396eb0b08d117bbe59d97344127b49af5f6ec3384b764f8a1",
-      "source_commit": "2f6738d31864862e7bfb978d2f2e99b32f17b62d",
+      "tree_hash": "6244294266c72f7a39703a2e806f376e6ce7b850c23e61d2cb67de7165db2519",
+      "source_commit": "c5d95e570f9819e9a29d0f9e42897cea1d375cd3",
       "files": [
         ".claude/hooks/eugo-session-instructions.sh"
       ],
-      "installed_at": "2026-08-30T08:23:27+00:00"
+      "installed_at": "2026-08-30T10:11:44+00:00"
     }
   }
 }
