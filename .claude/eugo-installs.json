@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "installs": {
+    "eugo-session-hooks": {
+      "tree_hash": "0b714fd1a0a6dc1396eb0b08d117bbe59d97344127b49af5f6ec3384b764f8a1",
+      "source_commit": "2f6738d31864862e7bfb978d2f2e99b32f17b62d",
+      "files": [
+        ".claude/hooks/eugo-session-instructions.sh"
+      ],
+      "installed_at": "2026-08-30T08:23:27+00:00"
+    }
+  }
+}

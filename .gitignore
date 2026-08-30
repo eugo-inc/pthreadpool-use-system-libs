@@ -1,2 +1,4 @@
 # eugo-kb edge bearer — per machine, never committed (scaffolded by `eugo-skills init-mcp`)
 .claude/eugo-mcp-headers.txt
+# eugo-kb central instructions, refreshed per machine by the session hook (never committed)
+.claude/rules/eugo-central.md
