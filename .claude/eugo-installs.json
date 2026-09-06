@@ -8,6 +8,23 @@
         ".claude/hooks/eugo-session-instructions.sh"
       ],
       "installed_at": "2026-08-30T10:11:44+00:00"
+    },
+    "eugo-guardrails-kit": {
+      "tree_hash": "2b749029ace4ac5fbd50545c6cc605c60aa44f1ea4204bd27fd19b732034eb01",
+      "source_commit": "e741e9278a93f29e3af4364067f339491d04388d",
+      "files": [
+        ".claude/docs/guardrails/CODE.md",
+        ".claude/docs/guardrails/DEBUG.md",
+        ".claude/docs/guardrails/EFFICIENCY.md",
+        ".claude/docs/guardrails/PLAN.md",
+        ".claude/docs/guardrails/README.md",
+        ".claude/docs/guardrails/REPORT.md",
+        ".claude/docs/guardrails/SESSION.md",
+        ".claude/docs/guardrails/TRAPS.md",
+        ".claude/docs/guardrails/VERIFY.md",
+        ".claude/docs/guardrails/_FORMAT.md"
+      ],
+      "installed_at": "2026-09-06T09:37:41+00:00"
     }
   }
 }
