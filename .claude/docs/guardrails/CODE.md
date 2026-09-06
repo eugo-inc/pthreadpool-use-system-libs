@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.0.2 (§1996 iron-rule back-pointers say athena's) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
+<!-- guardrails-kit: v1.0.3 (§2001 harness-agnostic task widget) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
 You are here because you are about to create or modify a repo file — by Edit, Write, or a shell command that writes files — for the first time since session start or the last compaction.
 
 Checklist — cite the ID with one line of evidence when an item fires; skipping a fired item is a violation.
@@ -7,7 +7,7 @@ Before the FIRST edit of each file:
 - C1. Read the enclosing function/class plus the import block; file under 250 lines -> Read all of it. A Grep snippet is not a Read. Mandatory even for "obvious one-liners". (Compressed as athena's CLAUDE.md iron rule 1.)
 - C2. Generated/vendored check: path contains dist/, build/, out/, gen/, .next/, target/, node_modules/, vendor/, coverage/, *.min.*, or a lockfile (package-lock.json, yarn.lock, pnpm-lock.yaml, poetry.lock, Cargo.lock) — or the first 10 lines say "DO NOT EDIT"/"@generated"? Do not edit -> find the source or generator, change that, re-run the generator, and name the generator command.
 - C3. Twin check: Grep the target file/symbol name repo-wide before the first edit. More than one hit defines it? List all candidates and paste the evidence for the live one (the import line or stack frame pointing at it).
-- C4. Constraint check: print `CONSTRAINT CHECK: <path> — none apply` or `CONSTRAINT CHECK: <path> — matches '<constraint>', skipping/asking` (eugo: against your TodoWrite Constraints, or .claude/docs/guardrails/STATE.md `## Constraints` if the task spans a compaction — STATE.md then needed but missing? create it per .claude/docs/guardrails/SESSION.md S2). This format is owned here; other docs point to C4.
+- C4. Constraint check: print `CONSTRAINT CHECK: <path> — none apply` or `CONSTRAINT CHECK: <path> — matches '<constraint>', skipping/asking` (against your task-widget Constraints, or .claude/docs/guardrails/STATE.md `## Constraints` if the task spans a compaction — STATE.md then needed but missing? create it per .claude/docs/guardrails/SESSION.md S2). This format is owned here; other docs point to C4.
 
 While editing:
 - C5. Unfamiliar or third-party API with 2+ arguments: paste its real signature (from installed sources/type stubs, `python -c "import inspect,M; print(inspect.signature(M.fn))"`, node_modules/**/*.d.ts, or official docs) before writing the call. Cannot produce it? -> instead: write `SIGNATURE UNVERIFIED: <fn>` and either pick an API whose signature you can paste, or stop and ask the user for the docs. (Compressed as athena's CLAUDE.md iron rule 4.)

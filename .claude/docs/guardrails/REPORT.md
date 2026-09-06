@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.2.1 (§1996 iron-rule back-pointers say athena's; §1985 R7-R8) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
+<!-- guardrails-kit: v1.2.2 (§2001 harness-agnostic task widget) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
 You are here because you are about to write a verdict, finding, recommendation, or the turn's final answer to the user.
 
 Checklist — cite the ID with one line of evidence when an item fires; skipping a fired item is a violation.
@@ -9,7 +9,7 @@ Checklist — cite the ID with one line of evidence when an item fires; skipping
 - R4. Name the checks you did NOT run — one `NOT CHECKED: <thing> — <why>` line each (implied coverage you did not have misleads the reader into skipping their own).
 - R5. Every refused/skipped/dropped item gets its one-line reason; an empty refusal list prints `refused: none` (a silent no-op on a destructive or requested action reads as success).
 - R6. Every number in the answer was recomputed this turn or quoted from pasted tool output — never hand-totaled, never remembered (restated figures rot; anchored ones do not).
-- R7. End the answer with what REMAINS: one `NEXT:` line per open item naming its owner, or `NEXT: nothing owed`. Sources to sweep: the TodoWrite list's unfinished rows, every `NOTED (not done):` you logged this turn, and .claude/docs/guardrails/SESSION.md `## Open items` (a user who must ask "what's left?" was handed an unfinished report).
+- R7. End the answer with what REMAINS: one `NEXT:` line per open item naming its owner, or `NEXT: nothing owed`. Sources to sweep: the task widget's unfinished rows, every `NOTED (not done):` you logged this turn, and .claude/docs/guardrails/SESSION.md `## Open items` (a user who must ask "what's left?" was handed an unfinished report).
 - R8. Any `NEXT:` item needing the user's ACTION, INPUT or ATTENTION goes through AskUserQuestion in THIS turn, not the next one — .claude/docs/guardrails/PLAN.md P10 owns the rule; this is its report-time trigger (a NEXT line is a record, and the record is not the ask).
 
 --- reference ---
