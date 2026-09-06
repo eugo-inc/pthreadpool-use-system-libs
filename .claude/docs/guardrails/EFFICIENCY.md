@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.1.1 (§1996 iron-rule back-pointers say athena's; §backport1 E18) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
+<!-- guardrails-kit: v1.1.2 (§2001 harness-agnostic task widget) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
 You are here because you are about to Read a 3rd file over 300 lines, or a search returned >50 hits.
 
 Governing frame: the unit of cost is the full round trip — a skipped 200-token read that causes one failed edit-debug cycle costs ~10x the read. Every "read less" rule is capped by the "read enough" floors (E2, E4, E14). Never trade edit safety for token savings. IDs are grouped by theme, so numbering is non-sequential — stable per .claude/docs/guardrails/_FORMAT.md F12, never renumber.
@@ -9,7 +9,7 @@ Read less:
 - E11. Grep returned >50 hits? Do not scroll them or start opening hit files. Re-run with output_mode count or files_with_matches, then narrow (stricter pattern, glob/type filter, path). Still >50 relevant hits -> it is a sweep: delegate (E8). Exception: a REFERENCE SWEEP that narrows under 50 via .claude/docs/guardrails/CODE.md RS3 stays in main context.
 - E12. Never Read package-lock.json, yarn.lock, poetry.lock, dist/, build/, coverage/, *.min.*, *.map, node_modules/, vendor/. Need one fact from them (an installed version)? Grep that file for the specific key.
 - E13. Opening a file that neither the task statement nor a search hit identified? First state the one task question it answers ("does anything else import make_token?"). Cannot phrase the question? Do not open it. "Getting context" is not a question.
-- E17. A full-file Read justified by E1 on a file >300 lines: at most ONCE per session. Immediately record a 3-6 line structure map (key symbols + line ranges) (eugo: in TodoWrite, or .claude/docs/guardrails/STATE.md `## Facts` if the task spans a compaction); every later visit is a ranged Read or Grep.
+- E17. A full-file Read justified by E1 on a file >300 lines: at most ONCE per session. Immediately record a 3-6 line structure map (key symbols + line ranges) (in the task widget, or .claude/docs/guardrails/STATE.md `## Facts` if the task spans a compaction); every later visit is a ranged Read or Grep.
 
 Read enough (the floors):
 - E2. The first edit of a file still requires .claude/docs/guardrails/CODE.md C1 — enclosing scope + imports. Editing from a Grep snippet to "save tokens" is the most expensive move available.

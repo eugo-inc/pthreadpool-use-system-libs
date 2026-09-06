@@ -8,6 +8,55 @@ an entry below.
 
 ## Upgrade notes
 
+- **2026-09-06 §2002 (DEBUG.md v1.1.5-eugo → v1.1.6-eugo, plus the carrier's own SKILL.md)** —
+  **the root cause, found by a design panel and named independently by both of its judges.** It is
+  not the copier: it is **the kit's own `SKILL.md` step 3**, which read *"Tailor the marked spots:
+  `VERIFY.md`'s commit-gate bullet (the repo's gates) and `SESSION.md`'s state-store pointers"* —
+  instructing the hand-edit that **step 5, four lines below, forbids in as many words** ("Never
+  silently fix your installed copy — the next refresh replaces those bytes"). There were never any
+  markers. Two consumers obeyed step 3, and `ee_files_indexer` copied the phrase into its own
+  CLAUDE.md ("repo-tailored lines live in the marked eugo-slots"), which is why that sentence
+  always read as an invention when it was obedience.
+  Step 3 now says the opposite and agrees with step 5: **repo specifics go in the repo's own
+  `CLAUDE.md`; the kit's rules already point there** (`VERIFY.md`'s gate, `PLAN.md` P5,
+  `SESSION.md`'s recovery sources). Step 5 gained the §2001 detection so the prohibition is
+  enforceable rather than merely stated.
+  Also cured: `DEBUG.md` **D10** asserted "That is a `CLAUDE.md` `## Hard stops` violation" —
+  the same unqualified-cross-reference class §1996 fixed for the iron-rule numbers, missed there.
+  A consumer that kept its own CLAUDE.md may have no such section; the rule binds regardless, and
+  athena's case is now the labelled example.
+  ⚠ **Recorded dissent.** One judge argued §2001 should NOT have replaced `TodoWrite` with "the
+  native task widget", on the evidence that epstein-drive's own tailored `SESSION.md` KEPT
+  `TodoWrite` verbatim while rewriting everything around it — so the tool name was not the
+  friction. Kept as shipped, because the kit's own routing template already says "native task
+  widget", no consumer's CLAUDE.md mentions `TodoWrite`, and `(Claude Code: TodoWrite)` survives as
+  a labelled example so F9's greppable literal still holds. Written down so the call is reversible.
+
+- **2026-09-06 §2001 (CODE v1.0.3, DEBUG v1.1.5-eugo, EFFICIENCY v1.1.2, PLAN v1.2.3-eugo,
+  REPORT v1.2.2, SESSION v1.1.3)** — the FOURTH shape of §1990's defect, and the last of the
+  `eugo:` slots. The kit named **`TodoWrite`** — a Claude Code tool — in eight places across six
+  rule docs, as though it were the org's convention. It is not: the kit's OWN
+  `references/CLAUDE-routing-template.md` says "the native task widget", and **none of the three
+  consumers mentions `TodoWrite` at all** (protomolecule says "the task tool (the native chat
+  widget)"). Every rule now says **the native task widget**, with `(Claude Code: TodoWrite)` kept
+  once as a labelled example so F9's greppable-literal requirement still holds.
+  `SESSION.md`'s `> eugo reconciliation:` blockquote — the ONE slot with no upstream cure, and the
+  one BOTH consumers rewrote — no longer asserts athena's plan path and overnight breadcrumb dir
+  as the reader's. It now says post-compaction recovery reads "whatever THIS repo's `CLAUDE.md`
+  names as its own recovery sources", with athena's two named beneath as an example of the shape.
+  That is the same pointer form §1990 used for the commit gate and both consumer cures adopted.
+  **No `(eugo: …)` slot remains in any rule doc**; an `(athena: …)` label is now the only form a
+  repo-specific example takes, and `DEBUG.md` D15 says so.
+  ⚠ The `iron 13 / PLAN P10` F7 pair changed on BOTH sides in the same commit, and
+  `test_ask_and_report_rules_survive.py`'s `_SHARED_TRIGGER` moved with it — that is what the
+  §1996 presence-in-both assertion is for.
+  **Paired code change (§2001, not a kit file):** `eugo-skills install` now records
+  `file_hashes` per installed file and `doctor` re-hashes them, so a consumer that has HAND-EDITED
+  an installed doc is WARNED before the next refresh overwrites it. Until now `doctor`'s `fresh`
+  compared athena's own source tree to itself (`doctor.py:494`) and §1689 added only an EXISTENCE
+  check — so a file present-but-modified read as fresh, which is exactly how both consumers' edits
+  survived unnoticed. It warns; it never repairs. Installed files are committed in the consumer.
+
 - **2026-09-05 §1996 (CODE v1.0.2, EFFICIENCY v1.1.1, REPORT v1.2.1, PLAN v1.2.2-eugo,
   SESSION v1.1.2, VERIFY v1.2.2-eugo, _FORMAT v1.2.2)** — the THIRD shape of §1990's defect, and the
   worst of the three, because this one does not merely dead-end: it points a consumer at a rule that
