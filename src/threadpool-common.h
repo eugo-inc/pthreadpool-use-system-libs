@@ -24,24 +24,16 @@
 #endif
 #endif
 
-#ifndef PTHREADPOOL_USE_GCD
-#if defined(__APPLE__)
-#define PTHREADPOOL_USE_GCD 1
-#else
-#define PTHREADPOOL_USE_GCD 0
-#endif
-#endif
-
-#ifndef PTHREADPOOL_USE_EVENT
+#ifndef PTHREADPOOL_USE_PTHREADS
 #if defined(_WIN32) || defined(__CYGWIN__)
-#define PTHREADPOOL_USE_EVENT 1
+#define PTHREADPOOL_USE_PTHREADS 0
 #else
-#define PTHREADPOOL_USE_EVENT 0
+#define PTHREADPOOL_USE_PTHREADS 1
 #endif
 #endif
 
 #ifndef PTHREADPOOL_USE_CONDVAR
-#if PTHREADPOOL_USE_GCD || PTHREADPOOL_USE_FUTEX || PTHREADPOOL_USE_EVENT
+#if PTHREADPOOL_USE_FUTEX
 #define PTHREADPOOL_USE_CONDVAR 0
 #else
 #define PTHREADPOOL_USE_CONDVAR 1
@@ -89,18 +81,6 @@
   _Static_assert((predicate), message)
 #else
 #define PTHREADPOOL_STATIC_ASSERT(predicate, message)
-#endif
-
-#if defined(__GNUC__) && defined(__linux__)
-// We declare these symbols as having weak linkage, so they can be replaced by
-// a custom implementation.
-#define PTHREADPOOL_WEAK_ALIAS(name) \
-  extern __typeof(name) name         \
-      __attribute__((alias(#name "_private_impl"), __weak__));
-#define PTHREADPOOL_IMPL(name) name##_private_impl
-#else
-#define PTHREADPOOL_WEAK_ALIAS(name)
-#define PTHREADPOOL_IMPL(name) name
 #endif
 
 #ifndef PTHREADPOOL_INTERNAL

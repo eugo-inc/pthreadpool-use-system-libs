@@ -11,6 +11,7 @@
 #define __PTHREADPOOL_SRC_THREADPOOL_OBJECT_H_
 
 /* Standard C headers */
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -19,21 +20,10 @@
 #include "threadpool-common.h"
 
 /* POSIX headers */
-#if PTHREADPOOL_USE_CONDVAR || PTHREADPOOL_USE_FUTEX
+#if PTHREADPOOL_USE_PTHREADS
 #include <pthread.h>
-#endif
-
-/* Mach headers */
-#if PTHREADPOOL_USE_GCD
-#include <dispatch/dispatch.h>
-#endif
-
-/* Windows headers */
-#if PTHREADPOOL_USE_EVENT
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#else
+#include <threads.h>
 #endif
 
 /* Dependencies */
@@ -41,14 +31,6 @@
 
 /* Library header */
 #include <pthreadpool.h>
-
-#define THREADPOOL_COMMAND_MASK UINT32_C(0x7FFFFFFF)
-
-enum threadpool_command {
-  threadpool_command_init,
-  threadpool_command_parallelize,
-  threadpool_command_shutdown,
-};
 
 struct PTHREADPOOL_CACHELINE_ALIGNED thread_info {
   /**
@@ -72,25 +54,21 @@ struct PTHREADPOOL_CACHELINE_ALIGNED thread_info {
    */
   pthreadpool_atomic_size_t range_length;
   /**
-   * Thread number in the 0..threads_count-1 range.
+   * Thread number in the 0..max_num_threads-1 range.
    */
   size_t thread_number;
   /**
    * Thread pool which owns the thread.
    */
   struct pthreadpool* threadpool;
-#if PTHREADPOOL_USE_CONDVAR || PTHREADPOOL_USE_FUTEX
   /**
    * The pthread object corresponding to the thread.
    */
-  pthread_t thread_object;
-#endif
-#if PTHREADPOOL_USE_EVENT
+  pthreadpool_thread_t thread_object;
   /**
-   * The Windows thread handle corresponding to the thread.
+   * Whether this thread is active or not.
    */
-  HANDLE thread_handle;
-#endif
+  pthreadpool_atomic_uint32_t is_active;
 };
 
 PTHREADPOOL_STATIC_ASSERT(sizeof(struct thread_info) %
@@ -1083,13 +1061,62 @@ struct pthreadpool_6d_tile_2d_params {
   struct fxdiv_divisor_size_t tile_range_n;
 };
 
+union pthreadpool_params {
+  struct pthreadpool_1d_with_uarch_params parallelize_1d_with_uarch;
+  struct pthreadpool_1d_tile_1d_params parallelize_1d_tile_1d;
+  struct pthreadpool_1d_tile_1d_dynamic_params parallelize_1d_tile_1d_dynamic;
+  struct pthreadpool_1d_tile_1d_dynamic_with_uarch_params
+      parallelize_1d_tile_1d_dynamic_with_uarch;
+  struct pthreadpool_2d_params parallelize_2d;
+  struct pthreadpool_2d_tile_1d_params parallelize_2d_tile_1d;
+  struct pthreadpool_2d_tile_1d_with_uarch_params
+      parallelize_2d_tile_1d_with_uarch;
+  struct pthreadpool_2d_tile_1d_dynamic_params parallelize_2d_tile_1d_dynamic;
+  struct pthreadpool_2d_tile_1d_dynamic_with_uarch_params
+      parallelize_2d_tile_1d_dynamic_with_uarch;
+  struct pthreadpool_2d_tile_2d_params parallelize_2d_tile_2d;
+  struct pthreadpool_2d_tile_2d_with_uarch_params
+      parallelize_2d_tile_2d_with_uarch;
+  struct pthreadpool_2d_tile_2d_dynamic_params parallelize_2d_tile_2d_dynamic;
+  struct pthreadpool_2d_tile_2d_dynamic_with_uarch_params
+      parallelize_2d_tile_2d_dynamic_with_uarch;
+  struct pthreadpool_3d_params parallelize_3d;
+  struct pthreadpool_3d_tile_1d_params parallelize_3d_tile_1d;
+  struct pthreadpool_3d_tile_1d_with_uarch_params
+      parallelize_3d_tile_1d_with_uarch;
+  struct pthreadpool_3d_tile_1d_dynamic_params parallelize_3d_tile_1d_dynamic;
+  struct pthreadpool_3d_tile_1d_dynamic_with_uarch_params
+      parallelize_3d_tile_1d_dynamic_with_uarch;
+  struct pthreadpool_3d_tile_2d_params parallelize_3d_tile_2d;
+  struct pthreadpool_3d_tile_2d_with_uarch_params
+      parallelize_3d_tile_2d_with_uarch;
+  struct pthreadpool_3d_tile_2d_dynamic_params parallelize_3d_tile_2d_dynamic;
+  struct pthreadpool_3d_tile_2d_dynamic_with_uarch_params
+      parallelize_3d_tile_2d_dynamic_with_uarch;
+  struct pthreadpool_4d_params parallelize_4d;
+  struct pthreadpool_4d_tile_1d_params parallelize_4d_tile_1d;
+  struct pthreadpool_4d_tile_2d_params parallelize_4d_tile_2d;
+  struct pthreadpool_4d_tile_2d_with_uarch_params
+      parallelize_4d_tile_2d_with_uarch;
+  struct pthreadpool_4d_tile_2d_dynamic_params parallelize_4d_tile_2d_dynamic;
+  struct pthreadpool_4d_tile_2d_dynamic_with_uarch_params
+      parallelize_4d_tile_2d_dynamic_with_uarch;
+  struct pthreadpool_5d_params parallelize_5d;
+  struct pthreadpool_5d_tile_1d_params parallelize_5d_tile_1d;
+  struct pthreadpool_5d_tile_2d_params parallelize_5d_tile_2d;
+  struct pthreadpool_6d_params parallelize_6d;
+  struct pthreadpool_6d_tile_1d_params parallelize_6d_tile_1d;
+  struct pthreadpool_6d_tile_2d_params parallelize_6d_tile_2d;
+};
+
+#define PTHREADPOOL_NUM_ACTIVE_THREADS_DONE INT_MAX
+
 struct PTHREADPOOL_CACHELINE_ALIGNED pthreadpool {
-#if !PTHREADPOOL_USE_GCD
   /**
    * The number of threads that are processing an operation.
    */
   pthreadpool_atomic_size_t active_threads;
-#endif
+
 #if PTHREADPOOL_USE_FUTEX
   /**
    * Indicates if there are active threads.
@@ -1099,141 +1126,118 @@ struct PTHREADPOOL_CACHELINE_ALIGNED pthreadpool {
    */
   pthreadpool_atomic_uint32_t has_active_threads;
 #endif
-#if !PTHREADPOOL_USE_GCD
-  /**
-   * The last command submitted to the thread pool.
-   */
-  pthreadpool_atomic_uint32_t command;
-#endif
   /**
    * The entry point function to call for each thread in the thread pool for
    * parallelization tasks.
    */
   pthreadpool_atomic_void_p thread_function;
+
   /**
    * The function to call for each item.
    */
   pthreadpool_atomic_void_p task;
+
   /**
    * The first argument to the item processing function.
    */
   pthreadpool_atomic_void_p argument;
+
   /**
    * Additional parallelization parameters.
    * These parameters are specific for each thread_function.
    */
-  union {
-    struct pthreadpool_1d_with_uarch_params parallelize_1d_with_uarch;
-    struct pthreadpool_1d_tile_1d_params parallelize_1d_tile_1d;
-    struct pthreadpool_1d_tile_1d_dynamic_params parallelize_1d_tile_1d_dynamic;
-    struct pthreadpool_1d_tile_1d_dynamic_with_uarch_params
-        parallelize_1d_tile_1d_dynamic_with_uarch;
-    struct pthreadpool_2d_params parallelize_2d;
-    struct pthreadpool_2d_tile_1d_params parallelize_2d_tile_1d;
-    struct pthreadpool_2d_tile_1d_with_uarch_params
-        parallelize_2d_tile_1d_with_uarch;
-    struct pthreadpool_2d_tile_1d_dynamic_params parallelize_2d_tile_1d_dynamic;
-    struct pthreadpool_2d_tile_1d_dynamic_with_uarch_params
-        parallelize_2d_tile_1d_dynamic_with_uarch;
-    struct pthreadpool_2d_tile_2d_params parallelize_2d_tile_2d;
-    struct pthreadpool_2d_tile_2d_with_uarch_params
-        parallelize_2d_tile_2d_with_uarch;
-    struct pthreadpool_2d_tile_2d_dynamic_params parallelize_2d_tile_2d_dynamic;
-    struct pthreadpool_2d_tile_2d_dynamic_with_uarch_params
-        parallelize_2d_tile_2d_dynamic_with_uarch;
-    struct pthreadpool_3d_params parallelize_3d;
-    struct pthreadpool_3d_tile_1d_params parallelize_3d_tile_1d;
-    struct pthreadpool_3d_tile_1d_with_uarch_params
-        parallelize_3d_tile_1d_with_uarch;
-    struct pthreadpool_3d_tile_1d_dynamic_params parallelize_3d_tile_1d_dynamic;
-    struct pthreadpool_3d_tile_1d_dynamic_with_uarch_params
-        parallelize_3d_tile_1d_dynamic_with_uarch;
-    struct pthreadpool_3d_tile_2d_params parallelize_3d_tile_2d;
-    struct pthreadpool_3d_tile_2d_with_uarch_params
-        parallelize_3d_tile_2d_with_uarch;
-    struct pthreadpool_3d_tile_2d_dynamic_params parallelize_3d_tile_2d_dynamic;
-    struct pthreadpool_3d_tile_2d_dynamic_with_uarch_params
-        parallelize_3d_tile_2d_dynamic_with_uarch;
-    struct pthreadpool_4d_params parallelize_4d;
-    struct pthreadpool_4d_tile_1d_params parallelize_4d_tile_1d;
-    struct pthreadpool_4d_tile_2d_params parallelize_4d_tile_2d;
-    struct pthreadpool_4d_tile_2d_with_uarch_params
-        parallelize_4d_tile_2d_with_uarch;
-    struct pthreadpool_4d_tile_2d_dynamic_params parallelize_4d_tile_2d_dynamic;
-    struct pthreadpool_4d_tile_2d_dynamic_with_uarch_params
-        parallelize_4d_tile_2d_dynamic_with_uarch;
-    struct pthreadpool_5d_params parallelize_5d;
-    struct pthreadpool_5d_tile_1d_params parallelize_5d_tile_1d;
-    struct pthreadpool_5d_tile_2d_params parallelize_5d_tile_2d;
-    struct pthreadpool_6d_params parallelize_6d;
-    struct pthreadpool_6d_tile_1d_params parallelize_6d_tile_1d;
-    struct pthreadpool_6d_tile_2d_params parallelize_6d_tile_2d;
-  } params;
+  union pthreadpool_params params;
+
   /**
    * Copy of the flags passed to a parallelization function.
    */
   pthreadpool_atomic_uint32_t flags;
-#if PTHREADPOOL_USE_CONDVAR || PTHREADPOOL_USE_FUTEX
+
   /**
    * Serializes concurrent calls to @a pthreadpool_parallelize_* from different
    * threads.
    */
-  pthread_mutex_t execution_mutex;
-#endif
-#if PTHREADPOOL_USE_GCD
-  /**
-   * Serializes concurrent calls to @a pthreadpool_parallelize_* from different
-   * threads.
-   */
-  dispatch_semaphore_t execution_semaphore;
-#endif
-#if PTHREADPOOL_USE_EVENT
-  /**
-   * Serializes concurrent calls to @a pthreadpool_parallelize_* from different
-   * threads.
-   */
-  HANDLE execution_mutex;
-#endif
+  pthreadpool_mutex_t execution_mutex;
+
 #if PTHREADPOOL_USE_CONDVAR
   /**
    * Guards access to the @a active_threads variable.
    */
-  pthread_mutex_t completion_mutex;
+  pthreadpool_mutex_t completion_mutex;
+
   /**
    * Condition variable to wait until all threads complete an operation (until
    * @a active_threads is zero).
    */
-  pthread_cond_t completion_condvar;
+  pthreadpool_cond_t completion_condvar;
+
   /**
-   * Guards access to the @a command variable.
+   * Guards access to the @a num_active_threads_condvar variable.
    */
-  pthread_mutex_t command_mutex;
+  pthreadpool_mutex_t num_active_threads_mutex;
+
   /**
-   * Condition variable to wait for change of the @a command variable.
+   * Condition variable to wait on a change of @a num_active_threads.
    */
-  pthread_cond_t command_condvar;
+  pthreadpool_cond_t num_active_threads_condvar;
 #endif
-#if PTHREADPOOL_USE_EVENT
+
+#if PTHREADPOOL_USE_FUTEX
   /**
-   * Events to wait on until all threads complete an operation (until @a
-   * active_threads is zero). To avoid race conditions due to spin-lock
-   * synchronization, we use two events and switch event in use after every
-   * submitted command according to the high bit of the command word.
+   * Number of threads currently futex-waiting on @a num_active_threads.
    */
-  HANDLE completion_event[2];
+  pthreadpool_atomic_uint32_t num_waiting_threads;
+#endif  // PTHREADPOOL_USE_FUTEX
+
   /**
-   * Events to wait on for change of the @a command variable.
-   * To avoid race conditions due to spin-lock synchronization, we use two
-   * events and switch event in use after every submitted command according to
-   * the high bit of the command word.
+   * The ID of the job currently being run.
    */
-  HANDLE command_event[2];
-#endif
+  uint32_t job_id;
+
   /**
-   * FXdiv divisor for the number of threads in the thread pool.
-   * This struct never change after pthreadpool_create.
+   * The current number of threads running on the current job.
+   *
+   * This value is used to make sure that no more than @a max_active_threads are
+   * working on a parallel job at the same time, as well as to track when all
+   * threads working on a job have completed.
    */
-  struct fxdiv_divisor_size_t threads_count;
+  pthreadpool_atomic_int32_t num_active_threads;
+
+  /**
+   * Boolean value that indicates whether @a num_active_threads has become zero.
+   */
+  pthreadpool_atomic_uint32_t work_is_done;
+
+  /**
+   * Pointer to a `pthreadpool_executor` that will handle the creation of
+   * parallel threas for this threadpool.
+   */
+  struct pthreadpool_executor executor;
+
+  /**
+   * Pointer to a `pthreadpool_executor` context that will passed on to the @a
+   * executor functions.
+   */
+  void* executor_context;
+
+  /**
+   * The number of threads that are currently running. Threads using
+   * this datastructure should atomically decrement this variable as the last
+   * thing they do before releasing it.
+   */
+  pthreadpool_atomic_uint32_t num_recruited_threads;
+
+  /**
+   * The maximum number of threads, i.e. the thread_info structs that were
+   * originally allocated. This value never changes after @a pthreadpool_create.
+   */
+  size_t max_num_threads;
+
+  /**
+   * The current number of active threads in the thread pool.
+   */
+  pthreadpool_atomic_size_t threads_count;
+
   /**
    * Thread information structures that immediately follow this structure.
    */
