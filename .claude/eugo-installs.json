@@ -2,12 +2,21 @@
   "version": 1,
   "installs": {
     "eugo-session-hooks": {
-      "tree_hash": "6244294266c72f7a39703a2e806f376e6ce7b850c23e61d2cb67de7165db2519",
-      "source_commit": "c5d95e570f9819e9a29d0f9e42897cea1d375cd3",
+      "tree_hash": "e455f2d9cf2039581d94a14037f22ecd0d6eb26ce967a922ab99ba487b52a948",
+      "source_commit": "c60ddd6369bfb2fa05a6badfb909f766db78d9ca",
       "files": [
-        ".claude/hooks/eugo-session-instructions.sh"
+        ".claude/hooks/eugo-review-on-commit.sh",
+        ".claude/hooks/eugo-review-turn-end.sh",
+        ".claude/hooks/eugo-session-instructions.sh",
+        ".claude/hooks/eugo-watch-owed.sh"
       ],
-      "installed_at": "2026-08-30T10:11:44+00:00"
+      "file_hashes": {
+        ".claude/hooks/eugo-review-on-commit.sh": "2c0e321fe6d46632a31082437a56379ddd55f00e85453ba50d7e214fab71c306",
+        ".claude/hooks/eugo-review-turn-end.sh": "acdfb6403a80788993b7bda7967e3ee0ef80e7138a67753801fb788bf56d8a6a",
+        ".claude/hooks/eugo-session-instructions.sh": "a0099b182cb68d5cbbfcb0f246a2ba39f8744658c33a2ad3629c43782b5684fb",
+        ".claude/hooks/eugo-watch-owed.sh": "971c53de8d921130abff665486af8bbbbff486479f1aadf5e536f60219854b77"
+      },
+      "installed_at": "2026-09-16T14:05:18+00:00"
     },
     "eugo-guardrails-kit": {
       "tree_hash": "1185410076d414332c2668ed9db4cf7ed1e80d64674b7b58fbea208e35d4b279",
