@@ -2,21 +2,25 @@
   "version": 1,
   "installs": {
     "eugo-session-hooks": {
-      "tree_hash": "e455f2d9cf2039581d94a14037f22ecd0d6eb26ce967a922ab99ba487b52a948",
-      "source_commit": "c60ddd6369bfb2fa05a6badfb909f766db78d9ca",
+      "tree_hash": "5b183916513f2ed482f879fa0a0b95ed39a33b5420b9bf9a380cca366bae3782",
+      "source_commit": "c7d34e474349cf53834ee0113b067379a823aadb",
       "files": [
+        ".claude/hooks/eugo-external-publish-guard.sh",
+        ".claude/hooks/eugo-prompt-context.sh",
         ".claude/hooks/eugo-review-on-commit.sh",
         ".claude/hooks/eugo-review-turn-end.sh",
         ".claude/hooks/eugo-session-instructions.sh",
         ".claude/hooks/eugo-watch-owed.sh"
       ],
       "file_hashes": {
-        ".claude/hooks/eugo-review-on-commit.sh": "2c0e321fe6d46632a31082437a56379ddd55f00e85453ba50d7e214fab71c306",
-        ".claude/hooks/eugo-review-turn-end.sh": "acdfb6403a80788993b7bda7967e3ee0ef80e7138a67753801fb788bf56d8a6a",
+        ".claude/hooks/eugo-external-publish-guard.sh": "fa5384966f1a182d1b0abff147ed1f68cfa72d57dffef58c198076b94d382681",
+        ".claude/hooks/eugo-prompt-context.sh": "cc8d82650e90579d483dd0e9dfc5b8bce705f6bd95f6f0715d96bd1bd502bd94",
+        ".claude/hooks/eugo-review-on-commit.sh": "8a91e861aa5a4e070230bf531d9e4fd168d0062277e82ad27d67a6c9fea603a4",
+        ".claude/hooks/eugo-review-turn-end.sh": "b55b7bf8557c330252d4ee20450d330786209fc5b9798fef7ee3d3734f9c284f",
         ".claude/hooks/eugo-session-instructions.sh": "a0099b182cb68d5cbbfcb0f246a2ba39f8744658c33a2ad3629c43782b5684fb",
-        ".claude/hooks/eugo-watch-owed.sh": "971c53de8d921130abff665486af8bbbbff486479f1aadf5e536f60219854b77"
+        ".claude/hooks/eugo-watch-owed.sh": "3184f03214af7c803eebdd54071e31594e2494e00bbad7983487422a4f5136b6"
       },
-      "installed_at": "2026-09-16T14:05:18+00:00"
+      "installed_at": "2026-09-20T17:31:16+00:00"
     },
     "eugo-guardrails-kit": {
       "tree_hash": "1185410076d414332c2668ed9db4cf7ed1e80d64674b7b58fbea208e35d4b279",
@@ -46,6 +50,21 @@
         ".claude/docs/guardrails/_FORMAT.md": "2d151c12561f4fc065e640af773915bd6ce835c817a92d2585e8ada8f2825e4f"
       },
       "installed_at": "2026-09-06T13:35:57+00:00"
+    },
+    "eugo-agentic-scripts": {
+      "tree_hash": "7e479fb93dd8cdb7ccc0ca33229268a37f810ee9f63d00f0669d5f42650c9a2f",
+      "source_commit": "c7d34e474349cf53834ee0113b067379a823aadb",
+      "files": [
+        ".claude/scripts/codex_review.py",
+        ".claude/scripts/codex_watch.py",
+        ".claude/scripts/watch_drain.py"
+      ],
+      "file_hashes": {
+        ".claude/scripts/codex_review.py": "7da6287e58319da5103102393aa253e6dc2dff77041c48d9cdfe31edce78c2b0",
+        ".claude/scripts/codex_watch.py": "9e2b1669e86a8834c952121f23a292c808a936cc0c1f385017e72b33abdbef74",
+        ".claude/scripts/watch_drain.py": "891d2071dd0436a940965cb87d010ffc9212a5c35557badaf6146e24b5bb6ba6"
+      },
+      "installed_at": "2026-09-20T17:31:17+00:00"
     }
   }
 }

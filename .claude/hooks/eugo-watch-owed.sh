@@ -75,9 +75,15 @@ STALE="$(field stale)"
 # `status` now computes the depth; empty means nothing is stuck, `?` means it could not ask.
 RETRY_SCAN="$(field retry_scan)"
 case "$RETRY_SCAN" in
-  ""|"?") RETRY_CURE="--retry-abandoned --ledger-scan <deep enough to reach them>" ;;
-  *) RETRY_CURE="--retry-abandoned --ledger-scan $RETRY_SCAN" ;;
+  ""|"?") RETRY_CURE="--retry-abandoned --ledger-scan <deep enough to reach them> --wait-for-lock 900" ;;
+  *) RETRY_CURE="--retry-abandoned --ledger-scan $RETRY_SCAN --wait-for-lock 900" ;;
 esac
+# ⚠ §2912 — AND `--wait-for-lock`, OR THE CURE IS REFUSED. The hooks take the review lock on
+# every commit, and `codex_watch.py` without that flag refuses the moment another run holds
+# it (`_acquire_single_instance`, default 0 = refuse at once) and returns 1 having reviewed
+# nothing. Its own help names this case: a backlog pass that refuses and re-races is starved
+# (§2155). finding-triage.md §10 prints the full one-shot; this line had the flags without it.
+# The lines above are cited by number from codex_watch.py, so this note sits below them.
 
 ABANDONED="$(field abandoned)"
 ABANDON_NOTE=""

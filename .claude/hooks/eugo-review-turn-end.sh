@@ -365,8 +365,9 @@ if [ -f "$WATCH" ]; then
   # the group and restored on exit, which is what was meant all along.
   if [ ! -e "$WTLOCK" ] || { { exec 9<"$WTLOCK"; } 2>/dev/null && flock -n -s 9 2>/dev/null; }; then
     { flock -u 9 2>/dev/null; exec 9<&-; } 2>/dev/null || true
+    # §3044 — the writer travels in the ENV, never argv (see eugo-review-on-commit.sh).
     ( cd "$ROOT" 2>/dev/null &&
-      python3 "$WATCH" --once --since-ledger --worktree --no-commits \
+      EUGO_REVIEW_WRITER=hook-turn-end python3 "$WATCH" --once --since-ledger --worktree --no-commits \
           --engine claude --advice-dir ".adversarial-review/watch"
     ) >>"$LOG" 2>&1 &
   fi

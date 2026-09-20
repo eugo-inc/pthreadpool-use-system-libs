@@ -106,8 +106,12 @@ fi
 # selects from the same ledger and will pick up whatever is outstanding.
 LOG="$ROOT/outputs/_state/logs/review-on-commit.log"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+# §3044 — identify the dispatcher to the ledger through the ENVIRONMENT, never argv: this
+# hook and codex_watch.py are pinned by different carriers, so a `--writer` flag into an
+# older copy is an argparse exit 2 in a log nobody reads, while an unknown env var is
+# simply ignored. The value must be one of `codex_watch.WRITERS`.
 ( cd "$ROOT" 2>/dev/null &&
-  python3 "$WATCH" --once --since-ledger --commits --no-worktree \
+  EUGO_REVIEW_WRITER=hook-commit python3 "$WATCH" --once --since-ledger --commits --no-worktree \
       --engine claude --advice-dir ".adversarial-review/watch"
 ) >>"$LOG" 2>&1 &
 
