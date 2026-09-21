@@ -2,8 +2,8 @@
   "version": 1,
   "installs": {
     "eugo-session-hooks": {
-      "tree_hash": "5b183916513f2ed482f879fa0a0b95ed39a33b5420b9bf9a380cca366bae3782",
-      "source_commit": "c7d34e474349cf53834ee0113b067379a823aadb",
+      "tree_hash": "e54c6538fde035174f424fa008dce79be22d973fc9d68bc9665352a106fc3a3d",
+      "source_commit": "92d54f02ce084089260d2363716e409e3eac0263",
       "files": [
         ".claude/hooks/eugo-external-publish-guard.sh",
         ".claude/hooks/eugo-prompt-context.sh",
@@ -18,9 +18,9 @@
         ".claude/hooks/eugo-review-on-commit.sh": "8a91e861aa5a4e070230bf531d9e4fd168d0062277e82ad27d67a6c9fea603a4",
         ".claude/hooks/eugo-review-turn-end.sh": "b55b7bf8557c330252d4ee20450d330786209fc5b9798fef7ee3d3734f9c284f",
         ".claude/hooks/eugo-session-instructions.sh": "a0099b182cb68d5cbbfcb0f246a2ba39f8744658c33a2ad3629c43782b5684fb",
-        ".claude/hooks/eugo-watch-owed.sh": "3184f03214af7c803eebdd54071e31594e2494e00bbad7983487422a4f5136b6"
+        ".claude/hooks/eugo-watch-owed.sh": "6b2cd48a978e62adab9f3012d6f4c58828d2ff3fbaa9dc50f76d19302a81efa2"
       },
-      "installed_at": "2026-09-20T17:31:16+00:00"
+      "installed_at": "2026-09-21T12:44:44+00:00"
     },
     "eugo-guardrails-kit": {
       "tree_hash": "1185410076d414332c2668ed9db4cf7ed1e80d64674b7b58fbea208e35d4b279",
@@ -52,8 +52,8 @@
       "installed_at": "2026-09-06T13:35:57+00:00"
     },
     "eugo-agentic-scripts": {
-      "tree_hash": "7e479fb93dd8cdb7ccc0ca33229268a37f810ee9f63d00f0669d5f42650c9a2f",
-      "source_commit": "c7d34e474349cf53834ee0113b067379a823aadb",
+      "tree_hash": "346b082de9c6922a87511acbee1657a978ba6914d696faafcc4af744beec7722",
+      "source_commit": "92d54f02ce084089260d2363716e409e3eac0263",
       "files": [
         ".claude/scripts/codex_review.py",
         ".claude/scripts/codex_watch.py",
@@ -61,10 +61,10 @@
       ],
       "file_hashes": {
         ".claude/scripts/codex_review.py": "7da6287e58319da5103102393aa253e6dc2dff77041c48d9cdfe31edce78c2b0",
-        ".claude/scripts/codex_watch.py": "9e2b1669e86a8834c952121f23a292c808a936cc0c1f385017e72b33abdbef74",
-        ".claude/scripts/watch_drain.py": "891d2071dd0436a940965cb87d010ffc9212a5c35557badaf6146e24b5bb6ba6"
+        ".claude/scripts/codex_watch.py": "7db0e4b03ad4474b66c52b73c3d5b078246ce96c57a982c482316e49879d38de",
+        ".claude/scripts/watch_drain.py": "b1ed039dffc1b419abed3341e652bad1e4811156462476ae79c978f639cac3dd"
       },
-      "installed_at": "2026-09-20T17:31:17+00:00"
+      "installed_at": "2026-09-21T12:44:45+00:00"
     }
   }
 }

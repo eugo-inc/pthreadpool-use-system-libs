@@ -39,9 +39,12 @@ say() { printf 'review watch: %s\n' "$1"; exit 0; }
 # `ERROR: advice dir not found: …` and exits 1. So the `||` branch below is live code, not
 # the unreachable guard two comments described — and the state it fires in is a NORMAL one:
 # `init-hooks --review` registers this row (watch-owed is not in `_DEFAULT_KEYS`), so every
-# freshly wired repo sits without `.adversarial-review/watch/` until its first review
-# creates it. Parsing stdout rather than `$?` is still right; the reason is that status
-# exits 0 whenever it CAN report, not that it always can.
+# freshly wired repo sits without `.adversarial-review/watch/` — and ⚠ §3069: NOTHING
+# creates it in hook mode ("until its first review creates it" was false: the on-commit
+# hook exits before dispatching while the directory is absent, so the first review never
+# comes). `eugo-skills arm-review` seeds the tracked RESOLVED.md that creates it on every
+# clone. Parsing stdout rather than `$?` is still right; the reason is that status exits
+# 0 whenever it CAN report, not that it always can.
 #
 # ⚠ AND THE GUARD IS ON THE FAILURE PATH, NOT AHEAD OF IT. The first version of this fix
 # tested for the directory BEFORE running the drain and short-circuited — which silenced a
@@ -50,7 +53,7 @@ say() { printf 'review watch: %s\n' "$1"; exit 0; }
 # FAILURE.
 if ! OUT="$(cd "$ROOT" && python3 "$DRAIN" status 2>/dev/null)"; then
   if [ ! -d "$ROOT/.adversarial-review/watch" ]; then
-    say "no .adversarial-review/watch yet — review has nothing to report until its first run creates it"
+    say "no .adversarial-review/watch yet — review is wired but NOT armed (the hooks exit before dispatching); \`eugo-skills arm-review --into .\` seeds it, then commit"
   fi
   say "watch_drain.py status failed — run it yourself"
 fi
@@ -123,6 +126,9 @@ esac
 WIRED="$(field review_wired)"
 UNREVIEWED="$(field unreviewed)"
 HOLDER="$(field holder)"
+# §3069 — the per-tick budget the watcher will honour (`tick_budget=` from a §3067 drain;
+# "" from an older one), so a pending catch-up is priced before it is spent.
+BUDGET="$(field tick_budget)"
 
 case "$WIRED" in
   no)
@@ -155,7 +161,15 @@ case "$WIRED" in
     # `+` means the scan window was exhausted, so the number is a floor.
     case "$UNREVIEWED" in
       ""|"?"|0) ;;
-      *) REVIEW="$REVIEW; ⚠ $UNREVIEWED commit(s) unreviewed" ;;
+      *)
+        REVIEW="$REVIEW; ⚠ $UNREVIEWED commit(s) unreviewed"
+        # §3069 — name the pace: a positive integer budget means the next dispatches
+        # review at most that many each (HEAD first); "" (old drain) or 0 (unbounded)
+        # keep the line as it was.
+        case "$BUDGET" in
+          ""|0|*[!0-9]*) ;;
+          *) REVIEW="$REVIEW — reviewed at ≤$BUDGET per tick" ;;
+        esac ;;
     esac ;;
 esac
 # §2092 — a RUNNING daemon can still be the wrong daemon: `stale=yes` means the script

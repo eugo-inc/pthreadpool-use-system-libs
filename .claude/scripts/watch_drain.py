@@ -93,6 +93,9 @@ OWED_VERDICTS = frozenset({"NEEDS_REVISION", "ERROR"})
 #: every entry written before the field existed (~1,959 rows on 2026-09-19), so the
 #: daemon-vs-hook coverage question is answerable forward, not backward.
 WRITERS = ("hook-commit", "hook-turn-end", "daemon", "once")
+#: §3067 — MIRRORS `codex_watch.ARMED_RE` (the arming boundary in RESOLVED.md, written by
+#: `eugo-skills arm-review`); pinned equal by test_watch_drain.py like WRITERS above.
+ARMED_RE = re.compile(r"^<!-- armed-at: ([0-9a-f]{40}) -->$", re.M)
 #: §3046 — MIRRORS codex_watch._ACCOUNT_DOWN_MARKERS (pinned equal by test_watch_drain.py):
 #: the notes that mean the ACCOUNT could not review, as distinct from this commit failing.
 #: `status` counts the owed entries that carry one, INFORMATIONALLY — they stay owed (a
@@ -416,6 +419,22 @@ def unreviewed_count(repo_root: Path, advice_dir: Path) -> "str":
         return "?"
 
     return f"{len(pending)}{'+' if truncated else ''}"
+
+
+def selection_fields(repo_root: Path, advice_dir: Path) -> str:
+    """§3067 — `armed_at=… upstream_ref=… tick_budget=…`, the three things that decide what
+    the next dispatch selects, read from the sibling `codex_watch`; "" when the sibling
+    predates them (the "" rule `eugo-watch-owed.sh` already follows for `unreviewed`)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import codex_watch  # noqa: PLC0415 — sibling script, resolved beside this file
+        armed = codex_watch.armed_at(advice_dir)
+        upstream = codex_watch.upstream_ref(str(repo_root))
+        return (f"armed_at={armed[:12] if armed else '(none)'} "
+                f"upstream_ref={upstream or '(none)'} "
+                f"tick_budget={codex_watch.resolve_tick_budget()}")
+    except Exception:  # noqa: BLE001 — a sibling too old for §3067: report nothing, never fail
+        return ""
 
 
 def _fmt_epoch(epoch: float) -> str:
@@ -976,6 +995,8 @@ def cmd_status(args: argparse.Namespace, advice_dir: Path) -> int:
         # §2189 — the depth the cure needs, so the banner names a command that reaches
         # what it counts. Empty when nothing is stuck, which is the common path.
         f"retry_scan={retry_scan_depth(advice_dir, Path(args.repo))}",
+        # §3067 — the boundary, the exclusion and the budget the next dispatch will honour.
+        selection_fields(Path(args.repo), advice_dir),
         f"resolved_md={'present' if resolved.exists else 'absent'} resolved_rows={len(resolved.rows)}"
         + (f" ⚠ UNRECOGNISED: {resolved.unrecognised} table line(s) this parser could not see "
            f"(a different RESOLVED.md schema) — resolved_rows=0 describes THIS PARSER, not the file"

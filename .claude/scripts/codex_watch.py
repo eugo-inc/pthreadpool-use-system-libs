@@ -157,6 +157,100 @@ def _resolve_writer(once: bool, env: dict | None = None) -> str:
     return "once" if once else "daemon"
 
 
+#: §3067 (§1.75) — HOW MANY commits one `--since-ledger` tick may REVIEW, carried in the
+#: ENVIRONMENT for the same reason as WRITER_ENV: a flag from a newer hook into an older
+#: installed copy is an argparse exit 2 in a log nobody reads, an unknown env var is
+#: ignored. `--tick-budget` overrides it for operator passes; 0 = unbounded (the
+#: `--max-ticks` convention). The default is 3 — HEAD and two of the backlog per dispatch,
+#: ~7.5 min of review — because the hook fires on every commit and turn end, so a stale
+#: checkout that pulls 30 commits drains them over ten dispatches instead of one 75-minute
+#: background burn on the session user's credentials. Operator ruling 2026-09-21.
+TICK_BUDGET_ENV = "EUGO_REVIEW_TICK_BUDGET"
+DEFAULT_TICK_BUDGET = 3
+#: §3067 (§1.76) — THE ARMING BOUNDARY, read from the tracked `RESOLVED.md` beside the
+#: ledger: `<!-- armed-at: <sha40> -->`, written by `eugo-skills arm-review`. Commits at or
+#: before it are never selected: a freshly armed repo reviews what lands AFTER the arming,
+#: never its history (operator ruling 2026-09-21: forward-only). MIRRORS
+#: `watch_drain.ARMED_RE`, pinned equal by test_watch_drain.py.
+ARMED_RE = re.compile(r"^<!-- armed-at: ([0-9a-f]{40}) -->$", re.M)
+#: §3067 (§1.76) — WHOSE commits are ours. A vendored fork's history is mostly upstream's
+#: (eugo-grpc: 79 of the last 100 commits, 2026-09-21), brought in by sync merges; the
+#: merge commit is reviewed as its combined diff (the conflict resolutions — cheap and
+#: right), the commits it carried are NOT ours to review. Reachability from the upstream
+#: ref is the test — never an author filter: ring, eugo-website and eugo-university have
+#: outside collaborators whose code the operator wants reviewed.
+_UPSTREAM_TABLES = ("review", 'skills.adapters."eugo-upstream-merge"')
+_UPSTREAM_KEY_RE = re.compile(r'^\s*upstream_ref\s*=\s*"([^"]+)"')
+_TOML_TABLE_RE = re.compile(r"^\s*\[([^\]]+)\]")
+_UPSTREAM_WARNED: set[str] = set()
+
+
+def resolve_tick_budget(env: dict | None = None) -> int:
+    """The per-tick review budget: the env value when it is a non-negative int, else the default."""
+    val = ((env if env is not None else os.environ).get(TICK_BUDGET_ENV) or "").strip()
+    if val.isdigit():
+        return int(val)
+    return DEFAULT_TICK_BUDGET
+
+
+def armed_at(advice_dir: Path) -> str | None:
+    """The `armed-at` sha in `<advice_dir>/RESOLVED.md`, or None (absent, unreadable, or not
+    exactly one marker). The path is a LITERAL, not a `_transient` join: RESOLVED.md is a
+    TRACKED file (org rule D5), so it must never reach the transient-file registry."""
+    try:
+        text = (advice_dir / "RESOLVED.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    found = ARMED_RE.findall(text)
+    return found[0] if len(found) == 1 else None
+
+
+def _configured_upstream_ref(repo: str) -> str | None:
+    """`upstream_ref = "…"` from `.eugo.toml`'s `[review]` table, else the fork kit's
+    `[skills.adapters."eugo-upstream-merge"]` table. A line scanner, not tomllib: the hook
+    runs whatever `python3` the checkout's host has, and the two keys are all it needs."""
+    try:
+        lines = (Path(repo) / ".eugo.toml").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    found: dict[str, str] = {}
+    table = ""
+    for line in lines:
+        m = _TOML_TABLE_RE.match(line)
+        if m:
+            table = m.group(1).strip()
+            continue
+        k = _UPSTREAM_KEY_RE.match(line)
+        if k and table in _UPSTREAM_TABLES and table not in found:
+            found[table] = k.group(1).strip()
+    for table in _UPSTREAM_TABLES:
+        if found.get(table):
+            return found[table]
+    return None
+
+
+def upstream_ref(repo: str) -> str | None:
+    """The ref whose reachable commits are excluded from selection, RESOLVED in this checkout,
+    or None. Order: `.eugo.toml [review] upstream_ref` → the fork kit's `upstream_ref` param →
+    a remote literally named `upstream` (`upstream/HEAD`, then `upstream/main`, `upstream/master`).
+    A configured ref that does not resolve here (no `upstream` remote in this clone, say) is
+    reported ONCE per process on stderr and selection proceeds as if none were set — every
+    commit in the window, budget-bounded — never silently narrower."""
+    configured = _configured_upstream_ref(repo)
+    candidates = [configured] if configured else []
+    if not configured and "upstream" in _git(repo, "remote").split():
+        candidates = ["upstream/HEAD", "upstream/main", "upstream/master"]
+    for ref in candidates:
+        if _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").strip():
+            return ref
+    if configured and configured not in _UPSTREAM_WARNED:
+        _UPSTREAM_WARNED.add(configured)
+        print(f"[watch] upstream ref {configured!r} (from .eugo.toml) does not resolve in this "
+              f"checkout — selecting from the whole window; `git fetch upstream` restores the "
+              f"exclusion", file=sys.stderr, flush=True)
+    return None
+
+
 _STOP = False
 
 
@@ -471,12 +565,21 @@ def terminal_refs(advice_dir: Path) -> set[str]:
 
 
 def unreviewed_commits(repo: str, advice_dir: Path, scan: int,
-                       *, retry_abandoned: bool = False) -> tuple[list[str], bool]:
+                       *, retry_abandoned: bool = False,
+                       ignore_armed_at: bool = False) -> tuple[list[str], bool]:
     """(oldest-first commits on HEAD with no ledger entry, window-may-be-too-small).
 
     ⚠ `scan` is a HARD CAP and it is a safety device, not a tuning knob. Against an
     EMPTY ledger every commit in history is "unreviewed", so an uncapped scan would
     queue thousands of reviews at ~151s each.
+
+    §3067 — TWO MORE FILTERS, both fail-OPEN. (1) The arming boundary: with an `armed-at`
+    marker in RESOLVED.md that is an ancestor of HEAD, the window is `<armed>..HEAD`; a
+    marker that is NOT an ancestor (rewritten history) is reported on stderr and the plain
+    window applies — never `[]`, which is what `_git`'s "" on a failed `rev-list` would
+    silently produce. `ignore_armed_at` is the operator's way to reach pre-boundary refs.
+    (2) The upstream exclusion: `^<upstream_ref>` when one resolves (see `upstream_ref`).
+    `-{scan}` stays on every form, so `truncated` keeps its meaning.
 
     ⚠ THE SECOND RETURN IS DELIBERATELY NOT "how many commits fell outside the window".
     That was the first version and it is useless: this repo has 5,621 commits, so a
@@ -488,7 +591,21 @@ def unreviewed_commits(repo: str, advice_dir: Path, scan: int,
     """
     if scan <= 0:
         return [], False
-    shas = _git(repo, "rev-list", "--reverse", f"-{scan}", "HEAD").split()
+    args = ["rev-list", "--reverse", f"-{scan}"]
+    boundary = None if ignore_armed_at else armed_at(advice_dir)
+    if boundary and _git(repo, "merge-base", boundary, "HEAD").strip() == boundary:
+        args.append(f"{boundary}..HEAD")
+    else:
+        if boundary:
+            print(f"[watch] WARN: armed-at {boundary[:12]} is not an ancestor of HEAD (rewritten "
+                  f"history?) — selecting from the {scan}-commit window instead; re-run "
+                  f"`eugo-skills arm-review --set-armed-at` to move the boundary",
+                  file=sys.stderr, flush=True)
+        args.append("HEAD")
+    up = upstream_ref(repo)
+    if up:
+        args.append(f"^{up}")
+    shas = _git(repo, *args).split()
     done = reviewed_refs(advice_dir)
     # §2112 — a commit that has already burned its retries is NOT selected again. Without
     # this, a deterministically-failing commit is re-reviewed on every dispatch (~151s of
@@ -1495,6 +1612,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ledger-scan", type=int, default=100,
                     help="with --since-ledger, the most recent N commits to consider "
                          "(hard cap: an empty ledger would otherwise queue all of history)")
+    # §3067 — the per-tick budget and the boundary override. Both default from the
+    # environment / the ledger dir so the hooks never pass them (see TICK_BUDGET_ENV).
+    ap.add_argument("--tick-budget", type=int, default=None,
+                    help=f"with --since-ledger, review at most N commits per tick, HEAD first "
+                         f"(default: ${TICK_BUDGET_ENV} or {DEFAULT_TICK_BUDGET}; 0 = unbounded)")
+    ap.add_argument("--ignore-armed-at", action="store_true",
+                    help="select from the whole window even when RESOLVED.md carries an "
+                         "`armed-at` boundary — for operator passes over pre-arming refs")
     # §port-20260828 — ported from epstein-drive (Ben, 2026-08-14): skip commits whose SUBJECT
     # matches — for work already reviewed elsewhere. The athena-rollout commits landing in a
     # consumer repo are reviewed by athena itself, so re-reviewing them there is pure spend.
@@ -1614,10 +1739,17 @@ def main(argv: list[str] | None = None) -> int:
     # log: a `--retry-abandoned --ledger-scan 1000` pass announced `since=d25cc40a92d8`,
     # which is HEAD, while it was reaching back to commits from 2026-08-30.
     # §2133's lesson one file over: a label outliving the thing it described.
+    # §3067 — resolved once per process; the banner below names them because the selection
+    # they change is exactly what a reader of a catch-up log asks about (§2139).
+    tick_budget = cfg.tick_budget if cfg.tick_budget is not None else resolve_tick_budget()
+    ignore_armed = bool(getattr(cfg, "ignore_armed_at", False))
     if cfg.since_ledger:
         selection = f"selection=ledger scan={cfg.ledger_scan}"
         if getattr(cfg, "retry_abandoned", False):
             selection += " +retry-abandoned"
+        boundary = None if ignore_armed else armed_at(advice_dir)
+        selection += (f" armed-at={boundary[:12] if boundary else '(none)'}"
+                      f" upstream={upstream_ref(cfg.repo) or '(none)'} budget={tick_budget}")
     else:
         selection = f"selection=anchor since={last_sha[:12] or '(none)'}"
     print(f"[watch] started repo={cfg.repo} driver={Path(cfg.driver).name} commits={cfg.commits} worktree={cfg.worktree} "
@@ -1646,7 +1778,8 @@ def main(argv: list[str] | None = None) -> int:
                 if cfg.since_ledger:
                     new, truncated = unreviewed_commits(
                         cfg.repo, advice_dir, cfg.ledger_scan,
-                        retry_abandoned=getattr(cfg, "retry_abandoned", False))
+                        retry_abandoned=getattr(cfg, "retry_abandoned", False),
+                        ignore_armed_at=ignore_armed)
                     if truncated:
                         print(f"[watch] --ledger-scan {cfg.ledger_scan}: the OLDEST commit "
                               f"in the window is itself unreviewed, so older unreviewed "
@@ -1668,7 +1801,19 @@ def main(argv: list[str] | None = None) -> int:
                 # earlier cure added a WARN and left the behaviour, so the log said
                 # "skipped" and meant "lost".
                 reviewed_through = None
-                for sha in new:
+                # §3067 — LEDGER MODE REVIEWS THE NEWEST FIRST, under the tick budget. The
+                # list is oldest-first (the anchor path needs that: anchoring `last_sha` to a
+                # newest-first review would skip older commits forever), so under
+                # `--since-ledger`, which has no anchor, HEAD is moved to the front: the commit
+                # that just landed is reviewed by the dispatch it triggered, and the backlog
+                # behind it drains at ≤budget per tick instead of blocking HEAD for its length.
+                order = [new[-1], *new[:-1]] if (cfg.since_ledger and new) else list(new)
+                dispatched = 0
+                for pos, sha in enumerate(order):
+                    if cfg.since_ledger and tick_budget and dispatched >= tick_budget:
+                        print(f"[watch] tick budget {tick_budget} reached — {len(order) - pos} "
+                              f"commit(s) wait for the next dispatch", flush=True)
+                        break
                     if skip_re is not None:
                         subject = _git(cfg.repo, "log", "-1", "--format=%s", sha).strip()
                         if skip_re.search(subject):
@@ -1704,6 +1849,7 @@ def main(argv: list[str] | None = None) -> int:
                     # VISIBLE is not the same as recovering from it — the same half-cure
                     # shape as §1692, two rows apart.
                     entry = _review(cfg.repo, "commit", sha, show, cfg, advice_dir)
+                    dispatched += 1  # §3067 — a `_review` call is the unit the budget counts
                     if entry is not None and entry.get("driver_exit"):
                         # §2089 — an ACCOUNT-level failure is charged to NOBODY. Spending
                         # this commit's budget on an outage is how seven commits were lost

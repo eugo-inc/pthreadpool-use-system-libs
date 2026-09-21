@@ -2,3 +2,18 @@
 .claude/eugo-mcp-headers.txt
 # eugo-kb central instructions, refreshed per machine by the session hook (never committed)
 .claude/rules/eugo-central.md
+# >>> eugo-skills managed (edit outside this block) >>>
+.claude/settings.local.json
+.claude/skills/_pulled/
+.claude/data/external-drafts/
+/.adversarial-review/watch/raw/
+/.adversarial-review/watch/.watch.lock
+/.adversarial-review/watch/.watch.worktree.lock
+/.adversarial-review/watch/.advice.lock
+/.adversarial-review/watch/STOP
+/.adversarial-review/watch/STOP.worktree
+/.adversarial-review/watch/daemon.log
+__pycache__/
+*.pyc
+*.bak
+# <<< eugo-skills managed <<<
