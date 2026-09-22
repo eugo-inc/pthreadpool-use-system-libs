@@ -18,6 +18,8 @@ python3 .claude/scripts/watch_drain.py [--repo <dir>] [--advice-dir .adversarial
                                           `git show --name-only` intersects the pathspecs
   rotate --through <ts> [--lock-timeout N] [--dry-run]
                                           archive every entry APPENDED (else ts) <= through
+  resolve --ref <ref> --status <S> --evidence <text> [--ts <ts>]
+          [--lock-timeout N] [--dry-run] write ONE RESOLVED.md row for the matched entry
 ```
 
 THE LEDGER — `<advice-dir>/RESOLVED.md`. A Markdown table keyed `ts · ref` (the entry's
@@ -26,6 +28,30 @@ shorthand), one row per handled entry, status in {FIXED §id, OPEN → FUTURE, R
 RETRY, UNTRACED}, plus one marker line `<!-- drained-through: <ts> -->` (`(none)` before
 the first drain). `rotate` REFUSES while any NEEDS_REVISION/ERROR entry at or before
 `--through` has no row: the record is the precondition, not a by-product.
+
+THE WRITE PATH — `resolve`. Until §3070 the ledger had `status`/`list`/`rotate` and no
+way to WRITE a row, so dispositioning meant hand-editing a Markdown table and the queue
+grew at review speed while it shrank at hand-edit speed (measured here 2026-09-21:
+`unresolved=40`, of which most were already fixed or refuted in commits and prose). A
+row is DERIVED from the matched entry — `ts`, `kind`, `ref`, `model`, `verdict` all come
+from advice.jsonl, never from the caller; only `status` and `evidence` are the caller's,
+because only those are a judgement. The row is inserted INSIDE the ledger table rather
+than appended at EOF: `read_resolved` only sees rows while `in_table`, so a row written
+below later prose would be walked straight past — the §2159 defect, written rather than
+read. Every write is verified by RE-READING it with this file's own reader before the
+rename, so "the writer emits rows the reader accepts" is a checked precondition rather
+than a claim.
+
+⚠ `resolve` DOES NOT DEDUPE A RE-REPORTED DEFECT. A `worktree` ref is a per-snapshot
+content hash, so an undispositioned finding re-mints a NEW owed entry at every turn
+boundary and needs a fresh row each time. Fingerprinting the finding itself was
+considered and REFUSED at §3070: the two live `.gitignore` entries on 2026-09-21
+(`66cbea4b3784` 04:03:51Z, `3bd4f1e0b04c` 04:29:53Z) are one defect whose text was
+REWRITTEN between rounds — "has been truncated to 0 bytes" vs "is still 0 bytes …
+Fifth round, still unaddressed" — so any fingerprint tight enough to be safe misses
+them, and one loose enough to catch them can make a genuinely NEW finding inherit a
+stale REFUTED and vanish. A stable finding id belongs at EMISSION (the reviewer naming
+its own finding), not at disposition time by post-hoc text matching.
 
 `--through` takes the daemon's own `YYYY-MM-DDTHH:MM:SSZ`, or a bare `YYYY-MM-DD` meaning
 through the end of that UTC day, and is refused when later than now (§2918).
@@ -42,9 +68,10 @@ mtime. Test/diagnostic hook: `WATCH_DRAIN_HOLDER_START=<epoch seconds>` replaces
 `/proc` read of the holder's start time (nothing else).
 
 EXIT CODES. 0 done · 1 failure having written nothing (I/O, malformed input, a cursor
-that would move backwards, or `in != archived + remaining`) · 2 an owed entry has no
-RESOLVED.md row · 3 `.advice.lock` not acquired within `--lock-timeout` · 4 the watch
-daemon holding `.watch.lock` predates the installed `codex_watch.py`.
+that would move backwards, `in != archived + remaining`, or a `resolve` whose --ref
+matches no entry / more than one / whose --status is outside the vocabulary) · 2 an owed
+entry has no RESOLVED.md row · 3 `.advice.lock` not acquired within `--lock-timeout` · 4
+the watch daemon holding `.watch.lock` predates the installed `codex_watch.py`.
 
 WRITES. Every file `rotate` touches is written to a sibling temp file, fsynced and
 renamed into place: `archive/<yyyy-mm>.jsonl` (appended, by entry month), `advice.jsonl`
@@ -69,6 +96,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 
 # This repo root (/opt/eugo/athena) — `.claude/scripts/watch_drain.py`.parents[2].
@@ -93,6 +121,9 @@ OWED_VERDICTS = frozenset({"NEEDS_REVISION", "ERROR"})
 #: every entry written before the field existed (~1,959 rows on 2026-09-19), so the
 #: daemon-vs-hook coverage question is answerable forward, not backward.
 WRITERS = ("hook-commit", "hook-turn-end", "daemon", "once")
+#: §3103 — MIRRORS `codex_watch.SESSION_ENV`, pinned equal by test_watch_drain.py for the
+#: same reason WRITERS is: two copies of a name that must agree is how they stop agreeing.
+SESSION_ENV = "EUGO_REVIEW_SESSION"
 #: §3067 — MIRRORS `codex_watch.ARMED_RE` (the arming boundary in RESOLVED.md, written by
 #: `eugo-skills arm-review`); pinned equal by test_watch_drain.py like WRITERS above.
 ARMED_RE = re.compile(r"^<!-- armed-at: ([0-9a-f]{40}) -->$", re.M)
@@ -117,8 +148,168 @@ def account_is_down(obj: dict) -> bool:
     texts = [str(r.get("note") or "") for r in (obj.get("results") or []) if isinstance(r, dict)]
     texts.append(str(obj.get("driver_stderr_tail") or ""))
     return any(marker in t.lower() for t in texts for marker in ACCOUNT_DOWN_MARKERS)
+def account_hold_until(advice_dir: Path, now: float | None = None) -> str:
+    """§3122 — the persisted quota hold (`.account-down`, written by codex_watch) as
+    `YYYY-MM-DDTHH:MM:SSZ` while in force, else `-`. Read with the same fail-OPEN rule as
+    its writer's reader: absent, unreadable or junk is `-` (no hold), never an error."""
+    try:
+        until = float((advice_dir / ".account-down").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return "-"
+    if until <= (time.time() if now is None else now):
+        return "-"
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
+
+
 #: The status vocabulary — the row's status cell must START with one of these.
-STATUS_VOCAB = ("FIXED", "OPEN", "REFUTED", "RETRY", "UNTRACED")
+#: §3108 adds `CLAIMED` (§1.85 cure 2). Purely ADDITIVE: the reader is a prefix test, so
+#: every row written before it stays valid and no existing status changes meaning.
+STATUS_VOCAB = ("CLAIMED", "FIXED", "OPEN", "REFUTED", "RETRY", "UNTRACED")
+
+#: §3108 — how long a claim holds the finding before it returns to the pool.
+#:
+#: ⚠ 24 HOURS IS AN OPERATOR RULING (2026-09-22) AND THE REASON IS NOT FIX DURATION. Asked
+#: to choose, I offered 30 min / 90 min / 8 h, all derived from how long WORK takes here
+#: (review p50 151 s, ~8.1 min per commit, the >90 min BLOCKED threshold). Every one was
+#: wrong by an order of magnitude, because the quantity that actually matters is how long
+#: a SESSION SITS PARKED: "sometimes I do not continue the session until some other ends".
+#: A claim TTL is a statement about the claimer's availability, not about the task.
+#:
+#: HARD EXPIRY, no renewal (same ruling). A claim that refreshes itself on activity is one
+#: a stuck or looping session renews forever, which is exactly the "stale claims become the
+#: next backlog" failure §1.85 warns about. Re-claiming after expiry is one explicit call.
+CLAIM_TTL_SECONDS = 24 * 3600
+
+#: §3112 — how far ahead of our clock a claim's stamp may sit and still be believed.
+#: Three sessions share this checkout as different UNIX users, and a stamp written a
+#: second or two ahead of the reader's clock is ordinary disagreement, not a forgery.
+#: Beyond this the stamp is not trusted and the claim FAILS OPEN (finding stays visible),
+#: which is what stops a skewed clock or a hand-edited cell parking a finding for a year.
+CLAIM_FUTURE_SKEW_SECONDS = 300
+
+#: §3102 (§1.85 cure 1) — the statuses that do NOT take an entry off the queue.
+#:
+#: ⚠ EVERY QUERY USED TO KEY ON ROW PRESENCE, NOT STATUS: `resolved.lookup(e) is None`. So a
+#: session that correctly declined a verdict as not-its-own, and said so in the sanctioned way
+#: by writing an `OPEN` row, REMOVED that verdict from every other session's queue — its
+#: owner's included. Measured in protomolecule on refs `573138344d32` and `58fadb21bb0b`: both
+#: were absent from `list --unresolved` the moment the courtesy row landed, and one of them had
+#: been deliberately left rowless by a peer BECAUSE its finding was live.
+#:
+#: The vocabulary always anticipated this — `OPEN` has been a token since the file was written.
+#: Only the queries never honoured it, which is why the cure is a predicate and not a new token.
+#: §3108 — `CLAIMED` joins it. A claim says "I am working on this", which is the opposite
+#: of a closure: `rotate` must never archive a claimed entry, and `resolve` must still be
+#: able to write the real disposition over it when the work lands.
+NON_DISCHARGING = ("OPEN", "CLAIMED")
+
+
+def discharges(status: str | None) -> bool:
+    """Does a RESOLVED.md row carrying `status` take its entry OFF the queue?
+
+    None (no row at all) does not discharge. A row whose status begins with a
+    NON_DISCHARGING token does not discharge either: it records that somebody looked and
+    left the finding live, which is the opposite of closing it.
+    """
+    return status is not None and not status.startswith(NON_DISCHARGING)
+
+
+def owns(entry_session: str | None, session: str | None) -> bool:
+    """Is an entry stamped `entry_session` owned by `session`?
+
+    ONE definition, imported by every caller — `list --mine`, the turn-end hook's
+    blocking partition, and anything later that asks the same question. §3094 said "both
+    comparison sites" and there were three; §3102 said "all three predicates" and there
+    were four; a second copy of THIS predicate is how that becomes five, so the hook
+    imports it rather than re-deriving it in its embedded Python.
+
+    ABSENT IS NOT A MATCH, on either side. An unstamped entry (820 of the 822 in athena's
+    ledger on 2026-09-22, every one written before §3103) is owned by NOBODY rather than
+    by everybody, and a caller with no session of its own owns nothing. Both directions
+    matter: the first stops a cold session inheriting the whole backlog as "its" work,
+    the second stops an unidentified caller claiming it.
+
+    ⚠ OWNERSHIP OF A `worktree` ENTRY MEANS "DISPATCHED IT", NEVER "WROTE IT". That ref is
+    a content hash over the SHARED dirty tree, which several sessions and accounts write
+    at once, so the stamp records who asked for the review and nothing about authorship.
+    §3085's wording already refuses to claim an owner for those; this predicate is what
+    decides whose turn gets INTERRUPTED, which is a different question and a fair one.
+    """
+    a = (entry_session or "").strip()
+    b = (session or "").strip()
+    return bool(a) and a == b
+
+
+#: `CLAIMED <session> <ISO8601>` — the two cells a claim carries inside its status.
+CLAIM_RE = re.compile(r"^CLAIMED\s+(\S+)\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)")
+
+
+def parse_claim(status: str | None) -> tuple[str, float] | None:
+    """`(claimant, claimed_at_epoch)` for a well-formed claim row, else None.
+
+    A `CLAIMED` row this cannot parse is deliberately treated as NO claim by
+    `claim_is_live` below, so a hand-edited or truncated cell fails OPEN — the finding
+    stays visible to everyone. The opposite default would let one malformed row park a
+    finding permanently, which is the failure mode §1.85 names.
+    """
+    m = CLAIM_RE.match((status or "").strip())
+    if not m:
+        return None
+    try:
+        when = datetime.strptime(m.group(2), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return m.group(1), when.timestamp()
+
+
+def claim_is_live(status: str | None, now: float | None = None) -> bool:
+    """Is this row a claim that has NOT yet expired?"""
+    got = parse_claim(status)
+    if got is None:
+        return False
+    _who, at = got
+    # ⚠ §3112 — A CLAIM CAN NEVER HAVE STARTED LATER THAN NOW, AND §3108's COMMENT HERE
+    # ASSERTED A BOUND IT DID NOT IMPLEMENT. It read: "it expires TTL after its own stamp,
+    # and clock skew ... must not make one immortal. Comparing to `at + TTL` rather than to
+    # `now - at` keeps that bounded." Both halves were false. The two forms are the SAME
+    # inequality — `now < at + TTL` ⟺ `now - at < TTL` — so the distinction it drew does
+    # not exist; and neither bounds a FUTURE stamp. Measured on the shipped code: a row
+    # stamped one year ahead reported live=True, i.e. live for a year, which is exactly the
+    # "stale claims that never expire become the next backlog" failure §1.85 names the TTL
+    # to prevent. A wrong comment is bad; this one was worse, because it told the next
+    # reader the hazard was already handled.
+    #
+    # ⚠ AND THE FIRST FIX FOR IT WAS ALSO WRONG, caught by this function's own new test
+    # before it shipped. It read `now < min(at, now) + TTL` — clamping the start to `now`.
+    # But `now` is the EVALUATION time, so the clamp moves with every call: at now+10*TTL
+    # the effective start is also now+10*TTL, and the claim is live again. A bound measured
+    # from a moving reference is not a bound. Demonstrated at three evaluation times, all
+    # live.
+    #
+    # A claim must have STARTED to be live, and only a stamp that is plausibly in the past
+    # counts as started. `CLAIM_FUTURE_SKEW_SECONDS` is the tolerance for ordinary clock
+    # disagreement between machines sharing this checkout; beyond it the stamp is not
+    # trusted, and an untrusted claim FAILS OPEN — the finding stays visible to everyone,
+    # exactly as an unparseable claim does in `parse_claim`. Hiding a finding is the
+    # privilege this function grants, so anything it cannot vouch for must not get it.
+    now = time.time() if now is None else now
+    return at - CLAIM_FUTURE_SKEW_SECONDS <= now < at + CLAIM_TTL_SECONDS
+
+
+def hides(status: str | None, now: float | None = None) -> bool:
+    """Does this row take the entry off the QUEUE right now?
+
+    Two different questions live here and conflating them is how `rotate` would delete
+    work somebody is doing:
+
+    * `discharges` — is it CLOSED? Permanent, and the only thing that may let `rotate`
+      archive an entry away.
+    * `hides` — should the queue stop showing it right now? Closed OR live-claimed, and
+      the claim half is TEMPORARY by construction.
+
+    So `list --unresolved` and `status` ask THIS, and `rotate` keeps asking `discharges`.
+    """
+    return discharges(status) or claim_is_live(status, now)
 #: A ref this short or longer identifies an entry (the daemon logs `ref[:12]`).
 MIN_REF_PREFIX = 12
 
@@ -421,6 +612,42 @@ def unreviewed_count(repo_root: Path, advice_dir: Path) -> "str":
     return f"{len(pending)}{'+' if truncated else ''}"
 
 
+def unreviewed_oldest_h(repo_root: Path, advice_dir: Path) -> str:
+    """Hours since the OLDEST pending commit was committed, "0" when none, or "?".
+
+    §3109 (§1.85) — THE DEPTH WAS NEVER THE URGENT NUMBER. `unreviewed=N` says how much
+    is queued; it cannot distinguish six commits from the last ten minutes (healthy, they
+    drain at ≤budget per tick) from six that have been waiting since yesterday (the queue
+    is not keeping up). Measured on this repo's own ledger 2026-09-22: commit-to-review
+    p90 of 63.9 min since 2026-09-21 with six over an hour, and NOTHING reported it —
+    which is exactly why the operator noticed it as "arrived almost an hour or two later"
+    rather than from any line this tooling prints.
+
+    Same degradation rule as `unreviewed_count`: "?" on any failure, and "?" is never zero.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import codex_watch  # noqa: PLC0415 — sibling script, resolved beside this file
+        if not codex_watch._git(str(repo_root), "rev-parse", "HEAD").strip():
+            return "?"
+        pending, _truncated = codex_watch.unreviewed_commits(
+            str(repo_root), advice_dir, REVIEW_SCAN)
+        if not pending:
+            return "0"
+        # `unreviewed_commits` returns OLDEST-FIRST, so pending[0] is the one that has
+        # been waiting longest. Its committer date, not its author date: a rebased or
+        # cherry-picked commit keeps an author date from days earlier and would report a
+        # backlog that never existed.
+        when = codex_watch._git(str(repo_root), "log", "-1", "--format=%ct", pending[0]).strip()
+        if not when:
+            return "?"
+        hours = (time.time() - float(when)) / 3600.0
+    except Exception:  # noqa: BLE001 — same contract as the count above
+        return "?"
+
+    return f"{hours:.1f}"
+
+
 def selection_fields(repo_root: Path, advice_dir: Path) -> str:
     """§3067 — `armed_at=… upstream_ref=… tick_budget=…`, the three things that decide what
     the next dispatch selects, read from the sibling `codex_watch`; "" when the sibling
@@ -505,6 +732,18 @@ class Entry:
     @property
     def ts(self) -> str:
         return self.obj["ts"]
+
+    @property
+    def session(self) -> str:
+        """§3103 — the session whose hook DISPATCHED this review, or "" when unrecorded.
+
+        ⚠ Not authorship, and for `kind="worktree"` not even close: that ref is a content
+        hash over the shared dirty tree, so every session in the checkout contributed to it
+        and this field names only whose turn-end fired. For `kind="commit"` it is the best
+        owner signal this system has — git cannot attribute an author on a shared clone.
+        """
+        val = self.obj.get("session")
+        return val if isinstance(val, str) else ""
 
     @property
     def visible_at(self) -> str:
@@ -602,6 +841,8 @@ def render_md(entry: dict) -> str:
     out = [f"\n## {ts} · {kind} · {ref}\n"]
     for r in results:
         out.append(f"- **{r['model']}**: {r['verdict']}\n")
+        if r.get("resolved_model", r["model"]) != r["model"]:
+            out.append(f"  - model: {r['resolved_model']}\n")
         if r.get("note"):
             out.append(f"  - note: {r['note']}\n")
         if r["critical"]:
@@ -621,7 +862,15 @@ class Resolved:
         self.cursor: str | None = None  # None = no marker line at all
         self.rows: dict[tuple[str, str], str] = {}  # (ts, ref) -> status cell
         self.by_ts: dict[str, list[tuple[str, str]]] = {}  # ts -> [(ref, status)]
+        #: §3102 — 1-based line of the row for each key, so `resolve` can REPLACE a
+        #: non-discharging row instead of appending a second one for the same entry.
+        self.row_lines: dict[tuple[str, str], int] = {}  # (ts, ref) -> lineno
         self.malformed: list[str] = []  # "<lineno>: <reason>"
+        #: 1-based line number of the LAST line of the ledger table (its header when the
+        #: table is empty), or None when no ledger header was found. `resolve` inserts
+        #: after it — see the §2159 note below for why appending at EOF is not the same
+        #: thing the moment anything is written under the table.
+        self.table_end: int | None = None
         self.exists = False
         self.text = ""
         #: §2159 — table LINES present in a file whose ledger table this parser never
@@ -638,10 +887,11 @@ class Resolved:
         exact = self.rows.get((entry.ts, entry.ref))
         if exact is not None:
             return exact
+        found = None
         for ref, status in self.by_ts.get(entry.ts, ()):
             if len(ref) >= MIN_REF_PREFIX and entry.ref.startswith(ref):
-                return status
-        return None
+                found = status  # §3102 — LAST match, so this path agrees with the exact one
+        return found
 
 
 def read_resolved(path: Path) -> Resolved:
@@ -666,13 +916,27 @@ def read_resolved(path: Path) -> Resolved:
     for lineno, line in enumerate(res.text.split("\n"), 1):
         stripped = line.strip()
         if not stripped.startswith("|"):
-            in_table = False
+            # ⚠ §3092 — AN INDENTED CONTINUATION IS INSIDE THE TABLE, NOT THE END OF IT.
+            # This read `in_table = False` for any line not starting with `|`, and a
+            # ledger row's evidence cell may span several lines whose continuations start
+            # with SPACES. So the first multi-line row closed the table and every row
+            # appended after it was walked past — well-formed, present in the file, and
+            # absent from `res.rows`. Found by hitting it: `grep -c '^| 20'` said 429 and
+            # this parser said 427, with `malformed=0` and `unrecognised=0`, so nothing
+            # reported a problem. Only a BLANK line or prose at column 0 ends a table.
+            if not stripped or not line[:1].isspace():
+                in_table = False
             continue
         cells = row_cells(stripped)
         if cells and cells[0] == "ts":
             in_table = True
             saw_ledger_header = True
+            res.table_end = lineno
             continue
+        if in_table:
+            # The separator and every row — malformed ones included, because a row this
+            # parser rejected still OCCUPIES the table and an insert must land after it.
+            res.table_end = lineno
         separator = bool(cells and cells[0] and set(cells[0]) <= {"-", ":"})
         if not in_table or separator:
             if not separator:
@@ -692,7 +956,15 @@ def read_resolved(path: Path) -> Resolved:
             res.malformed.append(f"{lineno}: status {status!r} not in {'/'.join(STATUS_VOCAB)}")
             continue
         res.rows[(ts, ref)] = status
-        res.by_ts.setdefault(ts, []).append((ref, status))
+        res.row_lines[(ts, ref)] = lineno
+        # ⚠ §3102 — LAST WINS, matching `res.rows` one line above. This appended, and
+        # `lookup`'s prefix path then returned the FIRST match while the exact path
+        # returned the LAST — the two disagreed for any duplicated key. Nothing had
+        # ever exercised it (the live ledger carries 489 rows and zero duplicate keys),
+        # and `resolve` replacing in place keeps it that way; the ordering is made
+        # consistent anyway, because a HAND-written duplicate is still reachable.
+        res.by_ts.setdefault(ts, [])
+        res.by_ts[ts] = [(r, s) for r, s in res.by_ts[ts] if r != ref] + [(ref, status)]
     # ⚠ §2159 — A TOOL'S ZERO IS A STATEMENT ABOUT THE TOOL'S UNIVERSE (§703), and this
     # parser reported one as a fact about a colleague's repo. `in_table` turns on only at a
     # row whose first cell is literally `ts`; epstein-drive's RESOLVED.md is headed
@@ -963,8 +1235,18 @@ def cmd_status(args: argparse.Namespace, advice_dir: Path) -> int:
             else:
                 other += 1
     owed = [e for e in entries if e.owed]
-    unresolved = [e for e in owed if resolved.lookup(e) is None]
+    # §3108 — `hides`, not `discharges`: a live claim takes an entry off the QUEUE without
+    # closing it. `rotate` below deliberately keeps asking `discharges`.
+    unresolved = [e for e in owed if not hides(resolved.lookup(e))]
+    claimed = sum(1 for e in owed if claim_is_live(resolved.lookup(e)))
+    down_unresolved = sum(1 for e in unresolved if account_is_down(e.obj))
     # §3043 — who wrote each entry, and whose entries carry an ERROR verdict.
+    # §3103 — how many DISTINCT sessions this ledger holds, and how many entries carry no
+    # session at all. The second number is the one that matters while the stamp rolls out:
+    # an entry with no owner is one every session still sees.
+    sessions = {e.session for e in entries if e.session}
+    unowned = sum(1 for e in entries if not e.session)
+    unowned_owed = sum(1 for e in owed if not e.session)
     writers = {w: 0 for w in (*WRITERS, "unknown")}
     writer_errors = {w: 0 for w in (*WRITERS, "unknown")}
     for e in entries:
@@ -976,12 +1258,31 @@ def cmd_status(args: argparse.Namespace, advice_dir: Path) -> int:
     months: dict[str, int] = {}
     for e in entries:
         months[e.month] = months.get(e.month, 0) + 1
+    # §3118 — which model ACTUALLY reviewed: the exact id when recorded, else the settings
+    # value marked `(unrecorded)` (every entry before §3118, and any run that could not tell).
+    reviewers: dict[str, int] = {}
+    for e in entries:
+        for r in e.obj.get("results") or []:
+            if isinstance(r, dict):
+                key = r.get("resolved_model") or f"{r.get('model', '?')}(unrecorded)"
+                reviewers[key] = reviewers.get(key, 0) + 1
     out = [
         f"advice_dir={advice_dir}",
         f"entries={len(entries)}",
         f"approved={tally['APPROVED']} needs_revision={tally['NEEDS_REVISION']} error={tally['ERROR']} "
         f"other_verdicts={other} no_result={no_result}",
-        f"owed={len(owed)} unresolved={len(unresolved)}",
+        # §3122 (§1.88) — the HONEST headline beside the two it refines: an unresolved entry
+        # whose note is an account outage is a review that never happened, not a finding.
+        # Counted over `unresolved` (claims already hidden), so work + account_down ==
+        # unresolved always; `owed`/`unresolved` keep their meaning for every other reader.
+        f"owed={len(owed)} unresolved={len(unresolved)} unresolved_work={len(unresolved) - down_unresolved} "
+        f"unresolved_account_down={down_unresolved}",
+        # §3122 — a persisted quota hold is invisible otherwise: reviewing is paused until it.
+        f"account_hold_until={account_hold_until(advice_dir)}",
+        f"sessions={len(sessions)} unowned={unowned} unowned_owed={unowned_owed}",
+        # §3108 — claimed entries are HIDDEN from `unresolved`, so without this line the
+        # queue would appear to shrink with no account of where the work went.
+        f"claimed={claimed} claim_ttl_h={CLAIM_TTL_SECONDS // 3600}",
         # §3046 — informational: how many owed entries are an account outage, not a finding.
         f"owed_account_down={sum(1 for e in owed if account_is_down(e.obj))}",
         f"abandoned={_abandoned_count(advice_dir)} "
@@ -992,6 +1293,9 @@ def cmd_status(args: argparse.Namespace, advice_dir: Path) -> int:
         # the default `--advice-dir` depth.
         f"review_wired={review_wired(Path(args.repo))} "
         f"unreviewed={unreviewed_count(Path(args.repo), advice_dir)} "
+        # §3109 — the AGE beside the depth. Six queued commits from the last ten minutes
+        # and six waiting since yesterday print the same depth and mean opposite things.
+        f"unreviewed_oldest_h={unreviewed_oldest_h(Path(args.repo), advice_dir)} "
         # §2189 — the depth the cure needs, so the banner names a command that reaches
         # what it counts. Empty when nothing is stuck, which is the common path.
         f"retry_scan={retry_scan_depth(advice_dir, Path(args.repo))}",
@@ -1006,6 +1310,7 @@ def cmd_status(args: argparse.Namespace, advice_dir: Path) -> int:
         f"ts_min={min(e.ts for e in entries) if entries else '-'} "
         f"ts_max={max(e.ts for e in entries) if entries else '-'}",
         "months=" + (",".join(f"{m}:{n}" for m, n in sorted(months.items())) or "-"),
+        "reviewers=" + (",".join(f"{k}:{n}" for k, n in sorted(reviewers.items())) or "-"),
         "archive=" + (",".join(f"{k}:{v}" for k, v in _archive_counts(advice_dir).items()) or "-"),
         "writers=" + ",".join(f"{k}:{v}" for k, v in writers.items()),
         "writer_errors=" + ",".join(f"{k}:{v}" for k, v in writer_errors.items()),
@@ -1050,7 +1355,24 @@ def cmd_list(args: argparse.Namespace, advice_dir: Path) -> int:
         wanted = {v.strip() for v in args.verdict.split(",") if v.strip()}
         entries = [e for e in entries if wanted & set(e.verdicts)]
     if args.unresolved:
-        entries = [e for e in entries if e.owed and resolved.lookup(e) is None]
+        # §3108 — a live claim hides an entry from the queue without closing it.
+        entries = [e for e in entries if e.owed and not hides(resolved.lookup(e))]
+    if args.mine:
+        # ⚠ §3103 — `--mine` WITH NO SESSION MATCHES NOTHING, NEVER EVERYTHING. Written as
+        # `want = env.get(...)` and then `if want:`, an unset variable falls through to no
+        # filter at all and the command returns the whole queue — which is how a session
+        # ends up working a peer's findings while believing it is scoped. Asking to see only
+        # your own and being handed everyone's is the failure this flag exists to prevent.
+        # §3106 — through `owns`, which encodes that same rule: an empty side never
+        # matches. The filter reads as the question it answers, and the definition lives
+        # in one place that the turn-end hook imports rather than re-deriving.
+        mine = os.environ.get(SESSION_ENV, "").strip()
+        entries = [e for e in entries if owns(e.session, mine)]
+    elif args.session:
+        # `none` is a real query ("what carries no owner?"), not a missing argument — and
+        # it is the one question `owns` cannot express, by construction.
+        entries = [e for e in entries
+                   if (e.session == "" if args.session == "none" else owns(e.session, args.session))]
     unresolvable = 0
     for e in entries:
         obj = e.obj
@@ -1110,6 +1432,331 @@ def _mode_of(path: Path, default: int = 0o664) -> int:
         return default
 
 
+# ---------------------------------------------------------------------------
+# resolve — the ledger's write path
+# ---------------------------------------------------------------------------
+
+
+def _cell(text: object) -> str:
+    """One GFM table cell: whitespace flattened, `|` escaped the way `row_cells` reads it.
+
+    ⚠ A cell is ONE LINE, and `row_cells` splits on every UNESCAPED `|`. An evidence
+    sentence carrying a raw pipe would shift every cell after it — the §2180 divergence,
+    committed by the writer instead of tripped over by the reader. Idempotent: an input
+    that already spells `\\|` is normalised first, so escaping twice is a no-op rather
+    than a `\\\\|` the reader would split on.
+    """
+    flat = " ".join(str(text).split())
+
+    return flat.replace(r"\|", "|").replace("|", r"\|")
+
+
+def parse_status(raw: str) -> str:
+    """The status cell, validated STRICTER than `read_resolved` reads it.
+
+    The reader asks `status.startswith(STATUS_VOCAB)`, which accepts `FIXEDLY` and
+    `OPENING`. A writer may only emit what the vocabulary actually means, so the FIRST
+    WHITESPACE-SEPARATED TOKEN must be a vocabulary word exactly — `FIXED b808e4893f`
+    and `OPEN -> FUTURE F123` pass, `FIXEDLY` does not. Stricter than the reader is the
+    safe direction: every row this emits is one the reader classifies.
+    """
+    cell = _cell(raw)
+    if not cell:
+        raise DrainError(EXIT_FAIL, "--status is empty")
+    head = cell.split()[0]
+    if head not in STATUS_VOCAB:
+        raise DrainError(
+            EXIT_FAIL,
+            f"--status {raw!r} starts with {head!r}, which is not one of "
+            f"{'/'.join(STATUS_VOCAB)}; a row the reader cannot classify is worse than no row",
+        )
+
+    return cell
+
+
+def select_by_ref(entries: list[Entry], ref: str, ts: str = "") -> list[Entry]:
+    """Entries this `--ref` identifies — exact, else a >=12-char prefix.
+
+    The MIRROR of `Resolved.lookup`, which matches when `entry.ref.startswith(row_ref)`
+    and the row's ref is at least `MIN_REF_PREFIX` long. A shorter ref still matches
+    EXACTLY, because `wt@2` is a real ref and four characters long.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise DrainError(EXIT_FAIL, "--ref is empty")
+    hits = [e for e in entries
+            if e.ref == ref or (len(ref) >= MIN_REF_PREFIX and e.ref.startswith(ref))]
+    if ts:
+        hits = [e for e in hits if e.ts == ts]
+
+    return hits
+
+
+def primary_verdict(entry: Entry) -> str:
+    r"""The ONE verdict word the row carries: the first OWED one, else the first.
+
+    ⚠ ONE WORD, NOT THE SET, AND THAT IS A CONTRACT WITH AN EXISTING GATE rather than a
+    style choice. `test_no_resolved_row_claims_a_verdict_its_ledger_entry_does_not_carry`
+    (§2169) reads rows with `^\| (\S+) \| (\w+) \| ([0-9a-f]{12,40}) \| \w+ \| (\w+) \|` and
+    asserts the verdict cell is one the entry carries. `\w+` matches no comma, so a cell
+    spelling the whole set is not FAILED by that gate — it is SKIPPED, silently, and the
+    row leaves the population the gate exists to police. Measured at §3070 on a real
+    12-result entry (`eac712233616` 05:53:45Z): the comma form was skipped while the
+    one-word form was matched.
+
+    The OWED verdict first, because that is the verdict the row is a disposition OF: an
+    8-result review spanning APPROVED/NEEDS_REVISION/ERROR is in this ledger because of
+    the NEEDS_REVISION, and `APPROVED` in the cell would key the disposition to the half
+    that needed none. Ties inside the owed set go to appearance order — deterministic, and
+    the rest of the picture is one `list --verdict` away.
+    """
+    verdicts = entry.verdicts
+    for v in verdicts:
+        if v in OWED_VERDICTS:
+            return v
+
+    return verdicts[0] if verdicts else "?"
+
+
+def format_row(entry: Entry, status: str, evidence: str) -> str:
+    """The ledger row for one entry: 7 cells, five of them DERIVED.
+
+    `ts`/`kind`/`ref`/`model`/`verdict` come from the entry, never from the caller —
+    `lookup` keys on `(ts, ref)`, so a caller-supplied ts could silently key a row to an
+    entry that does not exist, which is §2169's defect handed a tool to repeat it with.
+    `model` is the entry's models deduped in first-appearance order (one word on every
+    entry measured here); `verdict` is `primary_verdict`, one word by contract.
+    """
+    models: list[str] = []
+    for r in entry.obj["results"]:
+        model = str(r.get("model", "?"))
+        if model not in models:
+            models.append(model)
+
+    return (f"| {entry.ts} | {_cell(entry.kind)} | {_cell(entry.ref)} | {_cell(','.join(models))} "
+            f"| {_cell(primary_verdict(entry))} | {status} | {evidence} |")
+
+
+def replace_row(text: str, lineno: int, row: str) -> str:
+    """`row` REPLACES line `lineno` (1-based).
+
+    §3102 — `resolve` over a non-discharging row rewrites it rather than appending a second
+    row for the same `(ts, ref)`. One row per entry keeps every consumer simple — `rotate`'s
+    counts, the §2169 verdict gate, and both `lookup` paths — and the previous status is not
+    lost: `RESOLVED.md` is tracked, so `git log -p` carries the OPEN -> FIXED transition.
+    """
+    lines = text.split("\n")
+    if not 1 <= lineno <= len(lines):
+        raise ValueError(f"line {lineno} is outside the file ({len(lines)} lines)")
+    lines[lineno - 1] = row
+    return "\n".join(lines)
+
+
+def insert_row(text: str, table_end: int, row: str) -> str:
+    """`row` placed immediately after line `table_end` (1-based), inside the table."""
+    lines = text.split("\n")
+    lines.insert(table_end, row)
+
+    return "\n".join(lines)
+
+
+def cmd_resolve(args: argparse.Namespace, advice_dir: Path) -> int:
+    _require_dir(advice_dir)
+    status = parse_status(args.status)
+    evidence = _cell(args.evidence)
+    if not evidence:
+        raise DrainError(EXIT_FAIL, "--evidence is empty; a row nobody can audit is not a disposition")
+    # The lock serialises this read-modify-write against `rotate`'s cursor write and
+    # against another `resolve`. It does NOT need `check_daemon`: advice.jsonl is only
+    # READ here, so a daemon appending underneath can lose nothing.
+    with advice_lock(advice_dir, args.lock_timeout):
+        entries = load_entries(advice_dir / ADVICE_JSONL)
+        resolved_path = advice_dir / RESOLVED_MD
+        resolved = read_resolved(resolved_path)
+        if not resolved.exists:
+            raise DrainError(EXIT_FAIL, f"{resolved_path} absent — seed the ledger first")
+        if resolved.table_end is None:
+            raise DrainError(
+                EXIT_FAIL,
+                f"{resolved_path} has no ledger table headed `| ts | kind | ref | model | verdict | "
+                f"status | evidence |` ({resolved.unrecognised} unrecognised table line(s)); this "
+                "writer will not invent a schema for a file it cannot read (§2159)",
+            )
+        hits = select_by_ref(entries, args.ref, args.ts)
+        if not hits:
+            where = f" at ts {args.ts}" if args.ts else ""
+            raise DrainError(
+                EXIT_FAIL,
+                f"--ref {args.ref!r} matches no entry in {advice_dir / ADVICE_JSONL}{where}; "
+                "a row for a finding that does not exist is worse than no row",
+            )
+        if len(hits) > 1:
+            lines = [f"  --ts {e.ts}  {e.kind} · {e.ref} · {','.join(e.verdicts)}" for e in hits[:20]]
+            more = f"\n  ... {len(hits) - 20} more" if len(hits) > 20 else ""
+            raise DrainError(
+                EXIT_FAIL,
+                f"--ref {args.ref!r} matches {len(hits)} entries; refusing rather than picking one "
+                "(they are distinct findings and one evidence sentence cannot speak for both). "
+                "Re-run once per entry with --ts:\n" + "\n".join(lines) + more,
+            )
+        entry = hits[0]
+        already = resolved.lookup(entry)
+        # ⚠ §3102 — IDEMPOTENT ONLY WHEN THE EXISTING ROW ACTUALLY CLOSED THE ENTRY. This
+        # read `if already is not None`, so ANY row was terminal — and an `OPEN` row is not a
+        # closure, it is a record that somebody looked and left the finding live. A later
+        # session that HAD the fix got `unchanged … already resolved: OPEN` at exit 0 and no
+        # way to say so. So today `OPEN` did not mean "still live", it meant "closed,
+        # silently, forever" — the write-path half of the same defect the read paths carried.
+        if discharges(already):
+            print(f"unchanged {entry.ts} · {entry.ref} already resolved: {already}")
+            return EXIT_OK
+        return _write_status_row(resolved, resolved_path, entry, status, evidence,
+                                 already, args.dry_run, verb="resolved")
+
+
+def _write_status_row(resolved: Resolved, resolved_path: Path, entry, status: str,
+                      evidence: str, already: str | None, dry_run: bool,
+                      *, verb: str) -> int:
+    """Write one status row for `entry`, replacing a non-discharging row in place.
+
+    §3108 — EXTRACTED so `claim` and `resolve` share ONE copy. They differ only in what
+    they refuse BEFORE this point; everything from here — the replace-vs-insert decision,
+    the staged write, and the four on-disk assertions that re-read the file with this
+    module's own parser — is identical, and a second copy of it is how the predicate
+    defects of §3094 / §3102 / §3104 / §3107 each happened. The caller holds the lock.
+    """
+    if resolved.table_end is None:
+        # Both callers check this before taking the lock; asserted again because this
+        # function is the only thing that WRITES, and an insert at `None` is a crash
+        # inside a staged write rather than a refusal the operator can read.
+        raise DrainError(EXIT_FAIL, "refusing: no ledger table to write into (§2159)")
+    row = format_row(entry, status, evidence)
+    # REPLACE a non-discharging row rather than appending a second one for the same key:
+    # one row per entry keeps `rotate`, the §2169 gate and both `lookup` paths simple, and
+    # the OPEN -> FIXED transition survives in the tracked file's git history.
+    replacing = resolved.row_lines.get((entry.ts, entry.ref)) if already is not None else None
+    if dry_run:
+        where = (f"dry-run replace {resolved_path}:{replacing} (was {already!r})" if replacing
+                 else f"dry-run insert after {resolved_path}:{resolved.table_end}")
+        print(f"{where}\n{row}")
+        return EXIT_OK
+    staged = _Staged()
+    try:
+        tmp = staged.write(
+            resolved_path,
+            replace_row(resolved.text, replacing, row) if replacing
+            else insert_row(resolved.text, resolved.table_end, row),
+            _mode_of(resolved_path),
+        )
+        # THE CONTRACT, CHECKED ON DISK: a writer whose rows the reader drops is the
+        # whole defect this subcommand exists to end, so it is asserted here rather
+        # than left to a test. Re-read the staged file with this file's own reader.
+        after = read_resolved(tmp)
+        if after.malformed:
+            raise DrainError(EXIT_FAIL,
+                             "refusing: the row written is unparseable — " + "; ".join(after.malformed[:5]))
+        # §3102 — an INSERT adds a key, a REPLACE rewrites one in place. This asserted
+        # +1 unconditionally, which would have refused every replace with a message about
+        # a count the operation never intended to change.
+        want = len(resolved.rows) + (0 if replacing else 1)
+        if len(after.rows) != want:
+            raise DrainError(EXIT_FAIL,
+                             f"refusing: rows went {len(resolved.rows)} -> {len(after.rows)}, "
+                             f"expected {want} ({'replace' if replacing else 'insert'})")
+        back = after.lookup(entry)
+        if back != status:
+            raise DrainError(EXIT_FAIL,
+                             f"refusing: the reader resolves this entry to {back!r}, not {status!r}")
+        if after.cursor != resolved.cursor:
+            raise DrainError(EXIT_FAIL,
+                             f"refusing: the drained-through cursor moved {resolved.cursor!r} -> "
+                             f"{after.cursor!r}; {verb} never moves it")
+        staged.commit()
+    except OSError as error:
+        staged.discard()
+        raise DrainError(EXIT_FAIL, f"write failed, nothing renamed: {error}") from error
+    except DrainError:
+        staged.discard()
+        raise
+    print(f"{verb} {entry.ts} · {entry.ref} · {status}")
+    return EXIT_OK
+
+
+def cmd_claim(args: argparse.Namespace, advice_dir: Path) -> int:
+    """§3108 (§1.85 cure 2) — take an UNOWNED finding so peers stop seeing it.
+
+    The owner column (§3103) answers "whose was this?" only for entries stamped since it
+    existed. The 820 that predate it, and every entry whose dispatching session is long
+    gone, are owned by nobody — and `owns` deliberately refuses to hand those to whoever
+    starts next. A claim is how one of those gets picked up on purpose.
+
+    It EXPIRES, and that is the whole safety property: §1.85's warning is that stale
+    claims become the next backlog, so a session that dies holding one must not park the
+    finding forever. Hard expiry, no renewal — see CLAIM_TTL_SECONDS for the ruling.
+    """
+    _require_dir(advice_dir)
+    me = resolve_session_for_claim(args)
+    if not me:
+        raise DrainError(
+            EXIT_FAIL,
+            f"no session id: set ${SESSION_ENV} or pass --as. A claim names WHO holds the "
+            "finding, and an anonymous one cannot be released, audited, or told apart "
+            "from a second anonymous claim.",
+        )
+    with advice_lock(advice_dir, args.lock_timeout):
+        entries = load_entries(advice_dir / ADVICE_JSONL)
+        resolved_path = advice_dir / RESOLVED_MD
+        resolved = read_resolved(resolved_path)
+        if not resolved.exists or resolved.table_end is None:
+            raise DrainError(EXIT_FAIL,
+                             f"{resolved_path} has no ledger table to claim in (§2159)")
+        hits = select_by_ref(entries, args.ref, args.ts)
+        if not hits:
+            raise DrainError(EXIT_FAIL, f"--ref {args.ref!r} matches no entry")
+        if len(hits) > 1:
+            lines = [f"  --ts {e.ts}  {e.kind} · {e.ref}" for e in hits[:20]]
+            raise DrainError(EXIT_FAIL,
+                             f"--ref {args.ref!r} matches {len(hits)} entries; re-run with "
+                             "--ts:\n" + "\n".join(lines))
+        entry = hits[0]
+        already = resolved.lookup(entry)
+        if discharges(already):
+            print(f"unchanged {entry.ts} · {entry.ref} already resolved: {already}")
+            return EXIT_OK
+        held = parse_claim(already)
+        if held is not None and claim_is_live(already):
+            who, at = held
+            if not owns(who, me):
+                # ANOTHER session holds it and the claim is still live. Refusing is the
+                # point: two sessions fixing one finding is the collision this subcommand
+                # exists to prevent. The expiry is printed so the caller knows the wait is
+                # bounded rather than indefinite.
+                left = (at + CLAIM_TTL_SECONDS - time.time()) / 3600.0
+                raise DrainError(
+                    EXIT_FAIL,
+                    f"{entry.ref[:12]} is claimed by {who} for another {left:.1f}h "
+                    f"({already!r}). Claims expire — they are never permanent — so either "
+                    "wait, or resolve it directly if you have the fix.",
+                )
+            # Our own live claim: a no-op rather than a refresh, because refreshing on
+            # re-claim is the renewal the operator ruled against (CLAIM_TTL_SECONDS).
+            print(f"unchanged {entry.ts} · {entry.ref} already yours: {already}")
+            return EXIT_OK
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        status = f"CLAIMED {me} {stamp}"
+        evidence = _cell(args.note) or (
+            f"claimed for up to {CLAIM_TTL_SECONDS // 3600}h; it returns to the queue "
+            "automatically if no disposition is written by then")
+        return _write_status_row(resolved, resolved_path, entry, status, evidence,
+                                 already, args.dry_run, verb="claimed")
+
+
+def resolve_session_for_claim(args: argparse.Namespace) -> str:
+    """`--as` beats the environment; both are trimmed, and `|` can never enter a cell."""
+    raw = (getattr(args, "as_session", "") or os.environ.get(SESSION_ENV, "") or "").strip()
+    return "".join(c for c in raw if c.isprintable() and c != "|")[:128]
+
+
 def cmd_rotate(args: argparse.Namespace, advice_dir: Path) -> int:
     _require_dir(advice_dir)
     through = parse_through(args.through)
@@ -1144,14 +1791,31 @@ def cmd_rotate(args: argparse.Namespace, advice_dir: Path) -> int:
         if n_in != n_arch + n_rem:
             raise DrainError(EXIT_FAIL, f"partition lost entries: in={n_in} archived={n_arch} remaining={n_rem}")
 
-        missing = [e for e in to_archive if e.owed and resolved.lookup(e) is None]
+        # ⚠ §3104 — THE FOURTH SITE, AND THE ONLY DESTRUCTIVE ONE. §3102 converted the two
+        # read paths and the resolve short-circuit and its message said "all three
+        # predicates"; there were FOUR. This one still asked `lookup(e) is None`, so an
+        # entry carrying an `OPEN` row — a row that records a live finding somebody
+        # declined, not a closure — passed rotate's gate, was written to the archive and
+        # DROPPED from advice.jsonl. The read paths only hid such a finding; this removes
+        # it. Second time in two runs that a predicate replaced "everywhere" missed a copy
+        # (§3094 said "both comparison sites" and doctor held a third).
+        #
+        # ⚠ §3107 — AND "THE FOURTH SITE" WAS ITSELF WRONG: there was a FIFTH, in
+        # `.claude/hooks/eugo-review-turn-end.sh`, the first consumer of these findings.
+        # §3104's message claimed the shape was cured rather than the site; the ratchet it
+        # added `ast.parse`s THIS FILE ONLY, and a hook is shell with embedded Python, so
+        # the scan could not reach it. Third repetition of §3094's lesson that a second
+        # TOOL holds a copy. The count is left in the sentence above because correcting it
+        # to "fifth" would hide that the miscount is the recurring defect, not the number.
+        missing = [e for e in to_archive if e.owed and not discharges(resolved.lookup(e))]
         if missing:
             lines = [f"  {e.ts} · {e.ref} · {','.join(e.verdicts)}" for e in missing[:50]]
             more = f"\n  ... {len(missing) - 50} more" if len(missing) > 50 else ""
             raise DrainError(
                 EXIT_UNRESOLVED,
                 f"{len(missing)} NEEDS_REVISION/ERROR entr{'y' if len(missing) == 1 else 'ies'} at or "
-                f"before {through} lack a {RESOLVED_MD} row (keyed `ts · ref`); nothing written:\n"
+                f"before {through} are not CLOSED by a {RESOLVED_MD} row (keyed `ts · ref`; an "
+                f"`OPEN` row records a look, not a closure); nothing written:\n"
                 + "\n".join(lines) + more,
             )
 
@@ -1203,8 +1867,15 @@ def cmd_rotate(args: argparse.Namespace, advice_dir: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # §3123 (§1.89) — the module docstring states the ledger's contract, and a hand-written
+    # one-line description kept it out of `--help`; the status vocabulary rides as the epilog.
     ap = argparse.ArgumentParser(
-        description="Drain the codex_watch advice files: ledger status, cursor listing, monthly rotation.",
+        description=__doc__,
+        epilog="RESOLVED.md status vocabulary — the status cell must START with one of: "
+               + ", ".join(STATUS_VOCAB)
+               + ". A prefix test: `FIXED — already at HEAD by <sha>` passes; "
+                 "`ALREADY FIXED BY <sha>` is a malformed row (see `status`: malformed_rows=).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--repo", default=REPO_ROOT,
                     help="repo root (git cwd for --paths; the advice dir is relative to it)")
@@ -1218,7 +1889,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="only entries after RESOLVED.md's drained-through marker")
     lp.add_argument("--verdict", default="", help="csv of verdicts; keep entries carrying any of them")
     lp.add_argument("--unresolved", action="store_true",
-                    help="only NEEDS_REVISION/ERROR entries with no RESOLVED.md row")
+                    help="only NEEDS_REVISION/ERROR entries no RESOLVED.md row has CLOSED "
+                         "(an `OPEN` row records a look, not a closure — §3102)")
+    lp.add_argument("--session", default="",
+                    help="only entries whose review was DISPATCHED by this session id; "
+                         "`--session none` keeps only entries carrying no session at all")
+    lp.add_argument("--mine", action="store_true",
+                    help=f"shorthand for --session ${SESSION_ENV}; with no such env var set "
+                         "this matches nothing, which is the honest answer rather than everything")
     lp.add_argument("--paths", nargs="+", default=[],
                     help="pathspecs (dir prefix or fnmatch); keep kind=commit entries whose "
                          "`git show --name-only` intersects them; adds `matched_paths`")
@@ -1227,12 +1905,41 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--lock-timeout", type=float, default=30.0,
                     help="seconds to wait for .advice.lock (0 = one try); exit 3 on timeout")
     rp.add_argument("--dry-run", action="store_true", help="report the counts, write nothing")
+    sp = sub.add_parser("resolve", help="write ONE RESOLVED.md disposition row for the matched entry")
+    sp.add_argument("--ref", required=True, help="the entry's ref: exact, or a >=12-char prefix of it")
+    sp.add_argument("--status", required=True,
+                    help="one of " + "/".join(STATUS_VOCAB) + ", optionally with a qualifier "
+                         "(\"FIXED b808e4893f\", \"OPEN -> FUTURE F123\")")
+    sp.add_argument("--evidence", required=True,
+                    help="commit sha, doc path or one sentence — what makes that status true")
+    sp.add_argument("--ts", default="",
+                    help="disambiguate a --ref that matches entries at more than one ts")
+    sp.add_argument("--lock-timeout", type=float, default=30.0,
+                    help="seconds to wait for .advice.lock (0 = one try); exit 3 on timeout")
+    sp.add_argument("--dry-run", action="store_true", help="print the row that would be written, write nothing")
+
+    # §3108 (§1.85 cure 2) — claim an UNOWNED finding so peers stop seeing it, for a
+    # BOUNDED time. Deliberately not a flag on `resolve`: a claim is not a disposition.
+    cp = sub.add_parser("claim", help="take an unowned finding for "
+                                      f"{CLAIM_TTL_SECONDS // 3600}h; it returns automatically")
+    cp.add_argument("--ref", required=True, help="the entry's ref: exact, or a >=12-char prefix of it")
+    cp.add_argument("--ts", default="",
+                    help="disambiguate a --ref that matches entries at more than one ts")
+    cp.add_argument("--as", dest="as_session", default="",
+                    help=f"claim as this session id (default: ${SESSION_ENV}). A claim must "
+                         "name a holder, so an empty value is refused rather than anonymised")
+    cp.add_argument("--note", default="",
+                    help="optional evidence cell — what you intend to do with it")
+    cp.add_argument("--lock-timeout", type=float, default=30.0,
+                    help="seconds to wait for .advice.lock (0 = one try); exit 3 on timeout")
+    cp.add_argument("--dry-run", action="store_true", help="print the row that would be written, write nothing")
     args = ap.parse_args(argv)
 
     advice_dir = Path(args.advice_dir)
     if not advice_dir.is_absolute():
         advice_dir = Path(args.repo) / advice_dir
-    handlers = {"status": cmd_status, "list": cmd_list, "rotate": cmd_rotate}
+    handlers = {"status": cmd_status, "list": cmd_list, "rotate": cmd_rotate,
+                "resolve": cmd_resolve, "claim": cmd_claim}
     try:
         return handlers[args.cmd](args, advice_dir)
     except DrainError as error:

@@ -66,17 +66,143 @@ esac
 
 [ -d "$ADVICE" ] || exit 0
 
-SID="$(printf '%s' "$IN" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+# ⚠ §3105 — TWO USES, TWO VARIABLES, AND §3103 CONFLATED THEM. `$SID` names the
+# seen-marker FILE, so it must never be empty and has carried a `nosession` placeholder
+# since long before the ledger had an owner column. The LEDGER stamp is an IDENTITY and
+# must stay EMPTY when the payload carried none: `codex_watch.resolve_session` omits the
+# key on "" precisely so a reader can tell "no session was recorded" from "a session
+# called nosession". Reusing the one variable for both stamped that placeholder as a real
+# id, and two payload-less sessions would then OWN each other's entries — the exact
+# collision the owner column was added to prevent.
+SESSION_ID="$(printf '%s' "$IN" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+SID="$SESSION_ID"
 [ -n "$SID" ] || SID="nosession"
 mkdir -p "$STATE" 2>/dev/null || exit 0
 MARK="$STATE/$SID.seen"
 
 # ---- surface anything that landed since this session last looked -------------------
-OUT="$(python3 - "$ADVICE" "$MARK" "$ROOT/.claude/scripts" <<'PY' 2>/dev/null
-import importlib.util, json, sys
+# §3106 — `$SESSION_ID` (never `$SID`: §3105) decides which findings may INTERRUPT.
+OUT="$(python3 - "$ADVICE" "$MARK" "$ROOT/.claude/scripts" "$SESSION_ID" <<'PY' 2>/dev/null
+import importlib.util, json, sys, time
 from pathlib import Path
 advice, mark = Path(sys.argv[1]), Path(sys.argv[2])
+#: §3114 — the checkout `advice` sits in: `<root>/.adversarial-review/watch`.
+root = advice.parents[1]
 scripts = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+#: §3106 — the session this turn belongs to, "" when the payload carried none (§3105).
+me = sys.argv[4] if len(sys.argv) > 4 else ""
+_wd_cache = []
+
+
+def _wd():
+    """`watch_drain` as a module, loaded at most once, or None.
+
+    §2142 loaded it inside `_resolved` and threw it away; §3106 needs `owns` from the
+    same module, and re-loading per call would pay the import twice while re-deriving
+    the predicate would be the second copy this file exists to avoid.
+    """
+    if _wd_cache:
+        return _wd_cache[0]
+    mod = None
+    if scripts is not None:
+        try:
+            spec = importlib.util.spec_from_file_location("_wd", scripts / "watch_drain.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception:
+            mod = None
+    _wd_cache.append(mod)
+    return mod
+
+
+def _discharged(e):
+    """Has a RESOLVED.md row CLOSED this entry? Imported, never re-derived (§3107).
+
+    The distinction `discharges` encodes: a row exists is not a row that closes. `OPEN`
+    is in the vocabulary precisely so a session can record a look without ending the
+    finding, and every query that asked about PRESENCE silently converted that courtesy
+    into a deletion.
+
+    Degrades to NOT discharged — the noisy direction, for the same reason as `_owns`: a
+    finding shown twice costs a line, a finding closed wrongly is gone from this channel
+    for good.
+    """
+    wd = _wd()
+    if wd is None or resolved is None:
+        return False
+    try:
+        return wd.discharges(resolved.lookup(_Ref(ts_of(e), str(e.get("ref") or ""))))
+    except Exception:
+        return False
+
+
+#: §3114 (§1.81 cure 3) — how far back a commit may sit and still count as THIS session's
+#: news on a cold start. A session commits, the review lands ~151s later (p95 390s), and
+#: the commit itself was written some minutes before that — so the window has to be
+#: comfortably wider than the review latency, and an hour is. Anything older than this was
+#: committed before the session existed: inherited backlog, not news.
+COLD_START_NEWS_SECONDS = 3600
+
+
+def _commit_epoch(ref):
+    """Committer date of `ref` as an epoch, or None when git cannot say.
+
+    Committer, not author: a rebased or cherry-picked commit carries an author date from
+    days earlier and would be misread as backlog — the same rule §3109 follows.
+    """
+    import subprocess  # noqa: PLC0415 — only reached on the cold-start path
+    try:
+        out = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%ct", str(ref)],
+                             capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    raw = (out.stdout or "").strip()
+    return float(raw) if out.returncode == 0 and raw else None
+
+
+def _is_inherited_backlog(e, cold):
+    """§3114 — was this entry's COMMIT written before this session existed?
+
+    ⚠ THE CURSOR KEYS ON REVIEW TIME, WHICH IS WHY THIS IS NEEDED AT ALL. `_key` reads
+    `appended` — stamped when the review LANDED — so a catch-up re-reviewing a three-day-old
+    commit mints an entry that reads as brand new, and §3106 does not help: this session
+    DISPATCHED that review, so it owns the entry and would be interrupted by it. Measured in
+    protomolecule 2026-09-21: two of the commits named were 8½ hours older than the addressed
+    session's first commit.
+
+    Only on a COLD start, and that is the whole trick. A cold session's `since` is "" so it
+    scans the entire ledger (§2130 calls this the dominant shape), and its first look IS
+    now — so "before the session existed" needs no stored start time, no marker file, and no
+    ledger derivation. A warm session is already bounded by its own cursor.
+
+    Fails toward NEWS: no ref, an unparseable date, a worktree entry (no commit to date), or
+    git declining all leave the entry blocking. Suppressing a real finding costs more than
+    showing an old one, which is the direction every degradation in this file takes.
+    """
+    if not cold or str(e.get("kind")) != "commit":
+        return False
+    when = _commit_epoch(e.get("ref") or "")
+    if when is None:
+        return False
+    return when < time.time() - COLD_START_NEWS_SECONDS
+
+
+def _owns(e):
+    """Is this entry THIS session's to be interrupted by? Imported, never re-derived.
+
+    ⚠ DEGRADES TOWARDS NOISE, DELIBERATELY. If `watch_drain` cannot be loaded the answer
+    is unknown, and the two ways to be wrong are not symmetric: suppressing a finding
+    that was this session's loses it silently, while showing one that was not costs a
+    line the reader can dismiss. A review channel survives the second failure and not the
+    first, and the same file already degrades this way for §2142's rowed-finding filter.
+    """
+    wd = _wd()
+    if wd is None:
+        return True
+    try:
+        return wd.owns(e.get("session"), me)
+    except Exception:
+        return True
 
 
 class _Ref:
@@ -108,12 +234,10 @@ def _resolved():
     §2110 and §2112 each shipped. Degrades silently to the old behaviour, because a hook
     must never fail a turn over its own bookkeeping.
     """
-    if scripts is None:
+    wd = _wd()  # §3106 — the one load, shared with `_owns`.
+    if wd is None:
         return None
     try:
-        spec = importlib.util.spec_from_file_location("_wd", scripts / "watch_drain.py")
-        wd = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(wd)
         return wd.read_resolved(advice / wd.RESOLVED_MD)
     except Exception:
         return None
@@ -204,6 +328,9 @@ def _key(e):
 
 
 since = _pad(since)
+# §3114 — a COLD start is one that has never looked: `since` is "" and the scan covers the
+# whole ledger. Captured BEFORE the loop, because `since` is a moving target inside it.
+cold_start = not since.strip()
 newest, blocking, informational = since, [], []
 try:
     lines = (advice / "advice.jsonl").read_text(encoding="utf-8").splitlines()
@@ -223,14 +350,53 @@ for line in lines:
     newest = max(newest, k)
     # §2142 — a finding already rowed in RESOLVED.md has been triaged; it is not this
     # turn's work. The cursor still advances over it, so it never comes back.
-    if resolved is not None and resolved.lookup(_Ref(ts_of(e), str(e.get("ref") or ""))) is not None:
+    #
+    # ⚠ §3107 — THE FIFTH SITE, AND THE CURSOR ABOVE IS WHAT MADE IT DESTRUCTIVE. This
+    # asked `lookup(...) is not None` — row PRESENCE — after §3102/§3104 had replaced that
+    # question everywhere in `watch_drain.py` with `discharges`. So an entry rowed `OPEN`
+    # ("I looked, it is still live") was skipped HERE while `list --unresolved` correctly
+    # kept holding it: the two halves of one channel disagreeing by construction, which is
+    # §2142's own stated defect, re-introduced in the reverse direction. And because
+    # `newest = max(newest, k)` runs two lines ABOVE this `continue`, the skipped entry is
+    # marked seen — so the finding went silent on this channel PERMANENTLY for that
+    # session, not merely for one turn.
+    #
+    # The §3104 ratchet could not catch it: it `ast.parse`s `watch_drain.py`, and this is
+    # shell with embedded Python. "Cured at the SHAPE rather than the site" was therefore
+    # false as written in §3104's message — the shape had a fifth instance in another
+    # file, which is §3094's recorded lesson ("a second TOOL held a copy") a third time.
+    if resolved is not None and _discharged(e):
         continue
     for r in e.get("results") or ():
         v, crit = r.get("verdict"), (r.get("critical") or "").strip()
         label = "%s %s" % (str(e.get("kind"))[:8], str(e.get("ref"))[:12])
         # INTERRUPT only on a real finding: NEEDS_REVISION carrying a critical body.
         # ~24% of captures produce nothing usable, so everything else informs.
-        if v == "NEEDS_REVISION" and crit:
+        if v == "NEEDS_REVISION" and crit and _is_inherited_backlog(e, cold_start):
+            # §3114 (§1.81 cure 3) — this session DISPATCHED the review, so §3106's owner
+            # check passes and would interrupt on it; but the COMMIT predates the session,
+            # so it is inherited work, not news. Placed before the ownership branch because
+            # it is the case ownership cannot see, and before `_superseded_now` because
+            # that costs a measured 51.7 ms (§2203) this branch never needs to pay.
+            informational.append("%s: NEEDS_REVISION (backlog — committed before this session)"
+                                 % label)
+        elif v == "NEEDS_REVISION" and crit and not _owns(e):
+            # ⚠ §3106 (§1.81 cure 2) — A REAL FINDING, AND NOT THIS TURN'S TO BE STOPPED BY.
+            # The queue is repo-wide and had no owner column until §3103, so every session
+            # was interrupted by every session's findings. Measured in protomolecule
+            # 2026-09-21: 17 blocking items named, ZERO written by the session addressed.
+            # §3085 fixed the SENTENCE that claimed authorship; this fixes the SET.
+            #
+            # It informs rather than vanishing: the finding is real, it is still owed a
+            # row, and `list --unresolved` still holds it. What changes is whose turn pays
+            # the interrupt. An UNSTAMPED entry is owned by nobody (`owns`), so the whole
+            # pre-§3103 backlog informs — which is the intended reading of it as backlog.
+            #
+            # Placed BEFORE `_superseded_now`: that call costs a measured 51.7 ms per
+            # entry (§2203) and this branch is the common one, so the filter that removes
+            # the most work now runs before the work. §2202 shipped the opposite ordering.
+            informational.append("%s: NEEDS_REVISION (another session's finding)" % label)
+        elif v == "NEEDS_REVISION" and crit:
             # §2143 — say so when the reviewed commit's files have moved since. A backlog
             # review argues against a diff and the reader acts against HEAD; without this
             # a finding about reverted code reads exactly like a finding about live code.
@@ -278,7 +444,9 @@ for line in lines:
             ref = e.get("ref") or ""
             if isinstance(e.get("superseded"), dict):
                 _stored_superseded[ref] = e["superseded"]
-            blocking.append((label, crit.split("\n")[0][:400], ref))
+            # §3085 — the KIND travels with the finding, because the lead sentence bash
+            # prints depends on it and nothing else can tell the two apart down there.
+            blocking.append((label, crit.split("\n")[0][:400], ref, str(e.get("kind") or "")))
         elif v == "NEEDS_REVISION":
             # A finding with no Critical body: real, but not worth interrupting for.
             informational.append("%s: NEEDS_REVISION (no critical body)" % label)
@@ -309,10 +477,13 @@ if newest and newest != since:
 CAP = 3
 OWED = "python3 .claude/scripts/watch_drain.py list --unresolved"
 if blocking:
-    print("BLOCK")
+    # §3085 — the marker carries the KINDS present, so the lead sentence can be true of
+    # what is actually in the list. `BLOCK*` still matches and `tail -n +2` still strips
+    # exactly this line, so every other consumer is unchanged.
+    print("BLOCK %s" % ",".join(sorted({k for _, _, _, k in blocking if k})))
     # §2202 — the supersession marker is derived HERE, for the capped slice only, so the
     # cost really is bounded by CAP the way §2201's comment claimed it already was.
-    for label, crit, ref in blocking[:CAP]:
+    for label, crit, ref, _kind in blocking[:CAP]:
         sup = _superseded_now(ref) or _stored_superseded.get(ref) or {}
         n = sup.get("commits_since") if isinstance(sup, dict) else None
         dom = sup.get("dominated_by") if isinstance(sup, dict) else None
@@ -367,7 +538,9 @@ if [ -f "$WATCH" ]; then
     { flock -u 9 2>/dev/null; exec 9<&-; } 2>/dev/null || true
     # §3044 — the writer travels in the ENV, never argv (see eugo-review-on-commit.sh).
     ( cd "$ROOT" 2>/dev/null &&
-      EUGO_REVIEW_WRITER=hook-turn-end python3 "$WATCH" --once --since-ledger --worktree --no-commits \
+      # §3103 — the ledger gets the session id too. §3105 — `$SESSION_ID`, NOT `$SID`:
+      # the latter is a filename that falls back to a placeholder (see its extraction).
+      EUGO_REVIEW_WRITER=hook-turn-end EUGO_REVIEW_SESSION="$SESSION_ID" python3 "$WATCH" --once --since-ledger --worktree --no-commits \
           --engine claude --advice-dir ".adversarial-review/watch"
     ) >>"$LOG" 2>&1 &
   fi
@@ -375,8 +548,34 @@ fi
 
 case "$OUT" in
   BLOCK*)
-    printf 'adversarial review found a blocking issue in work you just did:\n%s\n\nAddress it before continuing, or say why it is not a defect.\n' \
-      "$(printf '%s' "$OUT" | tail -n +2)" >&2
+    # ⚠ §3085 — THIS SENTENCE USED TO READ "in work you just did", AND IT WAS NOT TRUE.
+    # Measured in protomolecule 2026-09-21: the hook named 17 blocking items, ZERO of them
+    # written by the session it was addressing, two of them 8.5 hours older than that
+    # session's first commit. A cold session scans the whole ledger (§2130 above), so the
+    # false attribution is the DOMINANT shape rather than an edge, and the cost of a gate
+    # that blames every session for other people's backlog is every true finding it raises
+    # afterwards that nobody believes.
+    #
+    # THE TWO KINDS ARE NOT THE SAME CLAIM, which is why the marker carries them:
+    #   * `commit` — the reviewed sha landed during this turn, but this is a SHARED clone
+    #     and git cannot attribute an author, so the hook says when it landed and stops.
+    #   * `worktree` — the ref is a CONTENT HASH over the shared dirty tree, so it can
+    #     never be attributed to anyone. An earlier fix asserted the opposite here
+    #     ("the worktree one(s) are in work you just did") beside a correct disclaimer for
+    #     commits, which read as a considered distinction and was therefore believed:
+    #     measured at the firing moment, 67 tracked modifications across at least four
+    #     accounts, both flagged findings about files owned by another user whose mtime
+    #     was an hour AFTER the addressed session's last commit, and that session had no
+    #     uncommitted work at all. Saying NOTHING about ownership is the cheapest correct
+    #     form; the reader is pointed at the one command that settles it.
+    KINDS="$(printf '%s' "$OUT" | head -n1)"; KINDS="${KINDS#BLOCK}"; KINDS="${KINDS# }"
+    case "$KINDS" in
+      worktree) WHOSE='in the shared working tree — it holds every account'"'"'s uncommitted work, so these may or may not be yours; `git diff -U0 -- <path>` before acting' ;;
+      commit)   WHOSE='in commit(s) that LANDED during this turn (shared clone — git cannot attribute the author)' ;;
+      *)        WHOSE='in unresolved review findings for this repo (shared clone and shared worktree — neither can be attributed to a session)' ;;
+    esac
+    printf 'adversarial review found a blocking issue %s:\n%s\n\nAddress it before continuing, or say why it is not a defect.\n' \
+      "$WHOSE" "$(printf '%s' "$OUT" | tail -n +2)" >&2
     exit 2 ;;
   INFORM*)
     # ⚠ §2120 — STDERR, NOT STDOUT, AND THIS IS THE DEFECT THE HOOK FOUND IN ITSELF.

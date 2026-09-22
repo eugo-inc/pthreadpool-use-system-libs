@@ -31,10 +31,32 @@
 #   - it never mutates the ledger itself; only `codex_watch.py` writes there
 #   - bash 3.2 safe (macOS): no mapfile, no ${x,,}, no associative arrays
 set -u
+
+# §3103 (§1.85) — WHO dispatched this review, read BEFORE the detach below.
+#
+# The ledger has never carried an owner, so every session's queue was every other
+# session's queue; `session_id` arrives in the hook payload on stdin. This hook had never
+# read stdin because it had no use for it — and `exec </dev/null` on the next line means a
+# read placed anywhere AFTER it silently returns nothing. That is not a hypothetical: the
+# first version of this change sat below the detach, dispatched happily, and stamped every
+# entry with an empty session. ORDER IS THE WHOLE FIX.
+#
+# `[ -t 0 ]` guards the read: under the harness stdin is the payload pipe and EOFs at once,
+# but a hand invocation from a terminal would otherwise block on `cat` forever.
+SID=""
+if [ ! -t 0 ]; then
+  SID="$(cat 2>/dev/null | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+fi
+
+# ⚠ THE DETACH STAYS, AND IT STAYS HERE. §2109 put it at the top so the backgrounded
+# dispatch below cannot hold the session's stdin open; everything after this line — the
+# review included — sees /dev/null, which is what makes `( … ) &` safe to leave running.
 exec </dev/null
 
 ROOT="${CLAUDE_PROJECT_DIR:-.}"
 WATCH="$ROOT/.claude/scripts/codex_watch.py"
+# §3110 — the catch-up's ledger gate reads `unreviewed=` from here (see STAGE 1).
+WATCH_DRAIN="$ROOT/.claude/scripts/watch_drain.py"
 ADVICE="$ROOT/.adversarial-review/watch"
 FULL=0
 [ "${1:-}" = "--full" ] && FULL=1
@@ -66,7 +88,46 @@ if [ "$FULL" -eq 0 ]; then
   if tail -c 20000 "$ADVICE/advice.jsonl" 2>/dev/null | grep -qF "$HEAD_SHA"; then
     exit 0          # HEAD is already reviewed; anything older is the backstop's job
   fi
+else
+  # ⚠ §3110 (§1.85) — THE CATCH-UP HAD NO GATE AT ALL, and that made it the amplifier.
+  # `--full` fires on EVERY SessionStart and deliberately skips the HEAD grep above,
+  # because its whole job is to catch what that grep cannot see: a commit whose review
+  # FAILED (HEAD unchanged but unreviewed) and unreviewed commits OLDER than HEAD. So it
+  # dispatched unconditionally, and only the lock probe below could still stop it — every
+  # new session paying an interpreter start and a doomed process, or worse, a real review
+  # pass over a ledger with nothing in it to review.
+  #
+  # The cure is NOT the HEAD grep (it answers the wrong question) and NOT a marker file —
+  # the comment above explains why a second cursor is refused here, and that reasoning is
+  # unchanged. It is to ask the LEDGER the question the catch-up actually has: is anything
+  # unreviewed? `unreviewed=` is exactly that count, and it already exists.
+  #
+  # ⚠ "?" IS NOT ZERO. It is what the count degrades to when git cannot answer, and the
+  # established rule in `unreviewed_count`, `eugo-watch-owed.sh` and `_changed_lines` is
+  # that a detector's failure must never be read as an absence. Anything that is not a
+  # literal `0` dispatches, so the gate can only ever SKIP work it positively knows is
+  # absent. Costs one interpreter start, ONCE per session, against a review at ~151s.
+  UNREV="$(python3 "$WATCH_DRAIN" status 2>/dev/null \
+            | grep -o 'unreviewed=[^ ]*' | head -1 | cut -d= -f2)"
+  if [ "$UNREV" = "0" ]; then
+    exit 0
+  fi
 fi
+
+# STAGE 1a — §3121 (§1.90 cure A): an account hold is in force. §3095 made the watcher read
+# `.account-down` at startup and exit, which removed the ~151 s SPEND of reviewing against an
+# account that cannot answer — but not the SPAWN: a 154-commit outage day was still 154
+# interpreter starts to read one file. The hook reads it first.
+#
+# ⚠ FAILS OPEN, EXACTLY AS `codex_watch.read_account_hold` DOES: only a whole-number epoch in
+# the future skips. Absent, unreadable, empty, a float, junk — all dispatch, and the watcher
+# makes its own (identical) call. This file can only ever make reviewing do LESS, so a corrupt
+# one must never be able to switch it off.
+HOLD_UNTIL="$(head -c 32 "$ADVICE/.account-down" 2>/dev/null | tr -d '[:space:]')"
+case "$HOLD_UNTIL" in
+  ''|*[!0-9]*) ;;
+  *) [ "$HOLD_UNTIL" -gt "$(date +%s)" ] 2>/dev/null && exit 0 ;;
+esac
 
 # STAGE 1b — is a review ALREADY running? If so there is nothing to do, and finding
 # that out here rather than in a spawned python is the difference between free and
@@ -111,7 +172,7 @@ mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 # older copy is an argparse exit 2 in a log nobody reads, while an unknown env var is
 # simply ignored. The value must be one of `codex_watch.WRITERS`.
 ( cd "$ROOT" 2>/dev/null &&
-  EUGO_REVIEW_WRITER=hook-commit python3 "$WATCH" --once --since-ledger --commits --no-worktree \
+  EUGO_REVIEW_WRITER=hook-commit EUGO_REVIEW_SESSION="$SID" python3 "$WATCH" --once --since-ledger --commits --no-worktree \
       --engine claude --advice-dir ".adversarial-review/watch"
 ) >>"$LOG" 2>&1 &
 

@@ -10,6 +10,7 @@
 /.adversarial-review/watch/.watch.lock
 /.adversarial-review/watch/.watch.worktree.lock
 /.adversarial-review/watch/.advice.lock
+/.adversarial-review/watch/.account-down
 /.adversarial-review/watch/STOP
 /.adversarial-review/watch/STOP.worktree
 /.adversarial-review/watch/daemon.log

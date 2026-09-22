@@ -65,6 +65,7 @@ fi
 # shape the served section uses. The served section wins whenever the rules file has it.
 GLOSSARY_FALLBACK='- `eipl` — "explain in plain language": LOOK the reference up first (a §-id in the backlog files, a file, a ledger row, a commit), then the KB; then ONE jargon-free paragraph (what it is, why it matters, where it stands, what is pending, what decision is the user'"'"'s), technical detail after. Never explain from memory.
 - `eipws` — "execute in parallel with workflow subagents": run the named items (or the pending task-list items) as parallel Workflow agents rather than inline; the token IS the Workflow opt-in.
+- `eipwsncwtodo` — "execute in parallel with workflow subagents, the ncw todo list": fan out EVERY unblocked, parallelisable task-widget item as Workflow lanes now (the token IS the opt-in); `eipws` with the list taken from the widget. Re-test `blocked` labels first, name what you excluded, and follow the capped-wave controls in `eugo-parallel-fanout-base`.
 - `elaw` / `/law` — Ben'"'"'s L/A/W questions, answered only for the letters typed, in L → A → W order: L = what is LEFT, A = is an ADVERSARIAL review warranted, W = is everything WRITTEN BACK to the file the prompt came from. Skill eugo-law, slash /elaw.
 - `ncw` — the native chat widget (AskUserQuestion in Claude Code); as a bare instruction it means the same as `amqncw`.
 - `amqncw` — "ask me question(s) in the native chat widget": put every open question or decision through AskUserQuestion now, one question per decision, options spelled out.

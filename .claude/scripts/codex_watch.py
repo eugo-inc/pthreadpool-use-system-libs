@@ -88,9 +88,70 @@ SHOW_EMPTY_NOTE = "git show returned empty"
 # was never looked at again. Held and retried, but BOUNDED for the reason
 # `_MAX_SHOW_RETRIES` is: a permanently broken driver must not wedge the watcher.
 _MAX_REVIEW_RETRIES = 3
+#: §3121 (§1.90 cure B) — the ceiling on ALL verdict-less attempts at one ref, outages
+#: included. §2089/§2114 rightly charge an outage to nobody, which is also exactly what
+#: removed the only bound: one ref reached 109 attempts. At the ceiling the ref is saturated
+#: into the same exclusion as a spent retry budget, so `status` reports it under
+#: `abandoned=` — counted, never dropped silently (operator ruling 2026-09-22: 10, and
+#: "count as abandoned"; every attempt is already a ledger entry, so nothing new is written).
+_MAX_TOTAL_ATTEMPTS = 10
 
 #: §2089 — default hold after an account-level failure. See `_account_is_down`.
+#: §3122 — now the FALLBACK: a note that states its reset time is held until then.
 _ACCOUNT_BACKOFF_S = 1800
+#: §3122 — the longest a stated reset may hold reviewing off. Operator ruling 2026-09-22:
+#: "until reset, capped at 6h" — a weekly limit states a reset DAYS away, and the operator
+#: switches accounts to replenish quota; uncapped, reviewing would stay off on a working
+#: account. At the cap one probe runs: ~4 a day on a weekly limit instead of ~48.
+_MAX_ACCOUNT_HOLD_S = 6 * 3600
+#: §3122 — the reset clause of a limit note, in the shapes the live ledger holds
+#: (2026-09-22, 21 notes): `resets 6:20pm (UTC)`, `resets 7pm (UTC)`,
+#: `resets Sep 19, 10am (UTC)`. Anything else — no clause, another zone — is unparsed and
+#: falls back to `_ACCOUNT_BACKOFF_S`, never to a guess.
+_RESET_RE = re.compile(
+    r"resets\s+(?:(?P<mon>[A-Za-z]{3})[a-z]*\s+(?P<day>\d{1,2}),\s*)?"
+    r"(?P<h>\d{1,2})(?::(?P<mi>\d{2}))?\s*(?P<ap>am|pm)\s*\(UTC\)", re.I)
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def account_reset_epoch(note: str, now: float) -> float | None:
+    """§3122 — the UTC epoch a limit note says the account resets at, or None.
+
+    A time with no date is its NEXT occurrence after `now` (the note is written at the
+    moment of failure, so a time already past today means tomorrow). A dated reset takes
+    `now`'s year, or the next one when that date is more than 180 days behind (a
+    December note read in January). Out-of-range fields → None.
+    """
+    m = _RESET_RE.search(note or "")
+    if not m:
+        return None
+    hour, minute = int(m["h"]), int(m["mi"] or 0)
+    if not (1 <= hour <= 12 and minute <= 59):
+        return None
+    hour = hour % 12 + (12 if m["ap"].lower() == "pm" else 0)
+    t = time.gmtime(now)
+    if m["mon"]:
+        if m["mon"].lower() not in _MONTHS:
+            return None
+        month, day = _MONTHS.index(m["mon"].lower()) + 1, int(m["day"])
+        if not 1 <= day <= 31:
+            return None
+        at = calendar.timegm((t.tm_year, month, day, hour, minute, 0))
+        if at < now - 180 * 86400:
+            at = calendar.timegm((t.tm_year + 1, month, day, hour, minute, 0))
+        return float(at)
+    at = calendar.timegm((t.tm_year, t.tm_mon, t.tm_mday, hour, minute, 0))
+    return float(at if at > now else at + 86400)
+
+
+def account_hold_until(note: str, now: float, fallback_s: int) -> float:
+    """§3122 — how long to hold after an account-level failure: until the stated reset
+    (+60 s, so the probe lands after it), clamped to [60 s, `_MAX_ACCOUNT_HOLD_S`]; the
+    fixed `fallback_s` when the note states none."""
+    at = account_reset_epoch(note, now)
+    if at is None:
+        return now + fallback_s
+    return now + min(max(at + 60 - now, 60), _MAX_ACCOUNT_HOLD_S)
 
 #: Notes that mean the ACCOUNT cannot review ANYTHING, as distinct from this commit
 #: failing. The retry bound above is right for the second kind — a timeout, a capture
@@ -143,10 +204,39 @@ def _account_is_down(entry: dict) -> str | None:
 #: value would be `other_verdicts` drift one field over. Entries written before this
 #: field existed carry no `writer` and read `unknown` in `watch_drain status`: the
 #: daemon-vs-hook coverage gate is satisfiable forward, never backward.
+#: §3103 (§1.85) — WHO dispatched this review, carried the same way and for the same
+#: reason as WRITER_ENV: this hook and this script are pinned by DIFFERENT carriers, so a
+#: `--session` flag reaching an older installed copy is an argparse exit 2 in a log nobody
+#: reads, while an unknown env var is simply ignored.
+#:
+#: ⚠ IT RECORDS WHO DISPATCHED, NEVER WHO OWNS THE CONTENT — and for `kind="worktree"` those
+#: are not the same thing. A worktree ref is a content hash over the SHARED dirty tree, so
+#: every session working in that checkout contributed to it; the stamp says whose turn-end
+#: fired, and a reader treating it as authorship for that kind is wrong. For `kind="commit"`
+#: it is as close to an owner as this system can get: git cannot attribute an author on a
+#: shared clone, but the session whose hook dispatched the review is the one that committed.
+SESSION_ENV = "EUGO_REVIEW_SESSION"
+#: A session id is a harness-supplied opaque token. Bounded and stripped of anything that
+#: could break the line it lands on — it reaches a JSON entry today and a Markdown cell the
+#: moment anything renders it.
+_SESSION_MAX = 64
 WRITER_ENV = "EUGO_REVIEW_WRITER"
 #: MIRRORS `watch_drain.WRITERS` — pinned equal by test_watch_drain.py.
 WRITERS = ("hook-commit", "hook-turn-end", "daemon", "once")
 _WRITER = "daemon"  # resolved once in main(), read by _append_entry
+_SESSION = ""       # §3103 — same lifecycle; "" means no session was supplied
+
+
+def resolve_session(env: dict | None = None) -> str:
+    """The dispatching session id, sanitised; "" when the caller did not supply one.
+
+    Absent means ABSENT: the key is omitted from the entry rather than stamped with a
+    placeholder, exactly as `writer` behaves on the 746 of 816 entries that predate it. A
+    reader must be able to tell "no session was recorded" from "a session called nosession".
+    """
+    raw = ((env if env is not None else os.environ).get(SESSION_ENV) or "").strip()
+    clean = "".join(c for c in raw if c.isprintable() and c not in "|")
+    return clean[:_SESSION_MAX]
 
 
 def _resolve_writer(once: bool, env: dict | None = None) -> str:
@@ -489,6 +579,7 @@ def failed_attempts(advice_dir: Path) -> dict[str, int]:
     reproduces those semantics and makes them survive a process, which the dict never did.
     """
     counts: dict[str, int] = {}
+    totals: dict[str, int] = {}     # §3121 — every verdict-less attempt, outages included
     files = [advice_dir / "advice.jsonl", *sorted((advice_dir / "archive").glob("*.jsonl"))]
     for f in files:
         try:
@@ -507,6 +598,7 @@ def failed_attempts(advice_dir: Path) -> dict[str, int]:
                 continue
             if _is_real_review(entry):
                 continue
+            totals[entry["ref"]] = totals.get(entry["ref"], 0) + 1
             # ⚠ §2114 — AN OUTAGE IS CHARGED TO NOBODY, and §2112 forgot that when it
             # moved the budget onto the ledger. §2089 established the rule for the
             # process-local counter: an account-level failure (session/weekly limit,
@@ -533,6 +625,9 @@ def failed_attempts(advice_dir: Path) -> dict[str, int]:
                 counts[entry["ref"]] = _MAX_REVIEW_RETRIES
                 continue
             counts[entry["ref"]] = counts.get(entry["ref"], 0) + 1
+    for ref, n in totals.items():
+        if n >= _MAX_TOTAL_ATTEMPTS:
+            counts[ref] = max(counts.get(ref, 0), _MAX_REVIEW_RETRIES)
     return counts
 
 
@@ -615,6 +710,60 @@ def unreviewed_commits(repo: str, advice_dir: Path, scan: int,
                if s not in done and spent.get(s, 0) < _MAX_REVIEW_RETRIES]
     truncated = bool(shas) and len(shas) == scan and shas[0] not in done
     return pending, truncated
+
+
+def session_start_epoch(advice_dir: Path, session: str) -> float | None:
+    """§3120 (§1.91) — when THIS session started, derived from the ledger: the earliest
+    `ts` among entries it stamped (§3103). None for no session or no stamped entry.
+
+    Candidate 3 of §1.91's three, chosen because it needs NO new state: a start-time marker
+    file is the second cursor `eugo-review-on-commit.sh` already refuses, and HEAD-at-
+    dispatch is never the starved commit. Reads the live `advice.jsonl` only: a session
+    whose earliest entry was rotated into the archive gets a LATER start, which owns fewer
+    commits — the capped side, never the burning one.
+    """
+    if not session:
+        return None
+    earliest = None
+    try:
+        lines = (advice_dir / "advice.jsonl").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in lines.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict) or e.get("session") != session:
+            continue
+        try:
+            t = calendar.timegm(time.strptime(str(e.get("ts", "")), "%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            continue
+        earliest = t if earliest is None else min(earliest, t)
+    return earliest
+
+
+def owned_commits(repo: str, shas: list[str], start: float | None) -> set[str]:
+    """§3120 (§1.91) — the subset of `shas` committed at or after `start`: this session's
+    own fresh work, which drains to EMPTY past the tick budget.
+
+    ⚠ A COLD SESSION OWNS NOTHING, SO ITS WHOLE PENDING SET STAYS CAPPED BY CONSTRUCTION:
+    `start` is None until the session's first review lands, and None owns nothing. That is
+    §3067's protection — a cold session back-reviewing a hundred inherited commits at ~151 s
+    each — kept, not traded. Committer time, because a shared clone cannot attribute an
+    author: in a checkout three sessions share, commits another session made AFTER this one
+    started count as fresh too, which is the population the budget was never meant to cap.
+    Fails toward owning nothing (a failed `git show` → empty set → today's behaviour).
+    """
+    if start is None or not shas:
+        return set()
+    out = set()
+    for line in _git(repo, "show", "-s", "--format=%H %ct", *shas).splitlines():
+        sha, _, ct = line.partition(" ")
+        if ct.strip().isdigit() and int(ct) >= start:
+            out.add(sha)
+    return out
 
 
 #: §833 — the exact shape `_review` writes: `<kind>-<ref>-<epoch>`. The
@@ -1062,6 +1211,15 @@ def _acquire_single_instance(advice_dir: Path, lock_name: str = WATCH_LOCK, *,
 #: around both appends below, so an append never interleaves with a rotation. The name is
 #: pinned equal to `watch_drain.ADVICE_LOCK` by `tools/tests/test_watch_drain.py`.
 _ADVICE_LOCK = ".advice.lock"
+#: §3095 — the account-outage hold, PERSISTED. `account_down_until` was a local in `main()`,
+#: set on an account-level failure and read only by the interval sleep — which `--once`
+#: never reaches, because it `break`s first. `--once` IS the dispatch mode every hook uses,
+#: so the 30-minute backoff was written and discarded on every outage, and each new commit
+#: started a process that had never heard of it. Measured in protomolecule 2026-09-21: 544
+#: entries against 154 commits in one day, and FOUR commits accounted for 256 of 287 errored
+#: entries at 109, 91, 44 and 16 attempts each. It is not that hundreds of commits could not
+#: be reviewed — four commits were asked hundreds of times.
+ACCOUNT_HOLD = ".account-down"
 
 #: §2175 — EVERY transient file this module can create inside an advice dir, in ONE place.
 #:
@@ -1075,7 +1233,8 @@ _ADVICE_LOCK = ".advice.lock"
 #: Derivation is what makes an ADDITION visible, and `_transient` below is what makes the
 #: derivation true rather than decorative: a name that never reaches this tuple cannot
 #: reach the filesystem either.
-TRANSIENT_FILES = (WATCH_LOCK, WORKTREE_LOCK, STOP_SENTINEL, WORKTREE_STOP, _ADVICE_LOCK)
+TRANSIENT_FILES = (WATCH_LOCK, WORKTREE_LOCK, STOP_SENTINEL, WORKTREE_STOP, _ADVICE_LOCK,
+                   ACCOUNT_HOLD)
 
 
 def _transient(advice_dir: Path, name: str) -> Path:
@@ -1097,6 +1256,39 @@ def _transient(advice_dir: Path, name: str) -> Path:
             f"or `eugo-skills init-gitignore` will not ignore it in any consumer repo"
         )
     return advice_dir / name
+
+
+def read_account_hold(advice_dir: Path, now: float | None = None) -> float:
+    """Seconds remaining on a persisted account-outage hold; 0.0 when none is in force.
+
+    Unreadable, malformed or absent all mean NO HOLD, deliberately: this file can only ever
+    make the watcher do LESS, so a corrupt one must not be able to wedge reviewing off. The
+    failure it guards against is spending; the failure it must not cause is silence.
+    """
+    try:
+        raw = _transient(advice_dir, ACCOUNT_HOLD).read_text(encoding="utf-8").strip()
+    except OSError:
+        return 0.0
+    try:
+        until = float(raw)
+    except ValueError:
+        return 0.0
+    remaining = until - (time.time() if now is None else now)
+    return remaining if remaining > 0 else 0.0
+
+
+def write_account_hold(advice_dir: Path, until: float) -> None:
+    """Persist the hold. Best-effort: a watcher must never fail a review over bookkeeping.
+
+    FLOORED, not rounded. `f"{until:.0f}"` rounds half-up, so the stored instant could sit
+    up to a second PAST the one asked for and the hold would outlast its own backoff — a
+    gate that holds longer than it was told to is the wrong direction for a value whose
+    only job is to stop work. Whole seconds because a human and a hook both read this file.
+    """
+    try:
+        _transient(advice_dir, ACCOUNT_HOLD).write_text(f"{int(until)}\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 @contextlib.contextmanager
@@ -1156,6 +1348,11 @@ def _results_of(stdout: str, out_dir: Path, *, part: str = "") -> list[dict]:
         crit = _critical_section(md.read_text()) if md.exists() else ""
         result = {"model": model, "verdict": verdict,
                   "critical": crit if crit and crit.lower() != "none." else ""}
+        # §3118 — the exact id that answered (`resolved=`), beside `model`, which stays the
+        # value the settings name (an alias such as `opus`). Omitted when the driver could
+        # not tell — absence means UNRECORDED, never a mismatch.
+        if fields.get("resolved"):
+            result["resolved_model"] = fields["resolved"]
         if part:
             result["part"] = part
         if sep and note.strip():
@@ -1533,12 +1730,16 @@ def _append_entry(advice_dir: Path, entry: dict) -> None:
         entry["appended"] = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(_now))
                              + ".%06dZ" % int((_now % 1) * 1_000_000))
         entry["writer"] = _WRITER          # §3043 — the jsonl line only; the md section is unchanged
+        if _SESSION:                       # §3103 — omitted when absent, never a placeholder
+            entry["session"] = _SESSION
         with (advice_dir / "advice.jsonl").open("a") as f:
             f.write(json.dumps(entry) + "\n")
         with (advice_dir / "advice.md").open("a") as f:
             f.write(f"\n## {ts} · {kind} · {ref}\n")
             for r in results:
                 f.write(f"- **{r['model']}**: {r['verdict']}\n")
+                if r.get("resolved_model", r["model"]) != r["model"]:
+                    f.write(f"  - model: {r['resolved_model']}\n")
                 if r.get("note"):
                     f.write(f"  - note: {r['note']}\n")
                 if r["critical"]:
@@ -1671,13 +1872,17 @@ def main(argv: list[str] | None = None) -> int:
                     "forwarded verbatim to codex_review.py's --invariants-file)")
     ap.add_argument("--once", action="store_true", help="run a single tick then exit (the test hook)")
     ap.add_argument("--max-ticks", type=int, default=0, help="stop after N ticks (0 = unbounded)")
+    ap.add_argument("--ignore-account-hold", action="store_true",
+                    help="dispatch even when a persisted account-level backoff is still in "
+                         "force (§3095) — use when the account is known to be back early")
     ap.add_argument("--account-backoff", type=int, default=_ACCOUNT_BACKOFF_S,
                     help="seconds to hold the anchor after an ACCOUNT-level review failure "
                          "(quota, weekly limit, expired auth) instead of spending each "
                          "commit's retry budget on an outage")
     cfg = ap.parse_args(argv)
-    global _WRITER                         # §3043 — resolved once per process, before the lock
+    global _WRITER, _SESSION               # §3043/§3103 — resolved once per process, before the lock
     _WRITER = _resolve_writer(cfg.once)
+    _SESSION = resolve_session()
     # Compiled once at launch so a bad pattern fails immediately and loudly, not on tick N.
     skip_re = re.compile(cfg.skip_subject_re) if cfg.skip_subject_re else None
     # §1244 — resolve the LIGHT one-model default PER ENGINE. Resolved here rather than
@@ -1752,11 +1957,29 @@ def main(argv: list[str] | None = None) -> int:
                       f" upstream={upstream_ref(cfg.repo) or '(none)'} budget={tick_budget}")
     else:
         selection = f"selection=anchor since={last_sha[:12] or '(none)'}"
+    # ⚠ §3095 — THE HOLD IS CHECKED AT STARTUP, WHICH IS THE HALF THAT SAVES THE SPEND.
+    # `--once` is the dispatch mode every hook uses and it exits before the interval sleep
+    # that used to be this value's only reader, so a fresh process per commit re-attempted
+    # a review the previous one had just learned was impossible. Returning here costs one
+    # process spawn instead of a ~151 s driver run against an account that cannot answer.
+    #
+    # `--ignore-account-hold` is the deliberate override, for the case where the operator
+    # knows the account is back before the backoff expires. A hold NEVER blocks `--drain`
+    # or a STOP: it gates dispatching reviews, nothing else.
+    held = 0.0 if cfg.ignore_account_hold else read_account_hold(advice_dir)
+    if held:
+        print(f"[watch] ACCOUNT HOLD: {int(held)}s remaining on a persisted account-level "
+              f"backoff — dispatching nothing. Override with --ignore-account-hold.",
+              file=sys.stderr, flush=True)
+        return 0
+
     print(f"[watch] started repo={cfg.repo} driver={Path(cfg.driver).name} commits={cfg.commits} worktree={cfg.worktree} "
           f"models={cfg.models} effort={cfg.effort} {selection} → advice in {advice_dir}", flush=True)
 
+    attempted: set[str] = set()    # §3120 — every sha this process has sent to review
     while not _STOP:
         ticks += 1
+        redispatch = False
         try:
             # ⚠ §2139 — THE ANCHOR GATES ONLY THE PATH THAT NEEDS ONE. This read
             # `if cfg.commits and last_sha:`, so an empty `last_sha` skipped the whole
@@ -1808,12 +2031,19 @@ def main(argv: list[str] | None = None) -> int:
                 # that just landed is reviewed by the dispatch it triggered, and the backlog
                 # behind it drains at ≤budget per tick instead of blocking HEAD for its length.
                 order = [new[-1], *new[:-1]] if (cfg.since_ledger and new) else list(new)
-                dispatched = 0
-                for pos, sha in enumerate(order):
-                    if cfg.since_ledger and tick_budget and dispatched >= tick_budget:
-                        print(f"[watch] tick budget {tick_budget} reached — {len(order) - pos} "
-                              f"commit(s) wait for the next dispatch", flush=True)
-                        break
+                # §3120 (§1.91) — ONE BUDGET, TWO POPULATIONS. The cap was built for inherited
+                # backlog and was being paid by this session's own fresh commits too. Past the
+                # budget, OWNED commits keep draining; everything else waits, as before.
+                owned = (owned_commits(cfg.repo, order, session_start_epoch(advice_dir, _SESSION))
+                         if cfg.since_ledger and tick_budget and len(order) > tick_budget
+                         else set())
+                dispatched = waiting = 0
+                for sha in order:
+                    if (cfg.since_ledger and tick_budget and dispatched >= tick_budget
+                            and sha not in owned):
+                        waiting += 1
+                        continue
+                    attempted.add(sha)
                     if skip_re is not None:
                         subject = _git(cfg.repo, "log", "-1", "--format=%s", sha).strip()
                         if skip_re.search(subject):
@@ -1858,9 +2088,16 @@ def main(argv: list[str] | None = None) -> int:
                         # anchor costs a delay; an advanced one costs the review forever.
                         down = _account_is_down(entry)
                         if down is not None:
-                            account_down_until = time.time() + cfg.account_backoff
+                            # §3122 — until the reset the note states (capped at 6 h),
+                            # else the fixed backoff: a weekly limit no longer costs a probe
+                            # every 30 min for days.
+                            now = time.time()
+                            account_down_until = account_hold_until(down, now, cfg.account_backoff)
+                            # §3095 — PERSIST it. Under `--once` this process exits before
+                            # the interval sleep that used to be the only reader.
+                            write_account_hold(advice_dir, account_down_until)
                             print(f"[watch] ACCOUNT DOWN: {down} — holding the anchor at "
-                                  f"{sha[:12]} and backing off {cfg.account_backoff}s; no "
+                                  f"{sha[:12]} and backing off {int(account_down_until - now)}s; no "
                                   f"commit is advanced past while the account cannot review",
                                   file=sys.stderr, flush=True)
                             break
@@ -1886,6 +2123,24 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         review_failures.pop(sha, None)
                     reviewed_through = sha
+                if waiting:
+                    print(f"[watch] tick budget {tick_budget} reached — {waiting} inherited "
+                          f"commit(s) wait for the next dispatch"
+                          + (f"; {len(owned)} of this session's own drained past it"
+                             if owned else ""), flush=True)
+                # §3120 (§1.91) — RE-DISPATCH WHILE OWN WORK REMAINS. A commit that landed while
+                # this process reviewed was DROPPED by the single-instance lock, so waiting
+                # for "the next commit" is what left own work an hour behind (p90 53.6 min,
+                # n=54, 2026-09-22). Terminates: each extra tick needs an owned sha this
+                # process has never attempted, and an account hold stops it outright.
+                if cfg.since_ledger and cfg.once and time.time() >= account_down_until:
+                    again, _ = unreviewed_commits(
+                        cfg.repo, advice_dir, cfg.ledger_scan,
+                        retry_abandoned=getattr(cfg, "retry_abandoned", False),
+                        ignore_armed_at=ignore_armed)
+                    fresh = [s for s in again if s not in attempted]
+                    redispatch = bool(owned_commits(
+                        cfg.repo, fresh, session_start_epoch(advice_dir, _SESSION)))
                 if cfg.since_ledger:
                     # §2108 — NO ANCHOR TO ADVANCE. The ledger already records what was
                     # reviewed, so a commit whose review failed simply stays selected and
@@ -1941,8 +2196,14 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 — a tick failure must never crash the daemon
             print(f"[watch] tick error: {str(exc).splitlines()[0] if str(exc) else type(exc).__name__}",
                   file=sys.stderr, flush=True)
-        if cfg.once or (cfg.max_ticks and ticks >= cfg.max_ticks) or stop_file.exists():
+        if ((cfg.once and not redispatch) or (cfg.max_ticks and ticks >= cfg.max_ticks)
+                or stop_file.exists()):
             break
+        if cfg.once:                    # §3120 — an own-work re-dispatch: no sleep, no reset
+            redispatch = False
+            print("[watch] own commits landed during this dispatch — draining them now",
+                  flush=True)
+            continue
         # §2089 — after an account-level failure, wait it out rather than spinning the
         # retry budget down. Still interruptible, so the STOP sentinel is unaffected.
         sleep_s = cfg.interval

@@ -129,6 +129,11 @@ HOLDER="$(field holder)"
 # §3069 — the per-tick budget the watcher will honour (`tick_budget=` from a §3067 drain;
 # "" from an older one), so a pending catch-up is priced before it is spent.
 BUDGET="$(field tick_budget)"
+# §3109 — how long the OLDEST pending commit has waited. The depth alone cannot tell a
+# healthy burst from a queue that is not keeping up, and the p90 of 63.9 min measured on
+# this repo 2026-09-22 was noticed by the operator, never by this line. "" from an older
+# drain and "?" when git could not answer; neither is zero.
+OLDEST="$(field unreviewed_oldest_h)"
 
 case "$WIRED" in
   no)
@@ -163,6 +168,17 @@ case "$WIRED" in
       ""|"?"|0) ;;
       *)
         REVIEW="$REVIEW; ⚠ $UNREVIEWED commit(s) unreviewed"
+        # §3109 — the AGE, when the drain reports one. Only above 1h, because below that
+        # the number is noise on every healthy session and a line that warns constantly is
+        # one a reader learns to skip — the §2120 rule for ERROR entries, applied here.
+        case "$OLDEST" in
+          ""|"?") ;;
+          *[!0-9.]*) ;;
+          *) case "${OLDEST%%.*}" in
+               ""|0) ;;
+               *) REVIEW="$REVIEW, oldest ${OLDEST}h" ;;
+             esac ;;
+        esac
         # §3069 — name the pace: a positive integer budget means the next dispatches
         # review at most that many each (HEAD first); "" (old drain) or 0 (unbounded)
         # keep the line as it was.
@@ -185,8 +201,33 @@ if [ "$STALE" = "yes" ] && [ "$LOCK" = "held" ] && [ "$HOLDER" != "once" ]; then
   REVIEW="⚠ daemon RUNNING STALE CODE (restart it; rotate will refuse)"
 fi
 
+# §3123 (§1.89 cure 3) — a RESOLVED.md row the drain cannot parse closes nothing, and the
+# writer who minted it never finds out: `status` counted it and no banner field read it.
+MALFORMED="$(field malformed_rows)"
+case "$MALFORMED" in
+  ""|0|*[!0-9]*) ;;
+  *) REVIEW="$REVIEW; ⚠ $MALFORMED malformed RESOLVED.md row(s) — status must START with FIXED/OPEN/REFUTED/RETRY/UNTRACED/CLAIMED (watch_drain.py --help)" ;;
+esac
+
+# §3122 — a persisted quota hold pauses every dispatch; say so, or reviewing is silently off.
+HOLD="$(field account_hold_until)"
+case "$HOLD" in
+  ""|-) ;;
+  *) REVIEW="$REVIEW; review PAUSED until $HOLD (account quota — clear .adversarial-review/watch/.account-down after switching accounts)" ;;
+esac
+
+# §3122 (§1.88) — LEAD WITH THE WORK. `unresolved` counts reviews an account outage never
+# let happen (protomolecule, 2026-09-21: 372 owed, 282 of them one session limit); the drain
+# now splits them. An older drain prints neither field, and then the line is exactly as before.
+WORK="$(field unresolved_work)"
+DOWN="$(field unresolved_account_down)"
+OUTAGES=""
+case "$WORK:$DOWN" in
+  *[!0-9:]*|:*|*:) WORK="$UNRESOLVED" ;;
+  *) [ "$DOWN" -gt 0 ] && OUTAGES=" (+$DOWN failed on account quota, not findings)" ;;
+esac
 case "$UNRESOLVED" in
   "") say "could not read the owed count from watch_drain.py status — $REVIEW$ABANDON_NOTE" ;;
   0) say "nothing owed; $REVIEW$ABANDON_NOTE" ;;
-  *) say "$UNRESOLVED verdict(s) owed a row — python3 .claude/scripts/watch_drain.py list --unresolved; $REVIEW$ABANDON_NOTE" ;;
+  *) say "$WORK verdict(s) owed a row$OUTAGES — python3 .claude/scripts/watch_drain.py list --unresolved; $REVIEW$ABANDON_NOTE" ;;
 esac
