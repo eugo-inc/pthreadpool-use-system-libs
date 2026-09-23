@@ -213,6 +213,9 @@ esac
 HOLD="$(field account_hold_until)"
 case "$HOLD" in
   ""|-) ;;
+  # §3130 — a hold names the account that hit the limit; other accounts keep reviewing.
+  *"(account:"*) HOLD_ACCT="${HOLD#*(account:}"; HOLD_ACCT="${HOLD_ACCT%)}"
+    REVIEW="$REVIEW; quota hold until ${HOLD%%(*} for account $HOLD_ACCT — reviews under that account pause, other accounts (and a swapped-in one) continue" ;;
   *) REVIEW="$REVIEW; review PAUSED until $HOLD (account quota — clear .adversarial-review/watch/.account-down after switching accounts)" ;;
 esac
 

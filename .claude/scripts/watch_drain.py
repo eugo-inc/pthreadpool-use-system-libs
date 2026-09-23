@@ -153,12 +153,16 @@ def account_hold_until(advice_dir: Path, now: float | None = None) -> str:
     `YYYY-MM-DDTHH:MM:SSZ` while in force, else `-`. Read with the same fail-OPEN rule as
     its writer's reader: absent, unreadable or junk is `-` (no hold), never an error."""
     try:
-        until = float((advice_dir / ".account-down").read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+        parts = (advice_dir / ".account-down").read_text(encoding="utf-8").split()
+        until = float(parts[0])
+    except (OSError, ValueError, IndexError):
         return "-"
     if until <= (time.time() if now is None else now):
         return "-"
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
+    # §3130 — the hold names the account that hit the limit; say whose it is, so a session
+    # on another account reads "not yours" rather than "reviewing is off".
+    return stamp if len(parts) < 2 else f"{stamp}(account:{parts[1][:8]})"
 
 
 #: The status vocabulary — the row's status cell must START with one of these.
@@ -493,8 +497,10 @@ def retry_scan_depth(advice_dir: Path, repo_root: Path) -> str:
         return ""
     depth = 0
     for ref in sorted(stuck):
+        if not is_hex_ref(ref):          # §3129 — never an option on git's argv
+            return "?"
         try:
-            out = subprocess.run(["git", "rev-list", "--count", f"{ref}..HEAD"],
+            out = subprocess.run(["git", "rev-list", "--count", "--end-of-options", f"{ref}..HEAD"],
                                  cwd=str(repo_root), capture_output=True, text=True,
                                  timeout=30)
         except (OSError, subprocess.SubprocessError):
@@ -1172,13 +1178,30 @@ def check_daemon(advice_dir: Path, watch_script: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+#: §3129 (§1.93 leg 1) — EVERY ledger ref is hex: a commit sha, or a worktree content hash
+#: (sha1 of the diff). `advice.jsonl` is tracked and model-derived, so a ref is untrusted
+#: text, and a ref starting with `-` reaches git's argv as an OPTION — `--output=<path>` made
+#: `git show` and `git log` each CREATE a file (reproduced 2026-09-22, eugo-ray-meson's
+#: hand-off and again here). Anything not hex is refused before git runs, and every git call
+#: that takes a ledger ref also carries `--end-of-options` (a bare `--` would turn the ref
+#: into a pathspec). MIRRORED in codex_watch.py and the turn-end hook, pinned by tests.
+_HEX_REF = re.compile(r"[0-9a-f]{7,64}")
+
+
+def is_hex_ref(ref: object) -> bool:
+    """§3129 — True only for a string that can be a ledger ref: 7-64 lowercase hex digits."""
+    return isinstance(ref, str) and _HEX_REF.fullmatch(ref) is not None
+
+
 def changed_paths(repo: str, ref: str) -> list[str] | None:
     """Paths a commit touched, or None when git cannot resolve it in `repo`.
     `--first-parent` so a merge commit lists what it brought in (a plain
-    `git show --name-only` prints nothing for a merge)."""
+    `git show --name-only` prints nothing for a merge). §3129 — None for a non-hex ref."""
+    if not is_hex_ref(ref):
+        return None
     try:
         out = subprocess.run(
-            ["git", "show", "--name-only", "--format=", "--first-parent", ref],
+            ["git", "show", "--name-only", "--format=", "--first-parent", "--end-of-options", ref],
             cwd=repo, capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError):

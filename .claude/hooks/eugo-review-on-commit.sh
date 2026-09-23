@@ -123,10 +123,28 @@ fi
 # the future skips. Absent, unreadable, empty, a float, junk — all dispatch, and the watcher
 # makes its own (identical) call. This file can only ever make reviewing do LESS, so a corrupt
 # one must never be able to switch it off.
-HOLD_UNTIL="$(head -c 32 "$ADVICE/.account-down" 2>/dev/null | tr -d '[:space:]')"
+#
+# §3130 — THE HOLD BELONGS TO AN ACCOUNT: `<until> <accountUuid>`. It skips only when it names
+# no account (the pre-§3130 form) or THIS user's current Claude account — the operator swaps
+# accounts to replenish quota, and a peer on another account must not be paused. An account
+# this hook cannot read never matches: dispatch, and let the watcher decide.
+HOLD_LINE="$(head -c 128 "$ADVICE/.account-down" 2>/dev/null | head -n 1)"
+HOLD_UNTIL="${HOLD_LINE%% *}"; HOLD_UNTIL="$(printf '%s' "$HOLD_UNTIL" | tr -d '[:space:]')"
+HOLD_ACCT=""
+case "$HOLD_LINE" in *" "*) HOLD_ACCT="$(printf '%s' "${HOLD_LINE#* }" | tr -d '[:space:]')" ;; esac
 case "$HOLD_UNTIL" in
   ''|*[!0-9]*) ;;
-  *) [ "$HOLD_UNTIL" -gt "$(date +%s)" ] 2>/dev/null && exit 0 ;;
+  *)
+    if [ "$HOLD_UNTIL" -gt "$(date +%s)" ] 2>/dev/null; then
+      if [ -z "$HOLD_ACCT" ]; then
+        exit 0
+      fi
+      CUR_ACCT="$(python3 -c 'import json,os,sys
+b=os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~")
+try: print(((json.load(open(os.path.join(b,".claude.json"))) or {}).get("oauthAccount") or {}).get("accountUuid") or "")
+except Exception: print("")' 2>/dev/null)"
+      [ -n "$CUR_ACCT" ] && [ "$CUR_ACCT" = "$HOLD_ACCT" ] && exit 0
+    fi ;;
 esac
 
 # STAGE 1b — is a review ALREADY running? If so there is nothing to do, and finding

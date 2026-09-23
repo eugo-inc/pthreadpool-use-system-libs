@@ -750,10 +750,17 @@ def _run_one_claude(
         # Same fail-safe rule as the codex path (dogfood f2): a nonzero exit is a FAILED
         # run — never let partial output masquerade as a clean review (a sweep would
         # otherwise report a false NO_FINDINGS).
+        text, resolved, is_error = _unwrap_claude_json(proc.stdout or "")
         if proc.returncode != 0:
+            # §3128 — A FAILED RUN ALSO PRINTS THE ENVELOPE, on stdout, exit 1 (measured on CLI
+            # 2.1.280: `--model no-such-model` → rc=1, stdout one JSON object, stderr two text
+            # lines). The note is what `_account_is_down` and §3122's reset parser read, so it
+            # must be the envelope's human `result` — never the raw JSON line, which buries a
+            # `resets … (UTC)` clause past the 160-character cut and falls back to 30 min.
+            if text != (proc.stdout or "") and text.strip():
+                return (model, "ERROR", " ".join(text.split())[:300])
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()
             return (model, "ERROR", tail[-1] if tail else f"claude exited {proc.returncode}")
-        text, resolved, is_error = _unwrap_claude_json(proc.stdout or "")
         if resolved:
             _resolved_path(out_file).write_text(resolved + "\n")
         if is_error:

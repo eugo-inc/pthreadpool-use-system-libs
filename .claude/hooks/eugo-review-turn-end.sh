@@ -150,9 +150,13 @@ def _commit_epoch(ref):
     Committer, not author: a rebased or cherry-picked commit carries an author date from
     days earlier and would be misread as backlog — the same rule §3109 follows.
     """
-    import subprocess  # noqa: PLC0415 — only reached on the cold-start path
+    import re, subprocess  # noqa: PLC0415,E401 — only reached on the cold-start path
+    # §3129 (§1.93 leg 1) — a ledger ref is untrusted text; `--output=<path>` as a ref made
+    # `git log` WRITE A FILE. Hex only, and never an option (MIRRORS watch_drain.is_hex_ref).
+    if not (isinstance(ref, str) and re.fullmatch(r"[0-9a-f]{7,64}", ref)):
+        return None
     try:
-        out = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%ct", str(ref)],
+        out = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%ct", "--end-of-options", ref],
                              capture_output=True, text=True, timeout=5)
     except Exception:
         return None

@@ -2,8 +2,8 @@
   "version": 1,
   "installs": {
     "eugo-session-hooks": {
-      "tree_hash": "59de0227b0a69862ebe2a3d40df3489549d96fa32c509e65ddd7ecf2bafc3e76",
-      "source_commit": "81e40b97ee8882acbcfe05b3ef1a158a4987a1ba",
+      "tree_hash": "d78b7d5599e9a832d7e3f7026f05ec94ceda17651f688687d9defb53843abb6f",
+      "source_commit": "038b503131b484c4a9843f9d7953a2c97ed60c72",
       "files": [
         ".claude/hooks/eugo-external-publish-guard.sh",
         ".claude/hooks/eugo-prompt-context.sh",
@@ -15,12 +15,12 @@
       "file_hashes": {
         ".claude/hooks/eugo-external-publish-guard.sh": "fa5384966f1a182d1b0abff147ed1f68cfa72d57dffef58c198076b94d382681",
         ".claude/hooks/eugo-prompt-context.sh": "518991f5dd09200df9afead09b355b4c08278b07a5b12ac32e1c54959dd886a0",
-        ".claude/hooks/eugo-review-on-commit.sh": "87ec707a080a8b60f73020bddb58f0f19a7b0c044f7642f73d2a655686802a69",
-        ".claude/hooks/eugo-review-turn-end.sh": "4890593cbc5ba7a56a496d56d06c1c1757cfcf6a1300cf877ec8dcb6654dc61d",
+        ".claude/hooks/eugo-review-on-commit.sh": "8503b95d340f64a583206ee296a75e76dd2e0afa0c53ce95bffd4f9ea1f6e42c",
+        ".claude/hooks/eugo-review-turn-end.sh": "2277ea009026aff55f607af2632091dc5daf44f812c7aad6258e5e442a09e46b",
         ".claude/hooks/eugo-session-instructions.sh": "a0099b182cb68d5cbbfcb0f246a2ba39f8744658c33a2ad3629c43782b5684fb",
-        ".claude/hooks/eugo-watch-owed.sh": "c4c0e23ec2eed66727239265a4913945a54ec8f5a6ab54c90a1dcc41bef03932"
+        ".claude/hooks/eugo-watch-owed.sh": "1b858e73b4d78435b45aaba6abf9c928d2684e63f6fb1db34c02cbabd1b7520a"
       },
-      "installed_at": "2026-09-22T20:46:43+00:00"
+      "installed_at": "2026-09-23T08:28:15+00:00"
     },
     "eugo-guardrails-kit": {
       "tree_hash": "1185410076d414332c2668ed9db4cf7ed1e80d64674b7b58fbea208e35d4b279",
@@ -52,19 +52,19 @@
       "installed_at": "2026-09-06T13:35:57+00:00"
     },
     "eugo-agentic-scripts": {
-      "tree_hash": "d99a96ae81eb6b278544331f08714881f5919ca760a090f7ffde2323a589c020",
-      "source_commit": "81e40b97ee8882acbcfe05b3ef1a158a4987a1ba",
+      "tree_hash": "c45bf968e8e3a643fbaba756ca8f2012f0a6d10a0cb009aa816e1c9859a45868",
+      "source_commit": "038b503131b484c4a9843f9d7953a2c97ed60c72",
       "files": [
         ".claude/scripts/codex_review.py",
         ".claude/scripts/codex_watch.py",
         ".claude/scripts/watch_drain.py"
       ],
       "file_hashes": {
-        ".claude/scripts/codex_review.py": "23311cdf775909b35901ca0d562fa5d16d980069ba7d8f04fb0422345aac4da4",
-        ".claude/scripts/codex_watch.py": "07836eeef29f357aa6717a15cbe3ad87b3f7d9a5813a812037a7bbd11b675665",
-        ".claude/scripts/watch_drain.py": "03b8b2b27bd1616fba18ef790c9411fb635153feacb831af2f87b5550819caa2"
+        ".claude/scripts/codex_review.py": "6794e8a1e8e387456c195245d722ec3f35e01b60254bfb8307f75586fe216777",
+        ".claude/scripts/codex_watch.py": "2d5e8e3c786c8b31c85cfeef80563bff6504a091813e0da8897b4bdebcc7a1eb",
+        ".claude/scripts/watch_drain.py": "c43c4dcbf7ff19cd47c58ed8ee25add0551c61d54640a48ecd8b925096e71aaa"
       },
-      "installed_at": "2026-09-22T20:46:43+00:00"
+      "installed_at": "2026-09-23T08:28:15+00:00"
     }
   }
 }

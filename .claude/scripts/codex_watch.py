@@ -1258,26 +1258,59 @@ def _transient(advice_dir: Path, name: str) -> Path:
     return advice_dir / name
 
 
-def read_account_hold(advice_dir: Path, now: float | None = None) -> float:
+def current_account(env: dict | None = None) -> str:
+    """§3130 — the Claude account this process's CLI is logged into, or "" when unknown.
+
+    `oauthAccount.accountUuid` in `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json` —
+    where Claude Code keeps the active login. The operator SWAPS accounts under one UNIX user
+    to replenish quota, so the hold is keyed to this, not to the checkout or the uid.
+    """
+    e = env if env is not None else os.environ
+    base = e.get("CLAUDE_CONFIG_DIR") or e.get("HOME") or ""
+    if not base:
+        return ""
+    try:
+        data = json.loads((Path(base) / ".claude.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    acct = (data.get("oauthAccount") or {}).get("accountUuid") if isinstance(data, dict) else None
+    return acct.strip() if isinstance(acct, str) else ""
+
+
+def read_account_hold(advice_dir: Path, now: float | None = None,
+                      account: str | None = None) -> float:
     """Seconds remaining on a persisted account-outage hold; 0.0 when none is in force.
 
     Unreadable, malformed or absent all mean NO HOLD, deliberately: this file can only ever
     make the watcher do LESS, so a corrupt one must not be able to wedge reviewing off. The
     failure it guards against is spending; the failure it must not cause is silence.
+
+    §3130 — A HOLD BELONGS TO THE ACCOUNT THAT HIT THE LIMIT. The file is `<until> <account>`;
+    it applies only when it names no account (the pre-§3130 form) or names the account this
+    process runs as. After the operator swaps accounts the new one reviews at once, and a
+    peer session on the same checkout under a different account is never paused by it. An
+    unknown current account does NOT match — fail open, as everything else here does.
     """
     try:
         raw = _transient(advice_dir, ACCOUNT_HOLD).read_text(encoding="utf-8").strip()
     except OSError:
         return 0.0
+    parts = raw.split()
     try:
-        until = float(raw)
+        until = float(parts[0]) if parts else float("nan")
     except ValueError:
         return 0.0
+    if until != until:                    # NaN: empty file
+        return 0.0
+    if len(parts) > 1:
+        mine = current_account() if account is None else account
+        if not mine or mine != parts[1]:
+            return 0.0
     remaining = until - (time.time() if now is None else now)
     return remaining if remaining > 0 else 0.0
 
 
-def write_account_hold(advice_dir: Path, until: float) -> None:
+def write_account_hold(advice_dir: Path, until: float, account: str | None = None) -> None:
     """Persist the hold. Best-effort: a watcher must never fail a review over bookkeeping.
 
     FLOORED, not rounded. `f"{until:.0f}"` rounds half-up, so the stored instant could sit
@@ -1286,7 +1319,11 @@ def write_account_hold(advice_dir: Path, until: float) -> None:
     only job is to stop work. Whole seconds because a human and a hook both read this file.
     """
     try:
-        _transient(advice_dir, ACCOUNT_HOLD).write_text(f"{int(until)}\n", encoding="utf-8")
+        acct = current_account() if account is None else account
+        # §3130 — `<until> <account>`; no account known → the bare pre-§3130 form, which
+        # holds everyone (the only safe reading of "some account is down").
+        _transient(advice_dir, ACCOUNT_HOLD).write_text(
+            f"{int(until)} {acct}\n" if acct else f"{int(until)}\n", encoding="utf-8")
     except OSError:
         pass
 
@@ -1578,10 +1615,15 @@ def _superseded(repo: str, sha: str) -> dict | None:
     # THE CURE, if a deeper scan ever makes this reachable: `--format= -z` and split on NUL.
     # It needs its own gate and a fixture carrying a space path, because this function now
     # runs in every turn-end hook (§2201/§2202).
-    files = [f for f in _git(repo, "show", "--name-only", "--format=", sha).split() if f]
+    # §3129 (§1.93 leg 1) — `sha` comes from a ledger entry: untrusted, and a leading `-`
+    # would reach git as an OPTION (`--output=<path>` writes a file). Hex only, and
+    # `--end-of-options` before it — MIRRORS `watch_drain.is_hex_ref`.
+    if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{7,64}", sha)):
+        return None
+    files = [f for f in _git(repo, "show", "--name-only", "--format=", "--end-of-options", sha).split() if f]
     if not files:
         return None
-    out = _git(repo, "rev-list", "--count", f"{sha}..HEAD", "--", *files).strip()
+    out = _git(repo, "rev-list", "--count", "--end-of-options", f"{sha}..HEAD", "--", *files).strip()
     try:
         touched = int(out)
     except ValueError:
