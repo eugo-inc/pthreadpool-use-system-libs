@@ -18,6 +18,19 @@
 #   - the drain is READ-ONLY here: `status`, never `rotate`
 #   - a missing repo, a missing drain script or a broken one still prints one line
 #   - bash 3.2 safe (macOS): no mapfile, no ${x,,}, no associative arrays
+#   - an errexit INHERITED through BASH_ENV is disarmed before anything else runs
+#
+# §3143 — THE DISARM COMES FIRST (fact 7664bbb3e4c7: every kit hook started from `set -u`
+# alone). The eugo deploy image's BASH_ENV turns on `set -eE -o pipefail` (fact 76fb0dc9202e)
+# for EVERY non-interactive bash, this hook included whenever Claude Code runs in the
+# devcontainer.
+# Under it `field` — a `grep` that finds no such key, failing through `pipefail` — ended
+# this hook at the first field `status` did not print: measured, a non-zero exit (97 under
+# the test's trap) and NO line. An idle `status` prints no `stale=` and no `holder=` (only
+# a held lock does), so that was every idle session start: the silence this contract forbids.
+# The cure is the one protomolecule f73c6ba408 (Ben) gave the publish guard.
+set +eE +o pipefail
+trap - ERR
 set -u
 exec </dev/null
 

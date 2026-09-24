@@ -24,9 +24,9 @@ python3 .claude/scripts/watch_drain.py [--repo <dir>] [--advice-dir .adversarial
 
 THE LEDGER — `<advice-dir>/RESOLVED.md`. A Markdown table keyed `ts · ref` (the entry's
 own `ts` and `ref`; a ref of >= 12 leading characters matches, the daemon's own
-shorthand), one row per handled entry, status in {FIXED §id, OPEN → FUTURE, REFUTED,
-RETRY, UNTRACED}, plus one marker line `<!-- drained-through: <ts> -->` (`(none)` before
-the first drain). `rotate` REFUSES while any NEEDS_REVISION/ERROR entry at or before
+shorthand), one row per handled entry, status in {CLAIMED, FIXED §id, OPEN → FUTURE,
+REFUTED, RETRY, UNTRACED} (`STATUS_VOCAB`; `--help` prints what each means), plus one
+marker line `<!-- drained-through: <ts> -->` (`(none)` before the first drain). `rotate` REFUSES while any NEEDS_REVISION/ERROR entry at or before
 `--through` has no row: the record is the precondition, not a by-product.
 
 THE WRITE PATH — `resolve`. Until §3070 the ledger had `status`/`list`/`rotate` and no
@@ -60,8 +60,12 @@ LOCKS. `rotate` runs under `<advice-dir>/.advice.lock` — the per-append lock t
 takes around BOTH its writes (`codex_watch._ADVICE_LOCK`; the name is pinned equal to
 `ADVICE_LOCK` below by `tools/tests/test_watch_drain.py`). It cannot share the daemon's
 lifetime `.watch.lock`, which is one-daemon-per-directory. A daemon started BEFORE the
-installed `codex_watch.py` was last written never takes `.advice.lock` (it predates the
-lock), so a rotation would race its appends: `rotate` reads the holder's pid from
+installed `codex_watch.py` was last written MAY predate `.advice.lock` (§1945, 2026-09-04) —
+the script's mtime is the only age this can read, so it treats every such holder as one
+(§3139: "may", not "never takes" — a daemon started after 2026-09-04 does take it). A daemon
+that took no `.watch.lock` either (pre-§1650, before 2026-08-31) is invisible here; see
+`check_daemon` for why that is ruled out rather than detected. So a rotation would race a
+pre-lock daemon's appends: `rotate` reads the holder's pid from
 `.watch.lock` (the daemon writes it there), its start time from `/proc/<pid>/stat`, and
 refuses with "restart the watch daemon first" when that start predates the script's
 mtime. Test/diagnostic hook: `WATCH_DRAIN_HOLDER_START=<epoch seconds>` replaces the
@@ -71,13 +75,17 @@ EXIT CODES. 0 done · 1 failure having written nothing (I/O, malformed input, a 
 that would move backwards, `in != archived + remaining`, or a `resolve` whose --ref
 matches no entry / more than one / whose --status is outside the vocabulary) · 2 an owed
 entry has no RESOLVED.md row · 3 `.advice.lock` not acquired within `--lock-timeout` · 4
-the watch daemon holding `.watch.lock` predates the installed `codex_watch.py`.
+the watch daemon holding `.watch.lock` predates the installed `codex_watch.py`. §3139 —
+`rotate` also exits 1 when `advice.md` is not byte-identical to the rendering of
+`advice.jsonl` (a hand annotation would be dropped uncounted); `--discard-md-drift`
+overrides it and prints what it discarded.
 
 WRITES. Every file `rotate` touches is written to a sibling temp file, fsynced and
 renamed into place: `archive/<yyyy-mm>.jsonl` (appended, by entry month), `advice.jsonl`
 (the remaining raw lines, byte-for-byte), `advice.md` (regenerated from the remaining
 entries with the daemon's exact rendering — `render_md` below IS `codex_watch._review`'s
-loop), then `RESOLVED.md` (the marker). A failure between renames can only leave an
+loop — and only after the CURRENT file was verified to be exactly that rendering of the
+current jsonl, §3139), then `RESOLVED.md` (the marker). A failure between renames can only leave an
 entry in BOTH the archive and the live file, never in neither.
 """
 
@@ -89,6 +97,7 @@ import errno
 import fcntl
 import fnmatch
 import json
+import math
 import os
 import re
 import subprocess
@@ -157,9 +166,15 @@ def account_hold_until(advice_dir: Path, now: float | None = None) -> str:
         until = float(parts[0])
     except (OSError, ValueError, IndexError):
         return "-"
-    if until <= (time.time() if now is None else now):
+    # §1.94 L2 — `nan` compares False and reached `gmtime` (ValueError); `inf`, `1e20`
+    # (OverflowError) and `1e17` (OSError, EOVERFLOW) did too. All are NO HOLD, the same
+    # range `codex_watch.read_account_hold` honours, so the two readers agree.
+    if not math.isfinite(until) or until <= (time.time() if now is None else now):
         return "-"
-    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
+    try:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
+    except (OverflowError, ValueError, OSError):
+        return "-"
     # §3130 — the hold names the account that hit the limit; say whose it is, so a session
     # on another account reads "not yours" rather than "reviewing is off".
     return stamp if len(parts) < 2 else f"{stamp}(account:{parts[1][:8]})"
@@ -169,6 +184,23 @@ def account_hold_until(advice_dir: Path, now: float | None = None) -> str:
 #: §3108 adds `CLAIMED` (§1.85 cure 2). Purely ADDITIVE: the reader is a prefix test, so
 #: every row written before it stays valid and no existing status changes meaning.
 STATUS_VOCAB = ("CLAIMED", "FIXED", "OPEN", "REFUTED", "RETRY", "UNTRACED")
+#: §1.94 L3 — what each token MEANS, as (the status cell a row writes, meaning): `--help`
+#: prints them, and `.claude/docs/finding-triage.md` and the review skill both send the
+#: reader there for the meanings, which the epilog used to omit. MIRRORED, cell and meaning,
+#: by `eugo_kb.skills.reviewarm.STATUS_ROWS` (the seed of every consumer's RESOLVED.md,
+#: which cannot import this file); pinned equal by tools/tests/test_skills_reviewarm.py.
+STATUS_MEANINGS = {
+    "CLAIMED": ("`CLAIMED <session> <YYYY-MM-DDTHH:MM:SSZ>`",
+                "somebody is working on it (`watch_drain.py claim`); it closes nothing and lapses "
+                "after 24 h, and `resolve` writes the real status over it"),
+    "FIXED": ("`FIXED §<id>`", "cured in that commit"),
+    "OPEN": ("`OPEN → <backlog id>`",
+             "a real defect, filed in the backlog; the row records a look, not a closure, so the "
+             "entry stays owed"),
+    "REFUTED": ("`REFUTED`", "the finding is wrong; the row says why"),
+    "RETRY": ("`RETRY — <when>`", "an ERROR entry re-reviewed later"),
+    "UNTRACED": ("`UNTRACED`", "acknowledged but not traced: nothing was learned from it"),
+}
 
 #: §3108 — how long a claim holds the finding before it returns to the pool.
 #:
@@ -900,6 +932,49 @@ class Resolved:
         return found
 
 
+
+def md_drift(md_path: Path, entries: list) -> str:
+    """§3139 (§1.93 leg 6) — "" when `md_path` is byte-identical to the rendering of `entries`,
+    else a one-line `path:line` account of the first difference and which way it goes.
+
+    `rotate` regenerates the TRACKED advice.md from the jsonl, and its conservation check counts
+    jsonl LINES only, so content that exists only in the md — a hand annotation — was dropped
+    uncounted. Measured before this shipped (wf_31d4e874-8e3): athena's live pair, all 20
+    committed versions of it, and three other local checkouts were byte-identical, so the check
+    blocks nothing today. BYTES, not text: the daemon appends with the locale encoding, and a
+    strict decode of a skewed file would be a traceback rather than an exit 1.
+
+    The direction matters because only one side is lossy: md lines that are an in-order
+    subsequence of the rendered lines mean the md is MISSING content (a torn daemon append —
+    regenerating loses nothing); anything else means it carries content no entry renders.
+    """
+    want = "".join(render_md(e.obj) for e in entries).encode("utf-8")
+    try:
+        have = md_path.read_bytes()
+    except FileNotFoundError:
+        if not want:
+            return ""                   # nothing to render and nothing there: rotate's own full drain
+        return (f"{md_path}: absent while advice.jsonl holds {len(entries)} entries — nothing is "
+                f"lost by regenerating it; rerun with --discard-md-drift")
+    if have == want:
+        return ""
+    hl, wl = have.split(b"\n"), want.split(b"\n")
+    line = next((k for k, (a, b) in enumerate(zip(hl, wl)) if a != b), min(len(hl), len(wl)))
+    show = lambda b: repr(b.decode("utf-8", "backslashreplace"))[:160]  # noqa: E731
+    got = show(hl[line]) if line < len(hl) else "<end of file>"
+    exp = show(wl[line]) if line < len(wl) else "<end of rendering>"
+    it = iter(wl)
+    missing_only = all(any(x == y for y in it) for x in hl)
+    way = ("the file is MISSING rendered content (a torn daemon append?) — regenerating loses "
+           "nothing; rerun with --discard-md-drift" if missing_only else
+           "the file carries content no entry renders (a hand annotation?) — rotate would drop "
+           "it uncounted; move it into a RESOLVED.md evidence cell or a hand-off file, or rerun "
+           "with --discard-md-drift to discard it")
+    return (f"{md_path}:{line + 1}: advice.md is not the rendering of advice.jsonl "
+            f"({len(entries)} entries; {len(hl)} lines in the file, {len(wl)} rendered); first "
+            f"difference — file: {got} · rendered: {exp}. {way}")
+
+
 def read_resolved(path: Path) -> Resolved:
     res = Resolved()
     if not path.exists():
@@ -1153,7 +1228,21 @@ def daemon_state(advice_dir: Path, watch_script: Path) -> dict:
 
 def check_daemon(advice_dir: Path, watch_script: Path) -> dict:
     """Raise EXIT_STALE_DAEMON when a running daemon predates the installed script — or
-    when that cannot be determined: an unknown holder is treated as a pre-lock one."""
+    when that cannot be determined: an unknown holder is treated as a pre-lock one.
+
+    ⚠ §3139 (§1.93 leg 7) — "absent"/"free" returns CLEAN, and a LOCKLESS writer is invisible
+    to it. Ruled, from athena's history rather than assumed (wf_31d4e874-8e3): 13 versions of
+    `codex_watch.py` (336be8d0a..93c5d7e70, 2026-06-27..2026-08-31) ran as a daemon, appended
+    with no lock and recorded no pid — so such a writer DID exist. None can run now by any
+    automatic path: both hooks pass `--since-ledger`, which those versions reject (exit 2); the
+    box rebooted 2026-09-19, after §1650 (lifetime lock) and §1945 (`.advice.lock`); and rotate
+    is only ever run by an operator (`drain-watch`). The residual case is a human deliberately
+    starting a pre-2026-08-31 copy against a live advice dir. Neither code change considered
+    would catch it: reading `.watch.worktree.lock` too would refuse rotate at every turn end
+    while guarding nothing (every worktree-lock build, 28712a7b9+, appends under
+    `.advice.lock`), and "absent lock + live pid" detects nothing (pre-lock code wrote no pid).
+    Only a /proc argv scan could; not warranted on this evidence.
+    """
     state = daemon_state(advice_dir, watch_script)
     if state["lock"] in ("absent", "free"):
         return state
@@ -1789,6 +1878,14 @@ def cmd_rotate(args: argparse.Namespace, advice_dir: Path) -> int:
         if not jsonl.exists():
             raise DrainError(EXIT_FAIL, f"nothing to rotate: {jsonl} absent")
         entries = load_entries(jsonl)
+        # §3139 (§1.93 leg 6) — AFTER load_entries (a malformed jsonl line is reported as
+        # itself, §806) and under the advice lock (the daemon writes both files in one hold),
+        # BEFORE any write or the dry-run return, so `--dry-run` predicts the refusal too.
+        drift = md_drift(advice_dir / ADVICE_MD, entries)
+        if drift:
+            if not getattr(args, "discard_md_drift", False):
+                raise DrainError(EXIT_FAIL, f"{drift}; nothing written")
+            print(f"discarded advice.md drift: {drift}", file=sys.stderr)
         resolved_path = advice_dir / RESOLVED_MD
         resolved = read_resolved(resolved_path)
         if not resolved.exists:
@@ -1897,7 +1994,9 @@ def main(argv: list[str] | None = None) -> int:
         epilog="RESOLVED.md status vocabulary — the status cell must START with one of: "
                + ", ".join(STATUS_VOCAB)
                + ". A prefix test: `FIXED — already at HEAD by <sha>` passes; "
-                 "`ALREADY FIXED BY <sha>` is a malformed row (see `status`: malformed_rows=).",
+                 "`ALREADY FIXED BY <sha>` is a malformed row (see `status`: malformed_rows=).\n"
+               + "".join(f"\n  {STATUS_MEANINGS[token][0]} — {STATUS_MEANINGS[token][1]}"
+                         for token in STATUS_VOCAB),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--repo", default=REPO_ROOT,
@@ -1928,6 +2027,9 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--lock-timeout", type=float, default=30.0,
                     help="seconds to wait for .advice.lock (0 = one try); exit 3 on timeout")
     rp.add_argument("--dry-run", action="store_true", help="report the counts, write nothing")
+    rp.add_argument("--discard-md-drift", action="store_true",
+                    help="§3139 — rotate even when advice.md is not the rendering of advice.jsonl "
+                         "(a torn append, or a hand note you have moved elsewhere); prints what it discards")
     sp = sub.add_parser("resolve", help="write ONE RESOLVED.md disposition row for the matched entry")
     sp.add_argument("--ref", required=True, help="the entry's ref: exact, or a >=12-char prefix of it")
     sp.add_argument("--status", required=True,

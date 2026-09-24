@@ -46,6 +46,12 @@
 #   - a checkout with a remote outside the allowlist and no explicit -R on a gh write ASKS
 #     (gh may default to the upstream parent of a fork)
 #   - malformed stdin, no python3, no git -> silent pass; bash 3.2 safe
+#   - an errexit INHERITED through BASH_ENV is disarmed first: the eugo deploy image's /usr/local/etc/bash_env
+#     turns on `set -eE -o pipefail` + an ERR trap, and under it `MSG="$(verdict)"` died with the ask's own
+#     exit 3 before the JSON printed — a non-2 exit is non-blocking, so the write ran UNASKED (measured
+#     2026-09-23 in the gb10-extended lap image; reached whenever Claude Code runs inside the devcontainer)
+set +eE +o pipefail
+trap - ERR
 set -u
 
 IN="$(cat 2>/dev/null || true)"
@@ -79,6 +85,10 @@ MCP_W = {"create_issue", "create_pull_request", "add_issue_comment", "update_iss
          "dismiss_notification", "mark_all_notifications_read", "manage_notification_subscription"}
 MCP_W_PREFIX = ("create_", "add_", "update_", "delete_", "push_", "merge_", "fork_", "submit_", "request_",
                 "assign_", "dismiss_", "manage_", "mark_")
+# LOCAL PATCH 2026-09-23 (Ben: "Patch locally + send to athena"): the github MCP server's consolidated tools are
+# named by SUFFIX (`issue_write`, `pull_request_review_write`, `sub_issue_write`), which no prefix above matches, so
+# all three passed UNASKED. Guard: protomolecule packages/tests/unit/test_the_publish_guard_asks_before_every_github_write_tool.py.
+MCP_W_SUFFIX = ("_write",)
 
 
 def allowlist(cwd):
@@ -373,7 +383,7 @@ def check_mcp(name, tool_input, cwd):
         ask("external publication is a human step (§publish-manual): `%s` publishes under a personal identity, "
             "outside the org. Approve only if the operator named this draft and asked to publish it; otherwise "
             "draft it to %s and hand the path over via AskUserQuestion." % (name, DRAFTS))
-    if action not in MCP_W and not action.startswith(MCP_W_PREFIX):
+    if action not in MCP_W and not action.startswith(MCP_W_PREFIX) and not action.endswith(MCP_W_SUFFIX):
         return
     allow = allowlist(cwd)
     owner = str((tool_input or {}).get("owner") or "").strip().lower()

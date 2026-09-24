@@ -29,6 +29,19 @@
 #     unparseable, empty or ERROR informs — it must never interrupt on a non-finding.
 #   - a missing repo/ledger/script is silent and exit 0
 #   - bash 3.2 safe
+#   - an errexit INHERITED through BASH_ENV is disarmed before anything else runs
+#
+# §3143 — THE DISARM COMES FIRST (fact 7664bbb3e4c7: every kit hook started from `set -u`
+# alone). The eugo deploy image's BASH_ENV turns on `set -eE -o pipefail` (fact 76fb0dc9202e)
+# for EVERY non-interactive bash, this hook included whenever Claude Code runs in the
+# devcontainer.
+# Measured on this hook: every path its test file drives already behaved under that
+# environment, where each of its three siblings died, so here the lines guard the NEXT
+# edit. They matter more here than anywhere: a Stop hook ended by errexit exits with the
+# failing command's status, which is neither the 0 that informs nor the 2 that interrupts.
+# The cure is the one protomolecule f73c6ba408 (Ben) gave the publish guard.
+set +eE +o pipefail
+trap - ERR
 set -u
 
 ROOT="${CLAUDE_PROJECT_DIR:-.}"
@@ -175,9 +188,17 @@ def _is_inherited_backlog(e, cold):
     session's first commit.
 
     Only on a COLD start, and that is the whole trick. A cold session's `since` is "" so it
-    scans the entire ledger (§2130 calls this the dominant shape), and its first look IS
-    now — so "before the session existed" needs no stored start time, no marker file, and no
-    ledger derivation. A warm session is already bounded by its own cursor.
+    scans the entire ledger (§2130 calls this the dominant shape), and its first look is
+    taken as now — so "before the session existed" needs no stored start time, no marker
+    file, and no ledger derivation.
+
+    ⚠ §3143 (§1.94 L1) — TWO LIMITS OF THAT TRICK. (1) OPEN: "now" is the FIRST STOP, not
+    the session's start, so a first turn longer than COLD_START_NEWS_SECONDS demotes the
+    session's OWN early commits to backlog, against the rule below. (2) BY DESIGN: a warm
+    session is bounded by its cursor in REVIEW time only. A `--full` catch-up (every
+    SessionStart, resume and compact included) that reviews an old, still-unreviewed commit under this
+    session's id still reaches it and still interrupts, which is why the `commit)` lead
+    says when the REVIEW landed, not the commit.
 
     Fails toward NEWS: no ref, an unparseable date, a worktree entry (no commit to date), or
     git declining all leave the entry blocking. Suppressing a real finding costs more than
@@ -561,8 +582,15 @@ case "$OUT" in
     # afterwards that nobody believes.
     #
     # THE TWO KINDS ARE NOT THE SAME CLAIM, which is why the marker carries them:
-    #   * `commit` — the reviewed sha landed during this turn, but this is a SHARED clone
-    #     and git cannot attribute an author, so the hook says when it landed and stops.
+    #   * `commit` — the REVIEW landed since this session last looked; the commit itself may
+    #     be older, or a peer's brought in by a merge, and this is a SHARED clone where git
+    #     cannot attribute an author, so the hook says when the review landed and stops.
+    #     §3143 — this read "the reviewed sha landed during this turn" and the lead said
+    #     "commit(s) that LANDED during this turn": false on a warm turn, because only a
+    #     cold start filters by commit age (`_is_inherited_backlog`). Measured in
+    #     epstein-drive 2026-09-23 (fact fb12484ab7a6): two consecutive turns named commits
+    #     that an earlier merge had brought in before either turn began. Consumer guards
+    #     read the word `landed` in this arm (protomolecule a7b143a0a), so it stays.
     #   * `worktree` — the ref is a CONTENT HASH over the shared dirty tree, so it can
     #     never be attributed to anyone. An earlier fix asserted the opposite here
     #     ("the worktree one(s) are in work you just did") beside a correct disclaimer for
@@ -575,7 +603,7 @@ case "$OUT" in
     KINDS="$(printf '%s' "$OUT" | head -n1)"; KINDS="${KINDS#BLOCK}"; KINDS="${KINDS# }"
     case "$KINDS" in
       worktree) WHOSE='in the shared working tree — it holds every account'"'"'s uncommitted work, so these may or may not be yours; `git diff -U0 -- <path>` before acting' ;;
-      commit)   WHOSE='in commit(s) that LANDED during this turn (shared clone — git cannot attribute the author)' ;;
+      commit)   WHOSE='in commit(s) whose review LANDED since this session last looked — the commit itself may be older or merged in (shared clone — git cannot attribute the author)' ;;
       *)        WHOSE='in unresolved review findings for this repo (shared clone and shared worktree — neither can be attributed to a session)' ;;
     esac
     printf 'adversarial review found a blocking issue %s:\n%s\n\nAddress it before continuing, or say why it is not a defect.\n' \

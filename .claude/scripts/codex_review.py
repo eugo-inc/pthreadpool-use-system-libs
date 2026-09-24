@@ -757,10 +757,34 @@ def _run_one_claude(
             # lines). The note is what `_account_is_down` and §3122's reset parser read, so it
             # must be the envelope's human `result` — never the raw JSON line, which buries a
             # `resets … (UTC)` clause past the 160-character cut and falls back to 30 min.
-            if text != (proc.stdout or "") and text.strip():
+            enveloped = text != (proc.stdout or "")
+            if enveloped and text.strip():
                 return (model, "ERROR", " ".join(text.split())[:300])
-            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-            return (model, "ERROR", tail[-1] if tail else f"claude exited {proc.returncode}")
+            # §3144 (§1.94 L4, second shape) — an `error_during_execution` envelope carries NO
+            # `result` key at all (the CLI builds `{type:"result",subtype:"error_during_execution",
+            # is_error:true,errors:[…]}`), so `_unwrap_claude_json` hands the JSON line back and
+            # `enveloped` read False. Its human words are `errors[]`: they win, as `result` does
+            # above; an envelope with no words falls to stderr's tail, then the fixed note.
+            if not enveloped:
+                try:
+                    obj = json.loads(proc.stdout or "")
+                except ValueError:
+                    obj = None
+                if isinstance(obj, dict) and obj.get("type") == "result":
+                    errs = obj.get("errors")
+                    words = " ".join(e for e in errs if isinstance(e, str)) if isinstance(errs, list) else ""
+                    if words.strip():
+                        return (model, "ERROR", " ".join(words.split())[:300])
+                    enveloped, is_error = True, obj.get("is_error") is True
+            # §1.94 L4 — an envelope whose `result` is EMPTY fell through to `proc.stdout`,
+            # which IS the JSON line. stderr's last line when there is one; else a fixed note.
+            tail = (proc.stderr or ("" if enveloped else proc.stdout) or "").strip().splitlines()
+            if tail:
+                return (model, "ERROR", tail[-1])
+            if enveloped:
+                return (model, "ERROR", "claude reported is_error with an empty result" if is_error
+                        else f"claude exited {proc.returncode} with an empty result")
+            return (model, "ERROR", f"claude exited {proc.returncode}")
         if resolved:
             _resolved_path(out_file).write_text(resolved + "\n")
         if is_error:

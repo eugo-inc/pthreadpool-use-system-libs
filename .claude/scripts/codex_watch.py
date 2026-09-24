@@ -36,6 +36,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -356,16 +357,50 @@ def _git(repo: str, *args: str, timeout: int = 30) -> str:
     # UnicodeDecodeError out of every caller — under `--since-ledger` that one commit was a
     # permanent head-of-line block with no ledger trace, because the exception fired before
     # `_review` could write anything. A U+FFFD in the reviewed text is the right price.
+    # §3144 — a MAGIC pathspec (`_advice_exclude`'s `:(exclude,literal)…`) is read as a
+    # literal file name under an inherited GIT_LITERAL_PATHSPECS=1: measured on git 2.43,
+    # `git diff HEAD -- ':(exclude,literal)<dir>'` then lists nothing, rc 0, so the worktree
+    # lane would review NOTHING with no error. Forced off in the environment rather than
+    # with `--no-literal-pathspecs`, so argv[0] stays the subcommand the test stubs key on.
+    env = ({**os.environ, "GIT_LITERAL_PATHSPECS": "0"}
+           if any(arg.startswith(":(") for arg in args) else None)
     out = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True,
-                         errors="replace", timeout=timeout)
+                         errors="replace", timeout=timeout, env=env)
     return out.stdout if out.returncode == 0 else ""
 
 
-def _changed_lines(repo: str) -> int | None:
+def _advice_exclude(repo: str, advice_dir: Path) -> tuple[str, ...]:
+    """The pathspec that keeps the review's OWN ledger out of the worktree diff, or ().
+
+    ⚠ §3144 (epstein-drive ED-728, fact a6940df2e0a7) — A REPO THAT TRACKS ITS ADVICE
+    REVIEWED ITS OWN LEDGER. D5 keeps `advice.jsonl` / `advice.md` tracked, every review
+    appends to both, so the next worktree dispatch saw a diff made of the previous review's
+    output and paid ~151 s to review it: 91 reviews in epstein-drive's first 80 minutes.
+    Applied to BOTH worktree calls — the diff the reviewer is handed and the `--shortstat`
+    size gate — or ledger churn alone would still lift a three-line change over
+    `--wt-min-lines`.
+
+    `literal`, so a `*` or `[` in the directory name is not a glob. NO pathspec at all when
+    the advice dir is not strictly inside `repo`: git REFUSES a pathspec outside the
+    worktree (`fatal: … is outside repository`, rc 128), `_git` turns that into "", and the
+    lane would review NOTHING — the §703 fail-closed shape `_changed_lines` states the rule
+    against. A directory outside the checkout cannot appear in its diff anyway.
+    """
+    try:
+        rel = os.path.relpath(os.path.realpath(advice_dir), os.path.realpath(repo))
+    except ValueError:
+        return ()
+    if rel in (os.curdir, os.pardir) or rel.startswith(os.pardir + os.sep):
+        return ()
+    return ("--", f":(exclude,literal){rel}")
+
+
+def _changed_lines(repo: str, *pathspec: str) -> int | None:
     """Lines added + deleted in the uncommitted diff, or None when it cannot be read.
 
     §2116 — the size gate's input. Cheap (one git call, no diff text) and deliberately
     counts BOTH directions: a large deletion is as reviewable as a large addition.
+    §3144 — `pathspec` is `_advice_exclude`'s, the same one the reviewed diff carries.
 
     ⚠ None means UNKNOWN, and the caller must treat unknown as "review it". Returning 0
     for an unparseable `--shortstat` would make the gate fail CLOSED — silently skipping
@@ -374,7 +409,7 @@ def _changed_lines(repo: str) -> int | None:
     hypothetical: it turned two existing tests red the first time this ran, because their
     git stub answers every call with one fixed string.
     """
-    stat = _git(repo, "diff", "--shortstat", "HEAD")
+    stat = _git(repo, "diff", "--shortstat", "HEAD", *pathspec)
     if not stat.strip():
         return None
     found = re.findall(r"(\d+) (?:insertion|deletion)", stat)
@@ -460,6 +495,87 @@ def _terminally_unreviewable(entry: dict) -> str | None:
     return None
 
 
+def _names_nothing_blocking(result: dict) -> bool:
+    """A NEEDS_REVISION whose `critical` is empty or opens with the prompt's `None.` sentinel.
+
+    §3144 — ONE definition of the shape, read by `_is_verdict` (it is not a review) and by
+    `_outage_stub` (when it also names an outage, nobody is charged for it).
+    """
+    if result.get("verdict") != "NEEDS_REVISION":
+        return False
+    critical = result.get("critical")
+    critical = critical.strip() if isinstance(critical, str) else ""
+    return not critical or critical.lower().startswith("none.")
+
+
+def _is_verdict(result: dict) -> bool:
+    """Did this ONE result carry a verdict on the code?
+
+    ⚠ §3144 — A NEEDS_REVISION THAT NAMES NOTHING BLOCKING IS NOT A REVIEW. The prompt
+    (`codex_review.py` `_CODE`) asks for blocking issues under `## Critical Issues` and
+    "If none, write "None."", and NEEDS_REVISION only when there is one. A NEEDS_REVISION
+    whose `critical` is empty or begins with that sentinel is the driver's fail-safe
+    default for a capture with no verdict line (still the codex engine's rule; the claude
+    engine's until §2066) or a consumer driver's failure stub, and every such entry
+    MEASURED on 2026-09-23 was an unreviewed commit: athena's 5 (the §2048 capture losses,
+    each rowed by hand in RESOLVED.md) and epstein-drive's 4 "NO FINDING"s — two empty, two
+    reading `None.` then a driver note, `claude -p failed: API Error: 529 Overloaded …` and
+    `… You've hit your session limit …`. 0 of the other 2,445 non-ERROR results match.
+    ⚠ The shape is not PROOF of a capture loss: `_results_of` also stores `critical` as ""
+    when a real reviewer answers `None.` under a verdict of NEEDS_REVISION, or words the
+    heading so `_critical_section` misses it. Measured 2026-09-23 on athena's live ledger
+    (`advice.jsonl` + `archive/`; 226 in the copy committed at 78c744188): 0 of its 227
+    NEEDS_REVISION results is such a review —
+    the 5 in the shape are the capture losses above — so today the shape costs nothing it
+    should not; such a review would be retried and, after `_MAX_REVIEW_RETRIES`,
+    abandoned — counted, never silently marked done.
+    Keyed on the prompt's own sentinel, NOT on vendor outage text anywhere in `critical`:
+    in the same ledger, 8 non-ERROR results quote an `_ACCOUNT_DOWN_MARKERS` marker in
+    `critical` while discussing this very file (6 APPROVED that open with `None.`, 2 real
+    NEEDS_REVISION findings), and 0 of them is a NEEDS_REVISION that opens with `None.`.
+
+    A non-ERROR result whose `note` names an account outage is not a verdict either. The
+    driver writes a note only beside ERROR (0 of the 2,454 non-ERROR results carry one),
+    so this guards a foreign or older driver; `_account_is_down` already reads notes, so
+    `failed_attempts` charges it to nobody (§2089). So is a `None.` stub whose text names
+    an outage (`_outage_stub`) — charged to nobody, still counted toward
+    `_MAX_TOTAL_ATTEMPTS`; any other stub takes the ordinary per-commit charge.
+    """
+    verdict = result.get("verdict")
+    if not (isinstance(verdict, str) and verdict and verdict not in FAILED_VERDICTS):
+        return False
+    if _names_nothing_blocking(result):
+        return False
+    note = result.get("note")
+    note = note.lower() if isinstance(note, str) else ""
+    return not any(marker in note for marker in _ACCOUNT_DOWN_MARKERS)
+
+
+def _outage_stub(entry: dict) -> str | None:
+    """The outage a consumer driver's `None.` placeholder names, or None.
+
+    §3144 / §2089 — epstein-drive's driver wrote a failed run as a NEEDS_REVISION whose
+    `critical` reads `None.` and then a driver note, `(driver: … failed: You've hit your
+    session limit · resets …)`, where athena's writes ERROR plus a `note`. The outage is
+    the ACCOUNT's, so, like an ERROR with that note, it costs the commit nothing
+    (`failed_attempts`) and still counts toward `_MAX_TOTAL_ATTEMPTS`.
+
+    Gated on the stub shape (`_names_nothing_blocking`), never on marker text alone: real
+    reviews quote these markers in `critical` (see `_is_verdict`), and none of them is a
+    NEEDS_REVISION that opens with `None.`. Deliberately NOT part of `_account_is_down`,
+    which also sets account holds and stops a split mid-way: whether a stub should do that
+    too is a separate question (NOT MEASURED — athena's own ledger holds no such stub).
+    """
+    for result in entry.get("results") or ():
+        critical = result.get("critical")
+        if not (isinstance(critical, str) and _names_nothing_blocking(result)):
+            continue
+        low = critical.lower()
+        if any(marker in low for marker in _ACCOUNT_DOWN_MARKERS):
+            return " ".join(critical.split())[:160]
+    return None
+
+
 def _is_real_review(entry: dict) -> bool:
     """Did this entry actually produce a verdict, or only a record that it tried?
 
@@ -467,28 +583,24 @@ def _is_real_review(entry: dict) -> bool:
     and one ERROR is not a reviewed commit: the unreviewed fifth is exactly the region a
     reader would assume had been looked at. `any()` over the flat results list would have
     said yes and marked the ref done, which is the §2110 defect — a failed review counting
-    as done — reintroduced through a new door. An error is not a verdict (§2165).
+    as done — reintroduced through a new door. An error is not a verdict (§2165), and
+    neither is a NEEDS_REVISION that names nothing blocking (§3144, `_is_verdict`).
     """
     results = entry.get("results") or ()
     split = entry.get("split")
     if isinstance(split, dict) and isinstance(split.get("parts"), int) and split["parts"] > 1:
-        got = {result.get("part") for result in results
-               if isinstance(result.get("verdict"), str)
-               and result["verdict"] not in FAILED_VERDICTS and result["verdict"]}
+        got = {result.get("part") for result in results if _is_verdict(result)}
 
         return len(got - {None}) == split["parts"]
-    for result in results:
-        verdict = result.get("verdict")
-        if isinstance(verdict, str) and verdict and verdict not in FAILED_VERDICTS:
-            return True
-    return False
+    return any(_is_verdict(result) for result in results)
 
 
 def reviewed_refs(advice_dir: Path) -> set[str]:
     """Every commit sha with a ledger entry that actually CARRIES a verdict.
 
     An entry whose only result is `ERROR`, or whose `results` is empty, does not count:
-    see `FAILED_VERDICTS` above for what that cost when it did.
+    see `FAILED_VERDICTS` above for what that cost when it did. Nor does a NEEDS_REVISION
+    that names nothing blocking (§3144, `_is_verdict`).
     """
     out: set[str] = set()
     files = [advice_dir / "advice.jsonl", *sorted((advice_dir / "archive").glob("*.jsonl"))]
@@ -598,6 +710,11 @@ def failed_attempts(advice_dir: Path) -> dict[str, int]:
                 continue
             if _is_real_review(entry):
                 continue
+            # §3137 — an operator's STOP between parts is charged to NOBODY, like an outage,
+            # and never reaches the §3121 ceiling either.
+            # §3138 — unless a part FAILED before the stop: that failure is the commit's own.
+            if (entry.get("split") or {}).get("stopped") and not entry.get("driver_exit"):
+                continue
             totals[entry["ref"]] = totals.get(entry["ref"], 0) + 1
             # ⚠ §2114 — AN OUTAGE IS CHARGED TO NOBODY, and §2112 forgot that when it
             # moved the budget onto the ledger. §2089 established the rule for the
@@ -613,7 +730,9 @@ def failed_attempts(advice_dir: Path) -> dict[str, int]:
             # alone — permanently excluded from review by §2112, having never once been
             # reviewed. `_account_is_down` is reused rather than re-defined, so there is
             # one definition of "outage" in this file, not two.
-            if _account_is_down(entry) is not None:
+            # §3144 — and a consumer driver's `None.` stub naming one is the same outage in
+            # another shape (`_outage_stub`); `totals` above still counts it toward §3121.
+            if _account_is_down(entry) is not None or _outage_stub(entry) is not None:
                 continue
             # §2178 — A DETERMINISTIC REFUSAL COSTS ONE ATTEMPT, NOT THREE. The budget
             # exists to stop a broken commit wedging the queue; spending two more
@@ -1152,6 +1271,45 @@ def _acquire_single_instance(advice_dir: Path, lock_name: str = WATCH_LOCK, *,
     for two days because of it.
     """
     lock_path = _transient(advice_dir, lock_name)
+    # §3138 — THREE attempts, because an acquisition can lose its inode (see the check after
+    # the flock). A lock that keeps being replaced under us is refused, never looped on.
+    for _attempt in range(3):
+        fd = _open_and_flock(lock_path, wait_s)
+        if fd is None:
+            return None
+        # ⚠ §3138 — HELD ON THE INODE AT THE PATH, checked on EVERY acquisition. §3136 checked
+        # only after its own reclaim, which protected the run that checked LATER: a reclaimer
+        # that unlinked a file another run had just opened and flocked left BOTH holding a
+        # lock — reproduced with four real processes (wf_31d4e874-8e3). A flock on an inode
+        # no longer at the path is holding nothing: close it and take the one that is there.
+        try:
+            here = os.fstat(fd)
+            there = os.stat(lock_path)
+            same = (here.st_ino, here.st_dev) == (there.st_ino, there.st_dev)
+        except OSError:
+            same = False
+        if same:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+            return fd
+        os.close(fd)
+    print(f"ERROR: {lock_path} was replaced three times while this run acquired it — "
+          f"another run is contending; stepping back.", file=sys.stderr)
+    return None
+
+
+def _open_and_flock(lock_path: Path, wait_s: float) -> int | None:
+    """One open + flock of the single-instance lock; the fd, or None after reporting why.
+
+    §3138 — split out of `_acquire_single_instance` so the inode check there can retry it.
+    """
+    # §3136 (§1.93 leg 2) — a FOREIGN-owned lock left at a stricter mode (0644 by another
+    # UNIX user, e.g. under umask 0022 before §2131) fails the open below with EACCES, and
+    # every later run refused forever until someone removed it by hand. When NOBODY holds
+    # its flock, the file is only debris: `_reclaim_dead_lock` unlinks it and the open
+    # below recreates it 0664. A held or unprobeable lock keeps today's refusal.
+    if lock_path.exists() and not os.access(lock_path, os.R_OK | os.W_OK):
+        _reclaim_dead_lock(lock_path)
     try:
         # ⚠ §2110 — 0664, NOT 0644, and the mode is the whole point. This file must be
         # acquirable by EVERY user who reviews in a shared checkout: athena has three
@@ -1164,9 +1322,12 @@ def _acquire_single_instance(advice_dir: Path, lock_name: str = WATCH_LOCK, *,
         # cannot, since it records the holder's pid.
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o664)
     except OSError as error:  # noqa: BLE001 — an unlockable dir is reported, not fatal-by-traceback
+        # §3138 — reached only when the lock is unopenable AND could not be reclaimed: its
+        # holder is alive (it holds the flock), or the file cannot even be read to probe.
         print(f"ERROR: cannot open {lock_path}: {error}. If this is a PERMISSION error, "
-              f"the lock was created by another user at a stricter mode — remove the "
-              f"stale {lock_path} and it will be recreated group-writable.",
+              f"the lock was created by another user at a stricter mode and is still held "
+              f"(or cannot be probed) — once its holder exits, the next run reclaims it; "
+              f"otherwise remove {lock_path} and it will be recreated group-writable.",
               file=sys.stderr)
         return None
     # ⚠ §2131 — THE MODE ARGUMENT ABOVE IS MASKED BY UMASK, so §2110's guarantee held only
@@ -1200,9 +1361,63 @@ def _acquire_single_instance(advice_dir: Path, lock_name: str = WATCH_LOCK, *,
                 file=sys.stderr,
             )
         return None
-    os.ftruncate(fd, 0)
-    os.write(fd, f"{os.getpid()}\n".encode())
     return fd
+
+
+#: §3138 — the sentinel THIS process answers to, set once in `main()`: `STOP.worktree` for the
+#: worktree-only lane, `STOP` otherwise (the commit lane and the combined daemon) — the §2131
+#: contract. The default is `STOP` so a direct `_review` call (tests) behaves like the commit lane.
+_STOP_NAME = STOP_SENTINEL
+
+
+def _stop_requested(advice_dir: Path) -> bool:
+    """§3137 — has THIS lane been asked to stop: SIGTERM/SIGINT (`_STOP`) or its own sentinel.
+
+    ⚠ §3138 — BY LANE, NOT BY REVIEW KIND. §3137 chose the sentinels from the review's kind, so
+    a worktree review obeyed the commit lane's `STOP` and the combined daemon obeyed
+    `STOP.worktree` — against §2131, where each lane answers to (and unlinks) only its own.
+    """
+    return _STOP or _transient(advice_dir, _STOP_NAME).exists()
+
+
+def _reclaim_dead_lock(lock_path: Path) -> bool:
+    """§3136 (§1.93 leg 2) — unlink a lock this user cannot open for writing IF NOBODY HOLDS IT.
+
+    ⚠ §3138 — THE FLOCK IS THE LIVENESS TEST, NOT `/proc/<pid>`. §3136 read the recorded pid
+    and checked `/proc`, then unlinked whatever was at the path by then — a stale view that let
+    two runs both end up holding a lock (reproduced), and that a PID namespace or `hidepid`
+    could mislead. A live holder keeps its flock for its whole life, so: open the file
+    READ-ONLY (0644 permits it; flock needs no write access), try `LOCK_EX|LOCK_NB`, and only
+    while HOLDING that probe — and only if the probed inode is still the one at the path —
+    unlink it. `watch_drain.daemon_state` and `_advice_lock` already probe this way.
+
+    True only when this call removed the file. A held, unreadable or already-replaced lock
+    is kept: refusing is the safe reading of a lock whose holder cannot be ruled out.
+    """
+    try:
+        probe = os.open(lock_path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False                       # held: a live holder
+        try:
+            here, there = os.fstat(probe), os.stat(lock_path)
+        except OSError:
+            return False                       # already gone — the caller's open recreates it
+        if (here.st_ino, here.st_dev) != (there.st_ino, there.st_dev):
+            return False                       # replaced since the probe opened it
+        try:
+            lock_path.unlink()
+        except OSError:
+            return False
+        print(f"[watch] reclaimed {lock_path}: this user could not open it and no process "
+              f"holds it", file=sys.stderr)
+        return True
+    finally:
+        os.close(probe)
 
 
 #: §A2 — the PER-APPEND lock. `.watch.lock` above is held for the daemon's lifetime and
@@ -1293,14 +1508,25 @@ def read_account_hold(advice_dir: Path, now: float | None = None,
     """
     try:
         raw = _transient(advice_dir, ACCOUNT_HOLD).read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):   # §3144 — non-UTF-8 bytes are junk too: NO HOLD
         return 0.0
     parts = raw.split()
     try:
         until = float(parts[0]) if parts else float("nan")
     except ValueError:
         return 0.0
-    if until != until:                    # NaN: empty file
+    # §1.94 L2 — NaN (an empty file), ±inf, and any instant no clock can name are NO HOLD.
+    # `inf` was worse than junk: it came back as an infinite hold and `main`'s `int(held)`
+    # raised OverflowError on every dispatch while the file stood. The range is the one
+    # `watch_drain status` can PRINT (`time.gmtime`), so the watcher never honours a hold
+    # the operator's status line shows as `-`. NOT HANDLED, by choice: a far-future instant
+    # inside that range (year 33658, say) still holds — it is visible in `status` and the
+    # SessionStart banner, and `--ignore-account-hold` or deleting the file clears it.
+    if not math.isfinite(until):
+        return 0.0
+    try:
+        time.gmtime(until)
+    except (OverflowError, ValueError, OSError):
         return 0.0
     if len(parts) > 1:
         mine = current_account() if account is None else account
@@ -1463,6 +1689,7 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
     driver_exit = 0
     tails: list[str] = []
     dispatched = len(parts)
+    stopped = False
     for index, part_text in enumerate(parts, start=1):
         out_dir = raw if len(parts) == 1 else raw / f"part{index}of{len(parts)}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1500,6 +1727,16 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
                   f"for {kind} {ref[:12]} and stopped", file=sys.stderr, flush=True)
             dispatched = index
             break
+        # §3137 (§1.93 leg 3) — a STOP (SIGTERM, or the lane's sentinel file) waited for EVERY
+        # remaining part: the loop consulted only the outage check above. Stop between parts,
+        # as the outage stop does; the entry says `stopped`, and `failed_attempts` charges it
+        # to nobody — an operator's STOP is not the commit's fault.
+        if len(parts) > 1 and index < len(parts) and _stop_requested(advice_dir):
+            print(f"[watch] STOP mid-split; dispatched {index}/{len(parts)} part(s) for "
+                  f"{kind} {ref[:12]} and stopped", file=sys.stderr, flush=True)
+            dispatched = index
+            stopped = True
+            break
     entry = {"ts": ts, "kind": kind, "ref": ref, "results": results}
     if len(parts) > 1:
         # §2178 — WHAT THE READER NEEDS TO KNOW THAT THE VERDICTS DO NOT SAY. Recorded as
@@ -1514,6 +1751,8 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
         # was one failure and four dispatches that never happened.
         if dispatched != len(parts):
             entry["split"]["dispatched"] = dispatched
+        if stopped:
+            entry["split"]["stopped"] = True        # §3137
     if kind == "commit":
         # §2143 — see `_superseded`. Recorded on the ENTRY so every reader of the ledger
         # sees it, not only whoever happened to be watching the log.
@@ -1680,13 +1919,13 @@ def _superseded(repo: str, sha: str) -> dict | None:
     # RECORDED, NOT FIXED, and the reason is reach. ⚠ §2215 — §2211 FIRST ARGUED THIS FROM A
     # HISTORICAL MAXIMUM AND GOT THE NUMBER WRONG: it said "the deepest `--ledger-scan`
     # anything has ever run is 330", conflating the depth §2179's two stuck refs needed
-    # (`watch_drain.py:262`, `eugo-watch-owed.sh:74`) with the deepest pass actually run —
+    # (`watch_drain.py:516`, `eugo-watch-owed.sh:90`) with the deepest pass actually run —
     # which §2207's comment 67 lines above states as 1,000, with the deepest commit ever
     # reviewed at 1,014 back. A `--ledger-scan 1000` pass really ran on 2026-09-13
     # (`CATCHUP-FINDINGS-2026-09-13.md:3`).
     #
     # The FIX IS NOT SWAPPING THE DIGIT, because no historical maximum can bound this at all:
-    # `eugo-watch-owed.sh:76` reads `retry_scan` from `watch_drain.py:248`, computed at
+    # `eugo-watch-owed.sh:92` reads `retry_scan` from `watch_drain.py:502`, computed at
     # RUNTIME from how deep the stuck refs are, and prints `--ledger-scan <computed N>`. The
     # bound that does not decay is structural: athena has 6 merges in 5,858 commits, the
     # SHALLOWEST 3,472 back, against a default of 100 (`--ledger-scan`, below). Reaching one
@@ -1922,7 +2161,7 @@ def main(argv: list[str] | None = None) -> int:
                          "(quota, weekly limit, expired auth) instead of spending each "
                          "commit's retry budget on an outage")
     cfg = ap.parse_args(argv)
-    global _WRITER, _SESSION               # §3043/§3103 — resolved once per process, before the lock
+    global _WRITER, _SESSION, _STOP_NAME   # §3043/§3103/§3138 — resolved once per process, before the lock
     _WRITER = _resolve_writer(cfg.once)
     _SESSION = resolve_session()
     # Compiled once at launch so a bad pattern fails immediately and loudly, not on tick N.
@@ -1950,6 +2189,7 @@ def main(argv: list[str] | None = None) -> int:
 
     advice_dir = (Path(cfg.repo) / cfg.advice_dir) if not Path(cfg.advice_dir).is_absolute() else Path(cfg.advice_dir)
     advice_dir.mkdir(parents=True, exist_ok=True)
+    wt_exclude = _advice_exclude(cfg.repo, advice_dir)     # §3144 — the worktree lane's pathspec
     # §2124 — a WORKTREE-ONLY run takes its own lock so it is not starved by the commit
     # drain. Any run that reviews commits keeps `.watch.lock` unchanged, including the
     # legacy daemon's `--commits --worktree`, whose two kinds still share one process.
@@ -1967,7 +2207,8 @@ def main(argv: list[str] | None = None) -> int:
     # operator's `touch STOP` was liable to be eaten by a one-shot seconds later while the
     # daemon it was aimed at ran on. `STOP` still means the commit lane, so the documented
     # gesture is unchanged; the worktree lane answers to `STOP.worktree`.
-    stop_file = _transient(advice_dir, WORKTREE_STOP if worktree_only else STOP_SENTINEL)
+    _STOP_NAME = WORKTREE_STOP if worktree_only else STOP_SENTINEL      # §3138 — `_review` reads it
+    stop_file = _transient(advice_dir, _STOP_NAME)
     stop_file.unlink(missing_ok=True)
 
     last_sha = cfg.since.strip() or _git(cfg.repo, "rev-parse", "HEAD").strip()
@@ -1977,6 +2218,7 @@ def main(argv: list[str] | None = None) -> int:
     # §934 — per-sha consecutive `git show` failures, so the hold below is bounded.
     # §1700 — per-sha consecutive DRIVER failures, bounded the same way.
     review_failures: dict[str, int] = {}
+    anchor_failures = 0                    # §3138 — consecutive failed anchor rev-lists
     account_down_until = 0.0  # §2089 — set by the account-level branch below
     # ⚠ §2139 — THE STARTUP LINE NAMES THE SELECTION THE RUN WILL ACTUALLY USE. It read
     # `since={last_sha[:12]}` unconditionally, and under `--since-ledger` that value decides
@@ -2039,6 +2281,7 @@ def main(argv: list[str] | None = None) -> int:
             # The anchor path DOES need the anchor — `rev-list ..HEAD` with an empty left
             # side is a different command, not a no-op — so it keeps its guard and gains a
             # voice, because selecting nothing in silence is how this was missed.
+            rev_list_failed = False          # §3137 — leg 4
             if cfg.commits:
                 if cfg.since_ledger:
                     new, truncated = unreviewed_commits(
@@ -2051,7 +2294,39 @@ def main(argv: list[str] | None = None) -> int:
                               f"commits may exist beyond it — raise --ledger-scan to reach "
                               f"them", file=sys.stderr, flush=True)
                 elif last_sha:
+                    # §3137 (§1.93 leg 4) — `_git` returns "" on failure AND on "nothing new",
+                    # and the "HEAD moved" re-anchor below then stepped over every commit
+                    # between. A FAILED rev-list now holds the anchor, as §934 does for show.
+                    # An EMPTY answer is confirmed through the same `_git` seam: `--count`
+                    # says "0" when there is genuinely nothing new and "" when git failed.
                     new = _git(cfg.repo, "rev-list", "--reverse", f"{last_sha}..HEAD").split()
+                    count = "" if new else _git(cfg.repo, "rev-list", "--count",
+                                                f"{last_sha}..HEAD").strip()
+                    if new or count == "0":
+                        anchor_failures = 0
+                    elif count.isdigit():
+                        # §3138 — a commit landed BETWEEN the two calls: nothing failed, and
+                        # re-anchoring now would step over it. Hold silently; next tick sees it.
+                        rev_list_failed = True
+                    else:
+                        # ⚠ §3138 — BOUNDED, as §934 is. §3137 held forever, so an anchor whose
+                        # object is gone (a mistyped `--since`, a sha from another clone, a
+                        # pruned object) stopped the lane reviewing anything for the rest of
+                        # its life; the version before it re-anchored and kept going.
+                        anchor_failures += 1
+                        missing = not _git(cfg.repo, "cat-file", "-t", last_sha).strip()
+                        why = "the anchor's object is MISSING" if missing else "rev-list failed"
+                        if anchor_failures < _MAX_SHOW_RETRIES:
+                            rev_list_failed = True
+                            print(f"[watch] WARN: {why} for {last_sha[:12]}..HEAD (attempt "
+                                  f"{anchor_failures}/{_MAX_SHOW_RETRIES}) — holding the "
+                                  f"anchor; the next tick retries", file=sys.stderr, flush=True)
+                        else:
+                            anchor_failures = 0
+                            print(f"[watch] ERROR: {why} for {last_sha[:12]}..HEAD "
+                                  f"{_MAX_SHOW_RETRIES}x — re-anchoring to HEAD; any commit "
+                                  f"between {last_sha[:12]} and HEAD will NOT be reviewed",
+                                  file=sys.stderr, flush=True)
                 else:
                     new = []
                     print(f"[watch] ERROR: no anchor — `git rev-parse HEAD` failed in "
@@ -2081,6 +2356,13 @@ def main(argv: list[str] | None = None) -> int:
                          else set())
                 dispatched = waiting = 0
                 for sha in order:
+                    # §3138 — STOP between COMMITS, not only between the parts of one (§3137):
+                    # the hand-off asked for both, and a STOP otherwise sat through every
+                    # remaining review of the tick, ~151 s each. `break`, not `continue`, so in
+                    # anchor mode the anchor stays at the last commit actually reviewed.
+                    if _stop_requested(advice_dir):
+                        print("[watch] STOP — ending this tick before the next commit", flush=True)
+                        break
                     if (cfg.since_ledger and tick_budget and dispatched >= tick_budget
                             and sha not in owned):
                         waiting += 1
@@ -2122,6 +2404,9 @@ def main(argv: list[str] | None = None) -> int:
                     # shape as §1692, two rows apart.
                     entry = _review(cfg.repo, "commit", sha, show, cfg, advice_dir)
                     dispatched += 1  # §3067 — a `_review` call is the unit the budget counts
+                    # §3138 — a review STOPPED mid-split is not a review: never anchor past it.
+                    if entry is not None and (entry.get("split") or {}).get("stopped"):
+                        break
                     if entry is not None and entry.get("driver_exit"):
                         # §2089 — an ACCOUNT-level failure is charged to NOBODY. Spending
                         # this commit's budget on an outage is how seven commits were lost
@@ -2194,12 +2479,15 @@ def main(argv: list[str] | None = None) -> int:
                     # Anchor to the last REVIEWED sha, never a later HEAD: a commit that
                     # lands while the reviews above run must appear in the next rev-list.
                     last_sha = reviewed_through
-                elif not new:
+                elif not new and not rev_list_failed:
                     head = _git(cfg.repo, "rev-parse", "HEAD").strip()
                     if head and head != last_sha:
                         last_sha = head  # rev-list empty yet HEAD moved: reset/rebase — re-anchor
-            if cfg.worktree:
-                diff = _git(cfg.repo, "diff", "HEAD")
+            # §3140 — a STOP raised during the commit reviews also skips this tick's worktree
+            # review (a combined `--commits --worktree` daemon ran it anyway; review of f4813e82).
+            if cfg.worktree and not _stop_requested(advice_dir):
+                # §3144 — never the ledger's own churn (`_advice_exclude`).
+                diff = _git(cfg.repo, "diff", "HEAD", *wt_exclude)
                 h = hashlib.sha1(diff.encode()).hexdigest()
                 seen_h, seen_at = (last_wt_hash,), last_wt_review
                 if cfg.since_ledger:
@@ -2211,7 +2499,7 @@ def main(argv: list[str] | None = None) -> int:
                 # three-line diff is worse than not reviewing it, because it delays the
                 # one that matters. `--wt-min-lines` is the floor, counted from
                 # `diff --shortstat`, and 0 disables it.
-                changed = _changed_lines(cfg.repo) if cfg.wt_min_lines else None
+                changed = _changed_lines(cfg.repo, *wt_exclude) if cfg.wt_min_lines else None
                 big_enough = changed is None or changed >= cfg.wt_min_lines
                 if (diff.strip() and h not in seen_h and big_enough
                         and (time.time() - seen_at) >= cfg.wt_min_interval):
@@ -2221,7 +2509,9 @@ def main(argv: list[str] | None = None) -> int:
                     # `last_wt_review` still advances on failure, so the retry is
                     # throttled by `--wt-min-interval` rather than looping every tick.
                     wt_entry = _review(cfg.repo, "worktree", h, diff, cfg, advice_dir)
-                    if not (wt_entry is not None and wt_entry.get("driver_exit")):
+                    # §3138 — nor may a STOPPED review retire the diff it only half read.
+                    if not (wt_entry is not None and (wt_entry.get("driver_exit")
+                                                      or (wt_entry.get("split") or {}).get("stopped"))):
                         last_wt_hash = h
                     last_wt_review = time.time()
             # §833 — retention runs INSIDE the try: a prune failure (a racing
@@ -2256,6 +2546,10 @@ def main(argv: list[str] | None = None) -> int:
             if _STOP or stop_file.exists():
                 break
             time.sleep(1)
+        # §3137 (§1.93 leg 5) — the sentinel never set `_STOP`, so a STOP seen IN the sleep
+        # broke only the sleep, and the `while not _STOP` head ran one more full tick.
+        if _STOP or stop_file.exists():
+            break
 
     print(f"[watch] stopped after {ticks} tick(s).", flush=True)
     return 0

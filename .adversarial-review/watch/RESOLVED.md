@@ -15,6 +15,9 @@ marker is the review's starting line: commits at or before it are never selected
 | `FIXED §<id>` | cured in that commit |
 | `REFUTED` | the finding is wrong; the row says why |
 | `RETRY — <when>` | an ERROR entry re-reviewed later |
+| `CLAIMED <session> <YYYY-MM-DDTHH:MM:SSZ>` | somebody is working on it (`watch_drain.py claim`); it closes nothing and lapses after 24 h, and `resolve` writes the real status over it |
+| `OPEN → <backlog id>` | a real defect, filed in the backlog; the row records a look, not a closure, so the entry stays owed |
+| `UNTRACED` | acknowledged but not traced: nothing was learned from it |
 
 | ts | kind | ref | model | verdict | status | evidence |
 |---|---|---|---|---|---|---|

@@ -30,6 +30,18 @@
 #     wait. Verified at §2109 that a backgrounded child outlives the hook process.
 #   - it never mutates the ledger itself; only `codex_watch.py` writes there
 #   - bash 3.2 safe (macOS): no mapfile, no ${x,,}, no associative arrays
+#   - an errexit INHERITED through BASH_ENV is disarmed before anything else runs
+#
+# §3143 — THE DISARM COMES FIRST (fact 7664bbb3e4c7: every kit hook started from `set -u`
+# alone). The eugo deploy image's BASH_ENV turns on `set -eE -o pipefail` (fact 76fb0dc9202e)
+# for EVERY non-interactive bash, this hook included whenever Claude Code runs in the
+# devcontainer.
+# Under it the hold read in STAGE 1a — `head` of an ABSENT `.account-down`, the normal
+# state, failing through `pipefail` — ended this hook before it dispatched: measured, a
+# non-zero exit (97 under the test's trap) and no review, on every unreviewed commit.
+# The cure is the one protomolecule f73c6ba408 (Ben) gave the publish guard.
+set +eE +o pipefail
+trap - ERR
 set -u
 
 # §3103 (§1.85) — WHO dispatched this review, read BEFORE the detach below.
@@ -106,7 +118,9 @@ else
   # established rule in `unreviewed_count`, `eugo-watch-owed.sh` and `_changed_lines` is
   # that a detector's failure must never be read as an absence. Anything that is not a
   # literal `0` dispatches, so the gate can only ever SKIP work it positively knows is
-  # absent. Costs one interpreter start, ONCE per session, against a review at ~151s.
+  # absent. Costs one interpreter start per SessionStart — startup, resume, clear and
+  # compact each fire `--full` (§3143, §1.94 L7: this said "ONCE per session") — against
+  # a review at ~151s.
   UNREV="$(python3 "$WATCH_DRAIN" status 2>/dev/null \
             | grep -o 'unreviewed=[^ ]*' | head -1 | cut -d= -f2)"
   if [ "$UNREV" = "0" ]; then
@@ -119,10 +133,14 @@ fi
 # account that cannot answer — but not the SPAWN: a 154-commit outage day was still 154
 # interpreter starts to read one file. The hook reads it first.
 #
-# ⚠ FAILS OPEN, EXACTLY AS `codex_watch.read_account_hold` DOES: only a whole-number epoch in
-# the future skips. Absent, unreadable, empty, a float, junk — all dispatch, and the watcher
-# makes its own (identical) call. This file can only ever make reviewing do LESS, so a corrupt
-# one must never be able to switch it off.
+# ⚠ FAILS OPEN, AS `codex_watch.read_account_hold` DOES, ON A NARROWER PARSE: only a
+# whole-number epoch in the future skips. Absent, unreadable, empty, junk — all dispatch, and
+# the watcher makes its own call. §3143 (§1.94 L7) — this called that call "identical"; it
+# is not: the watcher takes any float (`float(parts[0])`), so a hand-edited future float such
+# as `1999999999.5` dispatches here and the watcher then stands down on it itself. What the watcher
+# writes — `int(until)` and at most one account, on one line — the two parse alike. This
+# file can only ever make reviewing do LESS, so a corrupt one must never be able to switch
+# it off.
 #
 # §3130 — THE HOLD BELONGS TO AN ACCOUNT: `<until> <accountUuid>`. It skips only when it names
 # no account (the pre-§3130 form) or THIS user's current Claude account — the operator swaps
@@ -180,9 +198,14 @@ fi
 # same `.advice.lock`, and appends the same entry schema — which matters because
 # `watch_drain._entry_problem` kills the whole drain on one malformed line.
 #
-# `--once` exits after a single tick. If a review is already running its single-instance
-# flock refuses this one, which is the correct outcome and not an error: the running tick
-# selects from the same ledger and will pick up whatever is outstanding.
+# `--once` is one DISPATCH, not always one tick. §3143 — this said "exits after a single
+# tick", untrue since §3120: while a commit whose committer time is at or after this
+# session's earliest ledger entry (`session_start_epoch` — on a shared clone a peer's commit
+# counts too) is unreviewed and not yet tried by this process, the one-shot runs another
+# tick at once, with no sleep; an account hold stops it, and a dispatch with no session id
+# owns nothing. If a review is already running its single-instance flock refuses this one,
+# which is the correct outcome and not an error: the running process selects from the same
+# ledger, and whatever it leaves outstanding the next dispatch selects again (§2108).
 LOG="$ROOT/outputs/_state/logs/review-on-commit.log"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 # §3044 — identify the dispatcher to the ledger through the ENVIRONMENT, never argv: this

@@ -45,6 +45,19 @@
 #     EUGO_PROMPT_CONTEXT_OFF set -> silent (the kill switch, both arms)
 #   - malformed or empty stdin, no python3, unreadable transcript -> silent
 #   - bash 3.2 safe (no mapfile, no ${x,,}, no associative arrays)
+#   - an errexit INHERITED through BASH_ENV is disarmed before anything else runs
+#
+# §3143 — THE DISARM COMES FIRST (fact 7664bbb3e4c7: every kit hook started from `set -u`
+# alone). The eugo deploy image's BASH_ENV turns on `set -eE -o pipefail` (fact 76fb0dc9202e)
+# for EVERY non-interactive bash, this hook included whenever Claude Code runs in the
+# devcontainer.
+# Under it the `transcript_path` extraction in MAIN — a `grep -o` with no match, failing
+# through `pipefail` — ended this hook before either arm printed: measured, a non-zero exit
+# (97 under the test's trap) for any payload without that key, malformed stdin included.
+# A payload that carries the key (every real one, per PAYLOAD above) was unaffected.
+# The cure is the one protomolecule f73c6ba408 (Ben) gave the publish guard.
+set +eE +o pipefail
+trap - ERR
 set -u
 
 ROOT="${CLAUDE_PROJECT_DIR:-.}"

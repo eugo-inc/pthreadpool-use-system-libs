@@ -2,25 +2,29 @@
   "version": 1,
   "installs": {
     "eugo-session-hooks": {
-      "tree_hash": "d78b7d5599e9a832d7e3f7026f05ec94ceda17651f688687d9defb53843abb6f",
-      "source_commit": "038b503131b484c4a9843f9d7953a2c97ed60c72",
+      "tree_hash": "4b6cd773bebf708eb28bed482b06db5559034fd8a7e2287832b38bbc445f39a6",
+      "source_commit": "695cd44741970379afa5f770c82bee3cfab96401",
       "files": [
+        ".claude/hooks/eugo-deletion-guard.sh",
         ".claude/hooks/eugo-external-publish-guard.sh",
         ".claude/hooks/eugo-prompt-context.sh",
         ".claude/hooks/eugo-review-on-commit.sh",
         ".claude/hooks/eugo-review-turn-end.sh",
         ".claude/hooks/eugo-session-instructions.sh",
-        ".claude/hooks/eugo-watch-owed.sh"
+        ".claude/hooks/eugo-watch-owed.sh",
+        ".claude/hooks/eugo-wip-snapshot.sh"
       ],
       "file_hashes": {
-        ".claude/hooks/eugo-external-publish-guard.sh": "fa5384966f1a182d1b0abff147ed1f68cfa72d57dffef58c198076b94d382681",
-        ".claude/hooks/eugo-prompt-context.sh": "518991f5dd09200df9afead09b355b4c08278b07a5b12ac32e1c54959dd886a0",
-        ".claude/hooks/eugo-review-on-commit.sh": "8503b95d340f64a583206ee296a75e76dd2e0afa0c53ce95bffd4f9ea1f6e42c",
-        ".claude/hooks/eugo-review-turn-end.sh": "2277ea009026aff55f607af2632091dc5daf44f812c7aad6258e5e442a09e46b",
-        ".claude/hooks/eugo-session-instructions.sh": "a0099b182cb68d5cbbfcb0f246a2ba39f8744658c33a2ad3629c43782b5684fb",
-        ".claude/hooks/eugo-watch-owed.sh": "1b858e73b4d78435b45aaba6abf9c928d2684e63f6fb1db34c02cbabd1b7520a"
+        ".claude/hooks/eugo-deletion-guard.sh": "47707456243bc0ca4a53725d9a604866156f4c6402d10d99eb58dca126f67090",
+        ".claude/hooks/eugo-external-publish-guard.sh": "cf23f7f58cbdd80c05b04ecfb1cf39df0d5dc0f39abc2beeb8ab7fedb6a2628a",
+        ".claude/hooks/eugo-prompt-context.sh": "59182bbbd22b8b76e366a1e0c3f9585a81efdb57541ae699304a6132912b5809",
+        ".claude/hooks/eugo-review-on-commit.sh": "766df0de98013af93e40da25fdd6b9959803636ea44bbf0f0364e405af4e4f6d",
+        ".claude/hooks/eugo-review-turn-end.sh": "ded518908c9437d8ffafdfe02e47de7697f53b66c74be5746d9f85d3e815ba40",
+        ".claude/hooks/eugo-session-instructions.sh": "cf98ff2dfa30c9da42506688a8d456ed8c078c6e4431e8f6ca591d3b06a31d77",
+        ".claude/hooks/eugo-watch-owed.sh": "16d04df993ece318ae1a18a734f395a6e19051bd544703a46c170e3c98466b97",
+        ".claude/hooks/eugo-wip-snapshot.sh": "4c809ebcc25be9c7ce0ee289d2d1b2ae1110759fd5e94132a55e170aeb7c5387"
       },
-      "installed_at": "2026-09-23T08:28:15+00:00"
+      "installed_at": "2026-09-24T13:38:37+00:00"
     },
     "eugo-guardrails-kit": {
       "tree_hash": "1185410076d414332c2668ed9db4cf7ed1e80d64674b7b58fbea208e35d4b279",
@@ -52,19 +56,19 @@
       "installed_at": "2026-09-06T13:35:57+00:00"
     },
     "eugo-agentic-scripts": {
-      "tree_hash": "c45bf968e8e3a643fbaba756ca8f2012f0a6d10a0cb009aa816e1c9859a45868",
-      "source_commit": "038b503131b484c4a9843f9d7953a2c97ed60c72",
+      "tree_hash": "657a793b4ab4fe05b577d81117e2fa702cdc1e6784f877d182907d5fcefbebc3",
+      "source_commit": "695cd44741970379afa5f770c82bee3cfab96401",
       "files": [
         ".claude/scripts/codex_review.py",
         ".claude/scripts/codex_watch.py",
         ".claude/scripts/watch_drain.py"
       ],
       "file_hashes": {
-        ".claude/scripts/codex_review.py": "6794e8a1e8e387456c195245d722ec3f35e01b60254bfb8307f75586fe216777",
-        ".claude/scripts/codex_watch.py": "2d5e8e3c786c8b31c85cfeef80563bff6504a091813e0da8897b4bdebcc7a1eb",
-        ".claude/scripts/watch_drain.py": "c43c4dcbf7ff19cd47c58ed8ee25add0551c61d54640a48ecd8b925096e71aaa"
+        ".claude/scripts/codex_review.py": "f57f70561922a7629059197ba6d24b9ab16fcd8f0c784d2df887b4ae0d50ab5c",
+        ".claude/scripts/codex_watch.py": "7d5a83f6987094e8bd671761b1e817ae362b61b22a8da0c5e17efe0de5caf14f",
+        ".claude/scripts/watch_drain.py": "9886e42c0978a95de931a21d0a27857c2a7a91b8c4d9a4e689b8ab3f6d83db42"
       },
-      "installed_at": "2026-09-23T08:28:15+00:00"
+      "installed_at": "2026-09-24T13:38:37+00:00"
     }
   }
 }
