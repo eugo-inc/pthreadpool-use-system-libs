@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.2.2 (§1996 iron-rule back-pointers say athena's) -->
+<!-- guardrails-kit: v1.2.3 (§2036 F7 rows name the RULE that holds the shared material; `doc-wide` is a declared exception) -->
 You are here because you are about to edit CLAUDE.md or any .claude/docs/guardrails file. These contracts govern the kit's FORM; violating them silently degrades every other rule.
 
 - F1. Every rule is one line, <=20 words where possible, opening with an imperative verb or a trigger clause (`When/Before/After <observable event>:`). No paragraphs. No hedges (usually / consider / try / generally). A checklist line over ~30 words splits into sub-lines under the same ID.
@@ -35,7 +35,7 @@ at all, and the `iron N` back-pointers in the rule docs say `athena's CLAUDE.md`
 | iron 4 <-> CODE.md C5 | `nfamiliar or third-party API with 2+ arguments: paste its real signature` |
 | iron 6 <-> VERIFY.md forbidden-phrases | `"should work", "should fix", "likely resolves",` · `` `Verified: <command> -> <result line>` `` · `` `UNVERIFIED — to confirm, run: <command>` `` |
 | iron 10 <-> EFFICIENCY.md E14 | `"probably / presumably / likely / I assume / should be" about this repo's code` · `run the Grep or Read that answers it` |
-| iron 11 <-> SESSION.md S3 | `"don't / only / keep / stop"` · `task spans a compaction` |
+| iron 11 <-> SESSION.md S3 (doc-wide: `task spans a compaction` lives in the reconciliation blockquote above the rules, not in S3's block) | `"don't / only / keep / stop"` · `task spans a compaction` |
 | iron 12 <-> EFFICIENCY.md E5+E6 | `at most ONE short line` NOTE: the pair's ONLY shared token; in athena it read "at most one line" on the CLAUDE.md side until athena §1991, which is the drift a registry of names could not see |
 | iron 13 <-> PLAN.md P10 | the whole trigger sentence, `Every TODO list goes to the user BEFORE the first Edit:` through `never prose, never only a row in a doc` |
 | iron 14 <-> REPORT.md R1 | `plain-English paragraph` NOTE: the pair shares a CONCEPT, not a list; this token is all F7 can hold it to |

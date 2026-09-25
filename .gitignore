@@ -6,6 +6,7 @@
 .claude/settings.local.json
 .claude/skills/_pulled/
 .claude/data/external-drafts/
+.claude/data/handoff/
 /.adversarial-review/watch/raw/
 /.adversarial-review/watch/.watch.lock
 /.adversarial-review/watch/.watch.worktree.lock

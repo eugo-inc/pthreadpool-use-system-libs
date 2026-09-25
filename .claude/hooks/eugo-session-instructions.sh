@@ -173,7 +173,13 @@ write_rules_from() { # atomic: tmp in the same dir, then rename; WORLD-READABLE 
   # trailing X's.
   RULES_TMP="$(mktemp -u "$RULES_DIR/.eugo-central.md.tmp.XXXXXX" 2>/dev/null)" || return 1
   trap 'rm -f "$RULES_TMP" 2>/dev/null' EXIT
-  ( umask 022; set -C; cat "$1" > "$RULES_TMP" ) 2>/dev/null && mv -f "$RULES_TMP" "$RULES" 2>/dev/null
+  # §1.100 — `-T` (GNU) / `-h` (BSD): rename ONTO $RULES, never into a directory it names. The
+  # `-d` refusal above cannot close the window between that test and this rename: a symlink to a
+  # directory planted there in between made plain `mv -f` move the tmp INTO that directory and
+  # return 0, so the rules file was reported written while it did not exist. Each mv rejects
+  # the other's flag, so only one of the two can move anything.
+  ( umask 022; set -C; cat "$1" > "$RULES_TMP" ) 2>/dev/null &&
+    { mv -fT "$RULES_TMP" "$RULES" 2>/dev/null || mv -fh "$RULES_TMP" "$RULES" 2>/dev/null; }
 }
 
 REASON="unknown"

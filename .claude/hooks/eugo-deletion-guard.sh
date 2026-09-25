@@ -43,7 +43,8 @@
 # into the string of `bash|sh|zsh|dash|ksh -c` (any cluster holding c: `-lc`, `-ec`), into
 # every `$(…)` / backtick / `<(…)` body, and past `sudo`, `env`, `xargs`, `timeout`, `nice`,
 # `nohup`, `time`, `command`, `exec`, `setsid`, `ionice`, `stdbuf`, `busybox <applet>`, into
-# `su … -c STRING`, `flock <file> -c STRING` / `flock <file> cmd…` and `watch` (whose words it
+# `su … -c STRING` / `--session-command STRING`, `runuser -u USER [--] cmd…` and su-style
+# `runuser [-] USER -c STRING`, `flock <file> -c STRING` / `flock <file> cmd…` and `watch` (whose words it
 # joins and runs with `sh -c`, so they are checked as that string: nothing binds), past
 # leading `VAR=value` words, shell keywords (`then`, `do`, `!`,
 # `{`, …), `docker [compose] exec|run` (`<container|service|image>`) and `docker-compose
@@ -157,6 +158,10 @@ WRAPPERS = {
 # §1.103 L1 — the other three carry the command differently (see check_command).
 FLOCK_VALUED = ("-w", "--wait", "--timeout", "-E", "--conflict-exit-code")
 WATCH_VALUED = ("-n", "--interval", "-q", "--equexit")
+# §1.109 (b) — `runuser --help` (util-linux): -u runs the command after the options; without -u it is su's
+# form, and -c/-f/-l/-s are mutually exclusive with -u (runuser refuses the mix, so nothing runs).
+RUNUSER_VALUED = ("-u", "--user", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment",
+                  "-s", "--shell", "-c", "--command", "--session-command")
 # §1.103 L2 (operator ruling 2026-09-24) — `NAME=$(mktemp …)` earlier in the SAME `&&` chain is never
 # empty: a failed mktemp stops the chain before the delete. Bound to this stand-in path, so a root
 # reached from it (`"$D"/../..`) is still a root; across `;` the binding ends and it is unguarded again.
@@ -539,14 +544,17 @@ def shell_string(args):
 
 def su_string(args):
     """The command-string WORD of `su [opts] [-] [user] -c STRING` (`--command STRING`,
-    `--command=STRING`, a short cluster ending in c: `-lc`), else None — `su` alone runs no command."""
+    `--command=STRING`, `--session-command[=]STRING`, a short cluster ending in c: `-lc`), else None
+    — `su` alone runs no command. `runuser` without -u takes the same forms."""
     for k, a in enumerate(args):
         t = a.text
-        if t.startswith("--command="):
-            w = Word(t[len("--command="):])
-            w.live, w.subs = a.live, a.subs
-            return w
-        if t == "--command" or (len(t) > 1 and t[0] == "-" and t[1] != "-" and t.endswith("c")):
+        for opt in ("--command=", "--session-command="):
+            if t.startswith(opt):
+                w = Word(t[len(opt):])
+                w.live, w.subs = a.live, a.subs
+                return w
+        if t in ("--command", "--session-command") or (len(t) > 1 and t[0] == "-" and t[1] != "-"
+                                                        and t.endswith("c")):
             return args[k + 1] if k + 1 < len(args) else None
     return None
 
@@ -675,6 +683,13 @@ def check_command(words, env):
     if base in ("docker", "docker-compose"):
         inner = docker_exec(base, args)
         return check_command(inner, env) if inner else None
+    if base == "runuser":
+        rest = args[skip_opts(args, 0, RUNUSER_VALUED):]
+        opts = args[:len(args) - len(rest)]
+        if any(w.text in ("-u", "--user") or w.text.startswith("--user=") or
+               (w.text.startswith("-u") and not w.text.startswith("--")) for w in opts):
+            return check_command(rest, env) if rest else None   # `runuser -u USER [--] cmd…`
+        base = "su"                                           # `runuser [-] USER -c STRING`: su's form
     if base == "su":
         inner = su_string(args)
         return check_text(inner.text, not inner.live) if inner is not None else None

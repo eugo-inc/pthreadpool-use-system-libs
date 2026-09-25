@@ -30,6 +30,16 @@
             "timeout": 15
           }
         ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-prompt-context.sh",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [

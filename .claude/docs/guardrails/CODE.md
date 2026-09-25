@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.0.3 (§2001 harness-agnostic task widget) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
+<!-- guardrails-kit: v1.0.4 (§2919 C11 separates your hunks from another writer's) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
 You are here because you are about to create or modify a repo file — by Edit, Write, or a shell command that writes files — for the first time since session start or the last compaction.
 
 Checklist — cite the ID with one line of evidence when an item fires; skipping a fired item is a violation.
@@ -20,7 +20,9 @@ While editing:
 - C15. Replacing more than half of a function or file? Follow "You are rewriting instead of editing" below the divider first.
 
 After each edit:
-- C11. Run `git diff -- <file>` — any change on a line you did not intend to touch is corruption: revert and redo the Edit with more surrounding context in old_string. Python file: additionally run `python -m py_compile <file>` and paste the result. .js/.mjs file: `node --check <file>`. No per-file syntax gate exists (.ts, .go) -> rely on the project build at VERIFY and say so.
+- C11. Run `git diff -- <file>` — any change on a line you did not intend to touch is corruption: revert and redo the Edit with more surrounding context in old_string. Python file: additionally run `python -m py_compile <file>` and paste the result. .js/.mjs file: `node --check <file>`. No per-file syntax gate exists (.ts, .go) -> rely on the project build at VERIFY and say so. Shared worktree:
+    1. File in `git status --short` before your first edit? `cp` it outside the repo first; diff against that copy.
+    2. A hunk already in that copy is another writer's work — never revert it -> leave it, name it in one line.
 - C12. Changed a signature, symbol name, return shape, config key, route, CLI flag, env var, or enum member? Run REFERENCE SWEEP (below) now — before the next task step. (Compressed as athena's CLAUDE.md iron rule 3.)
 - C13. New code doing I/O, network, parsing of external input, or multi-step mutation: implement the failure path explicitly, then report `HANDLED FAILURES: <list>` and `NOT HANDLED (by choice): <list + reason>`. An empty failure list on I/O code is a defect.
 

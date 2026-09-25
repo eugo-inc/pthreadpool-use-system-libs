@@ -4,9 +4,9 @@
   "managed_by": "adapter",
   "adapts": "eugo-upstream-merge-base",
   "base_tree_hash": "a475d86d303df234d7b1bd73ad3ba88e199ffd9d7106da62cdb6837e973c046d",
-  "base_source_commit": "807102309c4527a91ab2f3aa651a464e4beca0e0",
+  "base_source_commit": "3f62aac1ea267e9dfa70b4f31e3218222c367ffe",
   "generated_by": "eugo-skills pull --as-adapter",
-  "generated_at": "2026-08-29T15:28:21+00:00",
+  "generated_at": "2026-09-25T20:03:44+00:00",
   "params": {
     "upstream_ref": "upstream/main",
     "build_cmd": "configure with `-DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_LIBRARY_TYPE=shared` (the canonical flags from eugo-build-and-test) and build + install",
@@ -25,6 +25,12 @@
     "pins": [
       "protomolecule/dependencies/native/pthreadpool/meta.json `version.commit` (kind git_commit, branch eugo-main) — push the merged eugo-main to GitHub FIRST (the setup curls the archive tarball; an unpushed commit 404s), then bump to the new merge-commit SHA, verify the four eugo_patch_or_die regexes still match, and rebuild the coupled set if versions moved: cpuinfo, FP16, XNNPACK, then pytorch (XNNPACK <-> cpuinfo <-> pthreadpool <-> FP16 coupling, pytorch .eugo/system_dependencies.md §3 — check XNNPACK's pinned commit expectations)."
     ]
+  },
+  "defaults_snapshot": {
+    "upstream_ref": "upstream/main",
+    "build_cmd": "(defer to the repo's eugo-build-and-test canonical build)",
+    "test_cmd": "(defer to the repo's eugo-build-and-test smoke tests)",
+    "merge_notes": ""
   },
   "aliases": []
 }

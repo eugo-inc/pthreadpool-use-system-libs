@@ -8,6 +8,59 @@ an entry below.
 
 ## Upgrade notes
 
+- **2026-09-25 §3609 (REPORT.md v1.2.4 → v1.2.5)** — R7b narrowed to NEXT items: "no inbox" meant no harvester
+  for NEXT lines, and still does. A defect or improvement in content athena SERVES now has its own channel,
+  `report_to_athena` (athena §4.37) — never a `donate_fact`.
+- **2026-09-20 §3057 (REPORT.md v1.2.3 → v1.2.4)** — R7a–d: the writer FILES its NEXT items. The v1.2.3 line said a
+  turn-end harvester would file them; the operator ruled (2026-09-19) that there is no harvester and no inbox —
+  the session that writes a `NEXT-N (owner):` line also files it, in the turn's own commit: a continuation as ONE
+  `> NEXT→ <date> (§<id>): …` line under the item's body (never a heading word), new work as a body + index row +
+  next-free bump; each report line ends `→ <backlog file> §<id>` or `(not filed: <why>)`, and a pre-send grep
+  proves every `→` tail. R7's own line is unchanged; R8 is unchanged.
+- **2026-09-19 §2979 (VERIFY.md v1.2.2-eugo → v1.2.3-eugo)** — external publication is a human step. No rule said
+  that an issue, PR, review or comment on a repo outside the org is drafted by the session and posted by the
+  operator; the central instructions authorised such writes outright and three eugo skills said "file an
+  upstream issue". New **V21** (+ V21a, V21b): about to run `gh issue create`, comment, review or push outside
+  `eugo-inc` -> Write the text to `.claude/data/external-drafts/<date>-<slug>.md`, Grep it for internal details,
+  hand the path over via AskUserQuestion; run the publishing command only after the operator named that draft
+  and said publish. The rule's home is eugo-kb central §publish-manual (§2978). VERIFY's trigger line is
+  unchanged, so F11 leaves CLAUDE.md and the routing template alone.
+- **2026-09-19 §2979 (REPORT.md v1.2.2 → v1.2.3)** — R7's closing lines become numbered: `NEXT-1 (owner): …`,
+  restarting at 1 every turn, so a user can answer "do N2" instead of quoting a sentence back, and each line
+  cites the backlog §-id it continues (a turn-end harvester will file them); `NEXT: nothing owed` is unchanged
+  and is the only unnumbered form. R7's third sweep source named .claude/docs/guardrails/SESSION.md
+  `## Open items`, which is a TEMPLATE inside that file's fenced S2 block and not a ledger — a dead pointer
+  since the rule was written; it now names .claude/docs/guardrails/STATE.md `## Open items`, READ-only:
+  nothing is routed INTO STATE.md by this change. R8 is byte-unchanged. Central principle 4 carries the same
+  form (§2978).
+- **2026-09-16 §2919 (CODE.md v1.0.3 → v1.0.4)** — §1.72 row 4 (`c11-reverts-concurrent-session-hunks`).
+  C11 said to run `git diff -- <file>` and call any change on a line you did not intend to touch
+  corruption, to be reverted. `git diff` shows every uncommitted change in the file, not only yours,
+  and on a worktree two sessions and the review hooks write to, those lines are another writer's
+  unsaved work: measured at the sweep's rev, 33 foreign lines in the overnight breadcrumb log and
+  5,800 in the review ledgers. Obeying C11 there deletes work git cannot restore. Two numbered
+  sub-lines under C11 (F1/F12, no new ID): copy a file that is already dirty before the first edit
+  and diff against the copy; a hunk already in the copy is foreign and is never reverted. CLAUDE.md
+  is at its 15-rule cap, so the kit is the only home. ⚠ CODE.md grows 1,091 -> 1,140 words (`wc -w`),
+  about 4% past F11's approximate ~1,100 cap. Not split: the growth is one rule's sub-lines, and F11's
+  split is by trigger, which this does not add.
+
+- **2026-09-07 §2036 (_FORMAT.md v1.2.2 → v1.2.3; CLAUDE.md stamp v1.1.0-eugo → v1.1.1-eugo; the
+  carrier's own SKILL.md)** — synthesis S-6 + S-9 + S-7b over the §1.67 sweep (rows 39, 36, 32, 26,
+  41, 42, 14): the served `SKILL.md` had drifted from THIS ledger sitting one directory below it —
+  its literal count (40/eight → 42 across the nine non-README docs, now stated as a dated
+  measurement), its contents table (D1–D15, V13–V20, R1–R8 — this ledger records each addition),
+  its ring sentence (ring is a documented SIBLING lineage, §1991 above, never "superseded"), its
+  `doctor` promise (warns by name for records carrying `file_hashes`; older records are skipped
+  and say so — the same condition added to the §2001 note above), and its own generation stamp
+  (dropped: the generation is stated here and nowhere else). `_FORMAT.md`'s F7 registry rows now
+  name the RULE that holds the shared material and `test_f7_compression_pairs.py` checks the
+  rule's block rather than the whole file; iron 11's row declares its `doc-wide` exception.
+  CLAUDE.md's line-1 stamp had stayed at v1.1.0-eugo through §1985 (iron rule 13) and this
+  commit's own edit of the commit-ritual pointer, which no longer routes the trailer through the
+  retired model-mode SWITCH but names the running model and the rule's standing home.
+  Two folded corrections in this ledger: "kept once" (twice) and "10 rows" (11 at §1991).
+
 - **2026-09-06 §2002 (DEBUG.md v1.1.5-eugo → v1.1.6-eugo, plus the carrier's own SKILL.md)** —
   **the root cause, found by a design panel and named independently by both of its judges.** It is
   not the copier: it is **the kit's own `SKILL.md` step 3**, which read *"Tailor the marked spots:
@@ -39,7 +92,8 @@ an entry below.
   `references/CLAUDE-routing-template.md` says "the native task widget", and **none of the three
   consumers mentions `TodoWrite` at all** (protomolecule says "the task tool (the native chat
   widget)"). Every rule now says **the native task widget**, with `(Claude Code: TodoWrite)` kept
-  once as a labelled example so F9's greppable-literal requirement still holds.
+  as a labelled example so F9's greppable-literal requirement still holds (twice — `SESSION.md:4`
+  and `PLAN.md:15`; this said "once" until §2036).
   `SESSION.md`'s `> eugo reconciliation:` blockquote — the ONE slot with no upstream cure, and the
   one BOTH consumers rewrote — no longer asserts athena's plan path and overnight breadcrumb dir
   as the reader's. It now says post-compaction recovery reads "whatever THIS repo's `CLAUDE.md`
@@ -52,7 +106,9 @@ an entry below.
   §1996 presence-in-both assertion is for.
   **Paired code change (§2001, not a kit file):** `eugo-skills install` now records
   `file_hashes` per installed file and `doctor` re-hashes them, so a consumer that has HAND-EDITED
-  an installed doc is WARNED before the next refresh overwrites it. Until now `doctor`'s `fresh`
+  an installed doc is WARNED before the next refresh overwrites it — for install records carrying
+  `file_hashes` (recorded since §2001); for older records `doctor` says "no per-file hashes
+  recorded" (§2025), and since §2025 `install` itself warns before overwriting such a file. Until now `doctor`'s `fresh`
   compared athena's own source tree to itself (`doctor.py:494`) and §1689 added only an EXISTENCE
   check — so a file present-but-modified read as fresh, which is exactly how both consumers' edits
   survived unnoticed. It warns; it never repairs. Installed files are committed in the consumer.
@@ -135,7 +191,8 @@ an entry below.
   now matches E6. Two rows are deliberately one token long (iron 12, and iron 14 ↔ R1 which share
   a concept rather than a list); recording that honestly is the point.
   **(2) F3 gains ring's two caps** — `<=12 routing rows` and `<=140 lines total`. Both were ALREADY
-  satisfied when adopted (athena: 10 rows, 89 lines), which is what made them a ratchet rather than
+  satisfied when adopted (athena: 10 rows, 89 lines — §2036 correction: the table had 11 rows at §1991
+  too, a miscount at write time, not drift; `test_f7_compression_pairs.py` measures it), which is what made them a ratchet rather than
   a change; the new gate pins them from below.
   **(3) F11's flat "VERBATIM"** became ring's honest form — "glue words for grammar allowed, shared
   trigger TOKENS unchanged" — because athena's own routing rows already compress their docs'

@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.2.2-eugo stub (§1996 iron-rule back-pointers say athena's) | full playbook: superpowers:verification-before-completion. Editing? Read .claude/docs/guardrails/_FORMAT.md first. -->
+<!-- guardrails-kit: v1.2.3-eugo stub (§2979 V21 an external report is drafted, never posted; §1996 iron-rule back-pointers say athena's) | full playbook: superpowers:verification-before-completion. Editing? Read .claude/docs/guardrails/_FORMAT.md first. -->
 You are here because you are about to write "done", "fixed", "works", "passing", "complete", "resolved", or "ready", or to run git commit / gh pr create.
 
 Full playbook: invoke `superpowers:verification-before-completion` via the Skill tool — it owns the fuller evidence-before-assertion protocol. Not loaded this session? Follow the anchors below.
@@ -23,3 +23,6 @@ Full playbook: invoke `superpowers:verification-before-completion` via the Skill
   - V20c. Round-trip assertions: broken output often satisfies them (a Python dict repr IS valid YAML) — assert the encoding the cure guarantees, e.g. `json.loads`.
   - V20d. Asserting a token is ABSENT: the guard's own message may contain it — anchor to the emitted form (`>>> RECLAIMED`), never the bare word.
   - V20e. Control unbuildable without contriving the production path (a GIL race)? Write `regression pin, not a control` and record the both-sides run count.
+- V21. About to run `gh issue create`, comment, review or push outside `eugo-inc` -> instead: Write the text to `.claude/data/external-drafts/<date>-<slug>.md`.
+  - V21a. Grep the draft for absolute paths, hostnames, private repo names, people, tokens; then AskUserQuestion with the path — the operator publishes (eugo-kb central §publish-manual).
+  - V21b. Run the publishing command only after the operator named that draft and said publish; an unattended run never publishes.

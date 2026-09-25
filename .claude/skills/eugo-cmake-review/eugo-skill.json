@@ -4,9 +4,9 @@
   "managed_by": "adapter",
   "adapts": "eugo-cmake-review-base",
   "base_tree_hash": "0effeb9466b495ef4f6ca9659a0e56023ec880a58b8bfd8f65fb2d71d646a22f",
-  "base_source_commit": "807102309c4527a91ab2f3aa651a464e4beca0e0",
+  "base_source_commit": "3f62aac1ea267e9dfa70b4f31e3218222c367ffe",
   "generated_by": "eugo-skills pull --as-adapter",
-  "generated_at": "2026-08-29T15:28:21+00:00",
+  "generated_at": "2026-09-25T20:03:44+00:00",
   "params": {
     "legacy_marker_forms": "",
     "audit_cmd": "",
@@ -21,6 +21,14 @@
     "catalog_doc": "the divergence inventory in this repo's `eugo-upstream-merge` adapter (§2 invariants) — this fork has no CLAUDE.md catalog, no markers, no audit script and no snapshot; keep that inventory current in the same commit as any divergence change",
     "non_negotiables": "1. **USE_SYSTEM_* options intact.** `USE_SYSTEM_LIBS` (default OFF, upstream-friendly) plus `USE_SYSTEM_FXDIV` / `USE_SYSTEM_GOOGLETEST` / `USE_SYSTEM_GOOGLEBENCHMARK`, each defaulting to `${USE_SYSTEM_LIBS}`. Do not flip defaults to ON — the fork must still build standalone like upstream does.\n2. **Both branches of every dep guarded.** Each dependency has `FIND_PACKAGE(... REQUIRED)` under `USE_SYSTEM_*`, and the download path (`CONFIGURE_FILE(cmake/Download*.cmake ...)` + `EXECUTE_PROCESS`) only in the ELSE branch. The `ADD_SUBDIRECTORY` fallbacks further down must keep their `NOT TARGET x AND NOT USE_SYSTEM_*` guards — dropping one silently vendors a dep even in system mode.\n3. **Export/install machinery must not regress** (why the fork exists): `pthreadpool_interface` keeps `$<BUILD_INTERFACE:...>` / `$<INSTALL_INTERFACE:include>` includes and is installed into `${CMAKE_PROJECT_NAME}Targets`; `CONFIGURE_PACKAGE_CONFIG_FILE` + `INSTALL(EXPORT ...)` emit `${CMAKE_INSTALL_LIBDIR}/cmake/pthreadpool/pthreadpool-config.cmake`; `cmake/pthreadpool-config.cmake.in` keeps `find_dependency(FXdiv)` — removing it breaks pytorch's `find_package(pthreadpool CONFIG REQUIRED)` at pytorch-configure time, not here.\n4. **Consumer regex coupling.** protomolecule's `setup` patches these EXACT lines with `eugo_patch_or_die`: `SET(CMAKE_C_STANDARD 11)`, `SET(CMAKE_C_EXTENSIONS NO)`, `SET(CMAKE_CXX_STANDARD 11)`, `SET(CMAKE_CXX_EXTENSIONS NO)`. If a diff (or an upstream merge) reworks the \"Language options\" block, the downstream build fails loudly at patch time — update the setup regexes in the same adoption PR that bumps the pin.\n5. **Flags that must keep working** (the canonical protomolecule invocation uses them): `PTHREADPOOL_LIBRARY_TYPE=shared`, `PTHREADPOOL_SYNC_PRIMITIVE=futex`, `PTHREADPOOL_ALLOW_DEPRECATED_API=ON`, `PTHREADPOOL_ENABLE_FASTPATH` overridable per-arch (ON x86_64 / OFF aarch64).\n6. **Stay close to upstream.** Every divergent line is merge-conflict debt for the next `git merge upstream/main`. Prefer the smallest diff that works; adopt upstream shapes where possible.\n",
     "related_skills": "- `eugo-build-and-test` — canonical flags, the artifact checklist, the consumer smoke test.\n- `eugo-rebuild` — whether a change forces a downstream pin bump and the coupled-set rebuild order.\n- `eugo-upstream-merge` — the divergence inventory (keep it current) and the merge-commit-only recipe.\n- protomolecule `dependencies/native/pthreadpool/setup` — the four patch regexes this checklist protects.\n"
+  },
+  "defaults_snapshot": {
+    "legacy_marker_forms": "",
+    "audit_cmd": "",
+    "snapshot_path": "",
+    "snapshot_cmd": "",
+    "preflight_checks": "",
+    "failure_modes": ""
   },
   "aliases": []
 }
