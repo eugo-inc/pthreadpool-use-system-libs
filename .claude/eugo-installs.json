@@ -2,8 +2,8 @@
   "version": 1,
   "installs": {
     "eugo-session-hooks": {
-      "tree_hash": "45d48faf07a5f3742c18f14cb85f2e83028309dfc0fc2adf75b0498a52f34e70",
-      "source_commit": "3f62aac1ea267e9dfa70b4f31e3218222c367ffe",
+      "tree_hash": "3ba9b21f654cc7b75800609d18902c4c7f0cb79264d99906e3bf4912bf09927f",
+      "source_commit": "76df21603506a4328e609e863df7e67b6dfe7690",
       "files": [
         ".claude/hooks/eugo-deletion-guard.sh",
         ".claude/hooks/eugo-external-publish-guard.sh",
@@ -18,17 +18,17 @@
         ".claude/hooks/eugo-deletion-guard.sh": "c9a5029e2640ed7c6678a3dc9b775071426d55c3704a2c8c3d4d6653bd0213ee",
         ".claude/hooks/eugo-external-publish-guard.sh": "cf23f7f58cbdd80c05b04ecfb1cf39df0d5dc0f39abc2beeb8ab7fedb6a2628a",
         ".claude/hooks/eugo-prompt-context.sh": "541a739828a798084b90b207b552211cd3834b6d0768566e71448aec2c4cc28a",
-        ".claude/hooks/eugo-review-on-commit.sh": "766df0de98013af93e40da25fdd6b9959803636ea44bbf0f0364e405af4e4f6d",
+        ".claude/hooks/eugo-review-on-commit.sh": "a4891f6dc911a2c1b66d23ae98abe425b4ed368abc39be6e4798b03125d342c1",
         ".claude/hooks/eugo-review-turn-end.sh": "ded518908c9437d8ffafdfe02e47de7697f53b66c74be5746d9f85d3e815ba40",
-        ".claude/hooks/eugo-session-instructions.sh": "eb4407517980baf9ec6ec6467b40b315def6cd0f36a697a419e5322c99f09e79",
-        ".claude/hooks/eugo-watch-owed.sh": "16d04df993ece318ae1a18a734f395a6e19051bd544703a46c170e3c98466b97",
-        ".claude/hooks/eugo-wip-snapshot.sh": "4c809ebcc25be9c7ce0ee289d2d1b2ae1110759fd5e94132a55e170aeb7c5387"
+        ".claude/hooks/eugo-session-instructions.sh": "e903f5421ad9f298ebdba2b779f7db45df6e10953b6eab4a718df78e3ef682e2",
+        ".claude/hooks/eugo-watch-owed.sh": "f506333a1cf5240cd6beaa2a71bcf5800d57ef97a31ae5e276ff41e6899d2817",
+        ".claude/hooks/eugo-wip-snapshot.sh": "1d05db7f593be248a366a225ddeaf5d9322ef624aa3fcf115ba9c14f763e8628"
       },
-      "installed_at": "2026-09-25T20:03:43+00:00"
+      "installed_at": "2026-09-27T17:31:14+00:00"
     },
     "eugo-guardrails-kit": {
       "tree_hash": "4eaad13fa5ce50bafdf9ebf7c877606616c2243808d425303106a515bc310c83",
-      "source_commit": "3f62aac1ea267e9dfa70b4f31e3218222c367ffe",
+      "source_commit": "76df21603506a4328e609e863df7e67b6dfe7690",
       "files": [
         ".claude/docs/guardrails/CODE.md",
         ".claude/docs/guardrails/DEBUG.md",
@@ -53,22 +53,22 @@
         ".claude/docs/guardrails/VERIFY.md": "da7a02945ea665bde927cd755012dd91d1bc94dee8b2ec2652e0d75124242f5b",
         ".claude/docs/guardrails/_FORMAT.md": "49d34514d716f21647a9285b376697693ef01e4668f4001023e0e0ba4b8bd31c"
       },
-      "installed_at": "2026-09-25T20:03:43+00:00"
+      "installed_at": "2026-09-27T17:31:14+00:00"
     },
     "eugo-agentic-scripts": {
-      "tree_hash": "11e419ce4bf5fcf35b5c84720521fa46ad906c0933ee3a5022f52f065f5c4f66",
-      "source_commit": "3f62aac1ea267e9dfa70b4f31e3218222c367ffe",
+      "tree_hash": "1f69dd971e35bd128dd8aa9f5084e80ef2601130a6b38b35f5356fcff59bbdc9",
+      "source_commit": "76df21603506a4328e609e863df7e67b6dfe7690",
       "files": [
         ".claude/scripts/codex_review.py",
         ".claude/scripts/codex_watch.py",
         ".claude/scripts/watch_drain.py"
       ],
       "file_hashes": {
-        ".claude/scripts/codex_review.py": "d19964ce27b96c09706b810a66e894d0f43c79697954db3473c321ee24cbeaf7",
-        ".claude/scripts/codex_watch.py": "7d5a83f6987094e8bd671761b1e817ae362b61b22a8da0c5e17efe0de5caf14f",
-        ".claude/scripts/watch_drain.py": "9886e42c0978a95de931a21d0a27857c2a7a91b8c4d9a4e689b8ab3f6d83db42"
+        ".claude/scripts/codex_review.py": "c83d00cf47d1dc28c9e9e271f172d63a389fee47129ce4a417e80bdc8ccddd44",
+        ".claude/scripts/codex_watch.py": "b8d56ee58e1533734387cb498b3f4ec5183526cc4aa5c726b48f91f773939054",
+        ".claude/scripts/watch_drain.py": "49192f0c0d4e91b7baa0eb8fe2290e13d127d4c13394dae019579c103c893b70"
       },
-      "installed_at": "2026-09-25T20:03:43+00:00"
+      "installed_at": "2026-09-27T17:31:14+00:00"
     }
   }
 }

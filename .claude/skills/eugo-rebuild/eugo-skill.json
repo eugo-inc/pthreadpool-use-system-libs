@@ -4,9 +4,9 @@
   "managed_by": "adapter",
   "adapts": "eugo-rebuild-base",
   "base_tree_hash": "963b7aeb586317144e102b3c8841bd83987a08bc93c6735c3508f6c56ca4d710",
-  "base_source_commit": "3f62aac1ea267e9dfa70b4f31e3218222c367ffe",
+  "base_source_commit": "76df21603506a4328e609e863df7e67b6dfe7690",
   "generated_by": "eugo-skills pull --as-adapter",
-  "generated_at": "2026-09-25T20:03:44+00:00",
+  "generated_at": "2026-09-27T17:31:15+00:00",
   "params": {
     "configure_cmd": "the canonical-flag configure from eugo-build-and-test (`cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=\"$PWD/out\" -DPTHREADPOOL_LIBRARY_TYPE=shared -DPTHREADPOOL_SYNC_PRIMITIVE=futex -DPTHREADPOOL_ALLOW_DEPRECATED_API=ON -DUSE_SYSTEM_LIBS=ON -DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_BUILD_TESTS=OFF -DPTHREADPOOL_BUILD_BENCHMARKS=OFF`)",
     "test_cmd": "`ctest --test-dir build` with `-DPTHREADPOOL_BUILD_TESTS=ON -DUSE_SYSTEM_GOOGLETEST=ON` for src/include changes; the /tmp/ptp-smoke consumer `find_package(pthreadpool CONFIG REQUIRED)` build from eugo-build-and-test for the export",

@@ -75,9 +75,14 @@ FULL=0
 
 # ⚠ §2121 — A REVIEW MUST NOT DISPATCH A REVIEW. `codex_review.py` spawns the reviewer
 # with `cwd=repo`, so a review of THIS repo loads THIS file, and the reviewer's own tool
-# calls would fire this hook. Today that costs nothing here — the reviewer's toolset is
-# `Read,Grep,Glob`, so the `Bash` matcher never matches — but that set is a variable, not
-# a law, and the sibling `Stop` hook took 31 commits before anyone noticed the same
+# calls fire this hook. ⚠ §2.38 (e) — this used to say the `Bash` matcher never matches
+# because the reviewer's toolset is `Read,Grep,Glob`. MEASURED FALSE: `--allowed-tools`
+# under `dontAsk` does not remove Bash, and the CLI auto-allows commands it classes
+# read-only (`git log`, `git show`, `docker ps`) before `dontAsk` denies anything — ~2,100
+# Bash calls ran across 844 reviewer sessions (2026-09-09..27), and run 1229's probe P2
+# reproduced it. So the `PostToolUse` Bash row DOES fire inside a reviewer, and the
+# SessionStart `--full` row fires in every one: without this guard each review would
+# dispatch reviews. The sibling `Stop` hook took 31 commits before anyone noticed the same
 # inheritance. Guarded on the same marker, for the same reason.
 if [ -n "${EUGO_REVIEW_SUBPROCESS:-}" ]; then
   exit 0

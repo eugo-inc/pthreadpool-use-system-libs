@@ -45,9 +45,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 DRIVER = Path(__file__).resolve().parent / "codex_review.py"
-# This repo root (/opt/eugo/athena) — `.claude/scripts/codex_watch.py`.parents[2].
+# The repo this script is INSTALLED in — `<repo>/.claude/scripts/codex_watch.py`.parents[2].
+# §2.37 (g): athena for athena's own copy, the consumer for every installed one.
 REPO_ROOT = str(Path(__file__).resolve().parents[2])
 # The codex team roster — a mirror of codex_review.DEFAULT_MODELS (the two places model ids live;
 # eugo_kb §3.5). Watch stays LIGHT by default: a single model (the roster's FIRST) at effort `high`,
@@ -67,6 +69,10 @@ _WATCH_DEFAULT_CLAUDE_MODEL = DEFAULT_CLAUDE_MODELS[0]
 # gateway cannot answer — and every tick failed.
 GATEWAY_DEFAULT_MODELS = ["gpt-5.6-sol"]
 _WATCH_DEFAULT_GATEWAY_MODEL = GATEWAY_DEFAULT_MODELS[0]
+#: §2.37 (d) — a mirror of `codex_review.SESSION_CODEX_BIN_ENV`, pinned by a parity test. With no
+#: `--codex-bin` the DRIVER adopts the binary this names (`kiro-claude` exports `kiro`), so the
+#: watcher's light default must follow it too — see `main`.
+SESSION_CODEX_BIN_ENV = "EUGO_SESSION_CODEX_BIN"
 
 #: Mirrors `codex_review._KIRO_SHORTHAND`'s 2-9 bound rather than re-deriving it:
 #: `kiro1` is deliberately NOT a shorthand upstream (instance 1 is plain `kiro`), and a
@@ -345,10 +351,30 @@ def upstream_ref(repo: str) -> str | None:
 _STOP = False
 
 
-def _sig(signum, frame):  # graceful shutdown on SIGTERM/SIGINT
+def _sig(signum, frame):  # graceful shutdown on SIGTERM/SIGINT (and SIGHUP/SIGQUIT, see below)
     global _STOP
     del signum, frame  # required by the signal-handler API; unused here
     _STOP = True
+
+
+#: audit-w258 #1 (run 1229) — the signals that STOP the watcher, not only SIGTERM/SIGINT. Since
+#: §2.37 (c) each review part runs in its OWN session, so a signal the watcher simply dies of never
+#: reaches the driver: a hangup (the terminal or SSH session closing — the served hooks start the
+#: watcher as a plain background job, `( … ) &`) or a Ctrl-\ killed the watcher by default and left
+#: the driver and `claude -p` running orphaned and unrecorded for up to 1800 s. Handled, they end the
+#: part's whole group like any STOP. A signal the watcher was started with IGNORED (`nohup`) stays
+#: ignored: that launch asked it to outlive the terminal, and it still does.
+_STOP_SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT")
+
+
+def _install_stop_signals() -> None:
+    for name in _STOP_SIGNALS:
+        sig_no = getattr(signal, name, None)
+        if sig_no is None:
+            continue
+        if name in ("SIGHUP", "SIGQUIT") and signal.getsignal(sig_no) == signal.SIG_IGN:
+            continue
+        signal.signal(sig_no, _sig)
 
 
 def _git(repo: str, *args: str, timeout: int = 30) -> str:
@@ -576,6 +602,14 @@ def _outage_stub(entry: dict) -> str | None:
     return None
 
 
+def _was_stopped(entry: dict) -> bool:
+    """§2.37 (c) — was this review ended by an operator's STOP? The top-level `stopped` marker
+    (every stop since run 1229, a part killed in flight included), or §3137's `split.stopped`,
+    which older ledger entries carry alone. Never inferred from `driver_exit`: a killed driver's
+    exit status is the STOP's doing, not the commit's."""
+    return entry.get("stopped") is True or (entry.get("split") or {}).get("stopped") is True
+
+
 def _is_real_review(entry: dict) -> bool:
     """Did this entry actually produce a verdict, or only a record that it tried?
 
@@ -588,10 +622,20 @@ def _is_real_review(entry: dict) -> bool:
     """
     results = entry.get("results") or ()
     split = entry.get("split")
-    if isinstance(split, dict) and isinstance(split.get("parts"), int) and split["parts"] > 1:
+    resplit = split.get("resplit") if isinstance(split, dict) else None
+    resplit = resplit if isinstance(resplit, dict) else {}
+    if isinstance(split, dict) and isinstance(split.get("parts"), int) and (
+            split["parts"] > 1 or resplit):
+        # §2.37 (f) — a re-split part is reviewed only when EVERY one of its slices is.
+        n = split["parts"]
+        need: set[str] = set()
+        for i in range(1, n + 1):
+            k = resplit.get(str(i))
+            need |= ({f"{i}.{j}/{n}" for j in range(1, k + 1)}
+                     if isinstance(k, int) and k > 0 else {f"{i}/{n}"})
         got = {result.get("part") for result in results if _is_verdict(result)}
 
-        return len(got - {None}) == split["parts"]
+        return need <= got
     return any(_is_verdict(result) for result in results)
 
 
@@ -713,7 +757,7 @@ def failed_attempts(advice_dir: Path) -> dict[str, int]:
             # §3137 — an operator's STOP between parts is charged to NOBODY, like an outage,
             # and never reaches the §3121 ceiling either.
             # §3138 — unless a part FAILED before the stop: that failure is the commit's own.
-            if (entry.get("split") or {}).get("stopped") and not entry.get("driver_exit"):
+            if _was_stopped(entry) and not entry.get("driver_exit"):
                 continue
             totals[entry["ref"]] = totals.get(entry["ref"], 0) + 1
             # ⚠ §2114 — AN OUTAGE IS CHARGED TO NOBODY, and §2112 forgot that when it
@@ -919,6 +963,104 @@ _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 #: built on — the figure §2172 just made honest. That is the reason a part budget exists
 #: at all, not merely the spend.
 _DIFF_PART_BYTES = 1_500_000
+
+#: §2.37 (f), report:111 — BYTES ARE NOT WHAT A MODEL RUNS OUT OF. A part under the byte cap can
+#: still exceed the reviewer's context when its content is token-dense (base64, hex, minified
+#: JSON, CJK), and the ledger then carried an ERROR "Prompt is too long" as an open finding
+#: (protomolecule e2e9695760, 2026-09-25). No tokenizer ships with this stdlib carrier, so
+#: `estimate_tokens` counts by CONTENT CLASS, with weights FITTED to a real BPE rather than
+#: guessed: tiktoken `o200k_base` (the OpenAI tokenizer the codex engines use; Claude's does not
+#: ship, so it is the proxy), measured 2026-09-27 on six of this repo's largest diffs (3.00-3.69
+#: bytes per real token) plus base64 (1.45), hex (1.72), minified JSON (2.23), random CJK (1.57)
+#: and English prose (5.27). A first, hand-weighted version estimated base64 and CJK at 0.54-0.66x
+#: of real while code read 1.75x: it would have split the wrong content. The fitted weights put
+#: EVERY class at 1.21-1.44x of real (a 1.19x spread), erring toward splitting sooner.
+#:
+#: The cap is in these units, calibrated the way _DIFF_PART_BYTES was: the largest diff opus ever
+#: reviewed WHOLE to a verdict (48358df3b2e5, 1,896,954 bytes, 582,416 real tokens) scores
+#: _TOKENS_OF_LARGEST_SUCCESS units, and the cap sits 20% under it. So code of that density stays
+#: byte-capped, denser code is capped a few percent lower, and base64 or CJK splits ~2x sooner.
+_TOKENS_OF_LARGEST_SUCCESS = 740_031
+_DIFF_PART_TOKENS = 590_000
+_TOKEN_RUNS = re.compile(r"[A-Za-z]+|[0-9]+|\s+|[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]+|[^\x00-\x7f]")
+#: A long unbroken alphanumeric run that mixes digits and letters (hex, base64, a hash) — or
+#: flips case often — tokenizes far worse than an identifier: one unit per 1.2 characters.
+_BLOB_RUN = re.compile(r"[A-Za-z0-9+/=_-]{16,}")
+
+
+def _is_blob(run: str) -> bool:
+    if any(c.isdigit() for c in run) and any(c.isalpha() for c in run):
+        return True
+    return sum(1 for a, b in zip(run, run[1:])
+               if a.isalpha() and b.isalpha() and a.islower() != b.islower()) >= 4
+
+
+def _estimate_runs(text: str) -> float:
+    n = 0.0
+    for m in _TOKEN_RUNS.finditer(text):
+        run = m.group(0)
+        head = run[0]
+        if head.isascii() and head.isalpha():
+            n += -(-len(run) // 6)
+        elif head.isascii() and head.isdigit():
+            n += -(-len(run) // 2)
+        elif head.isspace():
+            n += 1 if "\n" in run else 0.25     # a newline+indent is a token; a lone space merges
+        elif head.isascii():
+            n += -(-len(run) // 2)
+        else:
+            n += 2.5                               # a non-ASCII character
+    return n
+
+
+def estimate_tokens(text: str) -> int:
+    """§2.37 (f) — a stdlib estimate of how many tokens `text` costs, by content class (see
+    _DIFF_PART_TOKENS for the fit and its units)."""
+    n, pos = 0.0, 0
+    for m in _BLOB_RUN.finditer(text):
+        if _is_blob(m.group(0)):
+            n += _estimate_runs(text[pos:m.start()]) + len(m.group(0)) / 1.2
+            pos = m.end()
+    return int(n + _estimate_runs(text[pos:]))
+
+
+def _part_cap(text: str) -> int:
+    """§2.37 (f) — the BYTE cap for this diff's parts: _DIFF_PART_BYTES, lowered in proportion
+    when the diff's estimated density would put a byte-capped part over _DIFF_PART_TOKENS."""
+    units = estimate_tokens(text)
+    if units <= 0:
+        return _DIFF_PART_BYTES
+    return max(1, min(_DIFF_PART_BYTES, _DIFF_PART_TOKENS * _nbytes(text) // units))
+
+
+#: §2.37 (f) — the reactive half. A part the reviewer still refused as too long is re-split
+#: ONCE, at its own size times the vendor's own ratio when the note carries one (`~N tokens
+#: (limit L)`, or the API's `N tokens > L maximum`) with a safety margin, else halved. A
+#: sub-part still too long keeps its terminal ERROR: that is `terminal_refs`' case.
+_TOKENS_OVER = re.compile(r"~?\s*([\d,]+)\s*tokens\s*(?:\(\s*limit\s*([\d,]+)\s*\)|>\s*([\d,]+)\s*maximum)",
+                          re.I)
+_RESPLIT_SAFETY = 0.85
+_RESPLIT_DEFAULT = 0.5
+
+
+def _resplit_factor(part_results: list[dict]) -> float | None:
+    """The size factor to re-split a part by, or None when it was not refused as too long.
+
+    Too long = the part produced results and EVERY one is an ERROR whose note says so."""
+    notes = [str(r.get("note") or "") for r in part_results]
+    if not part_results or not all(
+            r.get("verdict") == "ERROR"
+            and (any(mk in note.lower() for mk in _TERMINAL_MARKERS) or _TOKENS_OVER.search(note))
+            for r, note in zip(part_results, notes)):
+        return None
+    ratios = []
+    for note in notes:
+        m = _TOKENS_OVER.search(note)
+        if m:
+            over, limit = int(m.group(1).replace(",", "")), int((m.group(2) or m.group(3)).replace(",", ""))
+            if over > limit > 0:
+                ratios.append(limit / over)
+    return max(0.05, min(ratios) * _RESPLIT_SAFETY) if ratios else _RESPLIT_DEFAULT
 
 #: Every part of a split diff opens with exactly ONE line of this shape. It is not part of
 #: the diff: `part_body()` strips it, and the concatenated bodies reproduce the input
@@ -1625,6 +1767,63 @@ def _results_of(stdout: str, out_dir: Path, *, part: str = "") -> list[dict]:
     return results
 
 
+#: §2.37 (c) — A STOP REACHES A PART IN FLIGHT. Each review part was a blocking
+#: `subprocess.run(…, capture_output=True)` and `_sig` only sets a flag, so a STOP (the lane's
+#: sentinel, or SIGTERM) waited out the running part — up to the driver's 1800 s per-engine cap
+#: (report:102, §1.93's one residual). Now the part runs under `Popen` in its OWN session, and every
+#: _PART_POLL_S the watcher asks `_stop_requested`; on a STOP it SIGTERMs the part's whole process
+#: group (the driver and the engine CLI under it) and SIGKILLs the group if it outlives
+#: _PART_KILL_GRACE_S. The new session is what makes the group the driver's alone — and it also
+#: means a Ctrl-C at the watcher's terminal no longer reaches the driver, so the watcher must.
+_PART_POLL_S = 2.0
+_PART_KILL_GRACE_S = 10.0
+
+
+def _kill_part_group(proc: subprocess.Popen) -> None:
+    """SIGTERM the part's process group; SIGKILL it after the grace period. Never raises."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=_PART_KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _dispatch_part(argv: list[str], advice_dir: Path):
+    """Run ONE review part. §2.37 (c) — the ONE seam every driver dispatch goes through, and the
+    one the tests fake: `_review` never runs the driver through `subprocess.run`.
+
+    Returns `returncode` / `stdout` / `stderr` (text) and `stopped`, True when a STOP ended the
+    part; `_review` then records a top-level `stopped` marker, never a `driver_exit`."""
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    stopped = False
+    try:
+        while True:
+            try:
+                # Retrying `communicate` after TimeoutExpired loses no output (the stdlib's contract).
+                out, err = proc.communicate(timeout=_PART_POLL_S)
+                break
+            except subprocess.TimeoutExpired:
+                if _stop_requested(advice_dir):
+                    stopped = True
+                    _kill_part_group(proc)
+                    out, err = proc.communicate()
+                    break
+    except BaseException:
+        # audit-w258 #1 — whatever ends the watcher HERE (an exception out of the poll, a
+        # SystemExit), the part's session must not outlive it unowned: its group dies with it.
+        _kill_part_group(proc)
+        raise
+    return SimpleNamespace(args=argv, returncode=proc.returncode, stdout=out, stderr=err,
+                           stopped=stopped)
+
+
 def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namespace,
             advice_dir: Path) -> dict | None:
     """Review one increment via the driver; append advice; return the entry (or None if empty diff)."""
@@ -1658,17 +1857,24 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
     # The subdirectories do not disturb retention: `_RAW_TICK_DIR` matches the PARENT's
     # name, which is unchanged, and `_dir_size` / `_review_durations` both walk with
     # `rglob`, so a part's bytes and mtimes are counted with the tick they belong to.
-    parts = split_diff(diff_text, _DIFF_PART_BYTES)
+    # §2.37 (f) — the cap follows the diff's estimated token density (see _DIFF_PART_TOKENS);
+    # for ordinary code it IS _DIFF_PART_BYTES, so the common path is unchanged.
+    cap = _part_cap(diff_text)
+    parts = split_diff(diff_text, cap)
     argv_base = [sys.executable, str(cfg.driver), "--type", "code", "--repo", repo,
                  "--models", cfg.models, "--effort", cfg.effort]
     # §737 — forward the operator's triage invariants. Without this the watch arm
-    # had NO override path: `--type code` makes codex_review.py fall through to its
+    # had NO override path: `--type code` made codex_review.py fall through to its
     # built-in _EUGO_INVARIANTS, so every tick in a consumer repo triaged that
     # repo's findings against ATHENA's contracts — its count contract, its
     # commit-trailer rule, paths under skills/eugo/ — and told codex that findings
     # contradicting them were false positives. `invariants` is declared
     # required:true in the base's parameters.json, and on this surface it reached
     # no finding at all. getattr keeps a hand-built cfg Namespace working.
+    # §2.37 (a) — with no file forwarded, the driver now resolves the reviewed
+    # repo's OWN block from `--repo` (athena's too, from its own INVARIANTS.md since
+    # run 1229), so the served hooks, which forward none, are covered; a file given
+    # here still wins.
     if getattr(cfg, "invariants_file", ""):
         argv_base += ["--invariants-file", cfg.invariants_file]
     # §1244 — forward the ENGINE. The daemon used to be codex-only, which made it
@@ -1690,6 +1896,7 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
     tails: list[str] = []
     dispatched = len(parts)
     stopped = False
+    resplit: dict[str, int] = {}      # §2.37 (f) — part index -> the slices it was re-split into
     for index, part_text in enumerate(parts, start=1):
         out_dir = raw if len(parts) == 1 else raw / f"part{index}of{len(parts)}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1697,17 +1904,69 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
         inp.write_text(part_text)
         extra = _REVIEW_EXTRA if len(parts) == 1 else _REVIEW_EXTRA_PART.format(
             i=index, n=len(parts))
-        proc = subprocess.run([*argv_base, "--input", str(inp),
-                               "--output-dir", str(out_dir), "--extra", extra],
-                              capture_output=True, text=True)
-        part_exit = int(getattr(proc, "returncode", 0) or 0)
-        driver_exit = driver_exit or part_exit
-        if part_exit:
-            tail = " | ".join((proc.stderr or "").strip().splitlines()[-3:])
-            tails.append(f"part {index}/{len(parts)}: {tail}" if len(parts) > 1 else tail)
-        part_results = _results_of(proc.stdout, out_dir,
-                                   part=f"{index}/{len(parts)}" if len(parts) > 1 else "")
+        proc = _dispatch_part([*argv_base, "--input", str(inp),
+                               "--output-dir", str(out_dir), "--extra", extra], advice_dir)
+        # §2.37 (c) — a part a STOP ended IN FLIGHT: its exit status is the kill's and its
+        # output a fragment, so neither is recorded; the entry says `stopped`, and every
+        # reader (`_was_stopped`) charges it to nobody and never counts it reviewed.
+        if getattr(proc, "stopped", False):
+            print(f"[watch] STOP during part {index}/{len(parts)} of {kind} {ref[:12]}; "
+                  f"the driver was stopped", file=sys.stderr, flush=True)
+            dispatched = index
+            stopped = True
+            break
+        label = f"{index}/{len(parts)}" if len(parts) > 1 else ""
+        pieces = [(proc, _results_of(proc.stdout, out_dir, part=label), label)]
+        # §2.37 (f) — ONE reactive re-split of a part the reviewer refused as too long (see
+        # _resplit_factor). Its own result and exit are replaced by its slices', labelled
+        # `<i>.<j>/<n>`, every one of which `_is_real_review` then requires.
+        factor = _resplit_factor(pieces[0][1])
+        body = part_body(part_text)
+        subs = split_diff(body, max(1, int(_nbytes(body) * factor))) if factor is not None else []
+        if len(subs) > 1:
+            print(f"[watch] part {label or '1/1'} of {kind} {ref[:12]} was too long for the "
+                  f"reviewer; re-split into {len(subs)} and dispatched once more",
+                  file=sys.stderr, flush=True)
+            resplit[str(index)] = len(subs)
+            pieces = []
+            for j, sub in enumerate(subs, start=1):
+                sub_dir = out_dir / f"sub{j}of{len(subs)}"
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                (sub_dir / "diff.md").write_text(sub)
+                sub_extra = _REVIEW_EXTRA_PART.format(
+                    i=f"{index}.{j}", n=f"{len(parts)} (part {index} re-split into {len(subs)})")
+                sub_proc = _dispatch_part([*argv_base, "--input", str(sub_dir / "diff.md"),
+                                           "--output-dir", str(sub_dir), "--extra", sub_extra],
+                                          advice_dir)
+                if getattr(sub_proc, "stopped", False):          # §2.37 (c), as above
+                    stopped = True
+                    break
+                sub_label = f"{index}.{j}/{len(parts)}"
+                pieces.append((sub_proc, _results_of(sub_proc.stdout, sub_dir, part=sub_label),
+                               sub_label))
+                # audit-w258 #2 — §2187's rule inside the re-split too: a slice that reports the
+                # account unusable ends the slices, which would each pay the same outage. The
+                # unsent slices have no result, so `_is_real_review` still counts the ref
+                # unreviewed and the outage stays charged to nobody; the part loop below stops too.
+                if j < len(subs) and _account_is_down({"results": pieces[-1][1]}) is not None:
+                    print(f"[watch] account down mid-re-split; dispatched {j}/{len(subs)} slice(s) "
+                          f"of part {label or '1/1'} for {kind} {ref[:12]} and stopped",
+                          file=sys.stderr, flush=True)
+                    break
+        part_results = []
+        for piece, piece_results, piece_label in pieces:
+            piece_exit = int(getattr(piece, "returncode", 0) or 0)
+            driver_exit = driver_exit or piece_exit
+            if piece_exit:
+                tail = " | ".join((piece.stderr or "").strip().splitlines()[-3:])
+                tails.append(f"part {piece_label}: {tail}" if piece_label else tail)
+            part_results.extend(piece_results)
         results.extend(part_results)
+        if stopped:
+            print(f"[watch] STOP during a re-split slice of part {index}/{len(parts)} of {kind} "
+                  f"{ref[:12]}; the driver was stopped", file=sys.stderr, flush=True)
+            dispatched = index
+            break
         # ⚠ §2187 — AN OUTAGE IS CHARGED TO NOBODY, AND THIS LOOP WAS CHARGING IT PER PART.
         # `_account_is_down` exists (§2089/§2114) so a session/weekly limit does not spend a
         # commit's retries; nothing consulted it BETWEEN parts, and the reaction lives in
@@ -1738,21 +1997,25 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
             stopped = True
             break
     entry = {"ts": ts, "kind": kind, "ref": ref, "results": results}
-    if len(parts) > 1:
+    if len(parts) > 1 or resplit:
         # §2178 — WHAT THE READER NEEDS TO KNOW THAT THE VERDICTS DO NOT SAY. Recorded as
         # a structured block rather than a new verdict string: `watch_drain`'s status line
         # reports `other_verdicts`, so an invented value lands there and every downstream
         # count drifts. `_is_real_review` reads `parts` from here to require a verdict for
         # EVERY part before the ref counts as reviewed.
         entry["split"] = {"parts": len(parts), "bytes": len(diff_text.encode("utf-8", "surrogateescape")),
-                          "cap": _DIFF_PART_BYTES}
+                          "cap": cap}
+        if resplit:
+            entry["split"]["resplit"] = resplit     # §2.37 (f) — read by `_is_real_review`
         # §2187 — how many were actually SENT, which is not `parts` once an outage stops
         # the loop. Recorded so the entry cannot be read as five failed reviews when it
         # was one failure and four dispatches that never happened.
         if dispatched != len(parts):
             entry["split"]["dispatched"] = dispatched
         if stopped:
-            entry["split"]["stopped"] = True        # §3137
+            entry["split"]["stopped"] = True        # §3137 (read by older copies of this script)
+    if stopped:
+        entry["stopped"] = True                     # §2.37 (c) — top-level, split or not
     if kind == "commit":
         # §2143 — see `_superseded`. Recorded on the ENTRY so every reader of the ledger
         # sees it, not only whoever happened to be watching the log.
@@ -2059,7 +2322,8 @@ def _record_show_failure(advice_dir: Path, sha: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Codex continuous-review companion (the /eugo-adversarial-review `watch` mode).")
     ap.add_argument("--repo", default=REPO_ROOT,
-                    help="repo root (codex -C working dir); defaults to this repo (/opt/eugo/athena)")
+                    help="the repo to watch and review (the engine's working directory); defaults to "
+                         "the repo this script is installed in")
     ap.add_argument("--commits", action="store_true", default=True)
     ap.add_argument("--no-commits", dest="commits", action="store_false")
     ap.add_argument("--worktree", action="store_true", default=True)
@@ -2148,9 +2412,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--raw-max-mb", type=float, default=200.0,
                     help="cap the total size of raw/, deleting oldest-first (0 = uncapped)")
     ap.add_argument("--invariants-file", default="",
-                    help="file whose text REPLACES the built-in eugo_kb triage-invariants "
-                    "block in the driver's `code` prompt (consumer repos pass their own; "
-                    "forwarded verbatim to codex_review.py's --invariants-file)")
+                    help="file whose text is the triage-invariants block in the driver's "
+                    "`code` prompt (forwarded verbatim to codex_review.py's --invariants-file). "
+                    "Without it the driver resolves the block from --repo: its "
+                    ".adversarial-review/INVARIANTS.md, else the review adapter's "
+                    "`invariants` param, else none")
     ap.add_argument("--once", action="store_true", help="run a single tick then exit (the test hook)")
     ap.add_argument("--max-ticks", type=int, default=0, help="stop after N ticks (0 = unbounded)")
     ap.add_argument("--ignore-account-hold", action="store_true",
@@ -2172,9 +2438,18 @@ def main(argv: list[str] | None = None) -> int:
     # --models always wins. Keeping watch at ONE model is the property that makes it
     # cheap enough to run every tick.
     if not cfg.models.strip():
+        # §2.37 (d) — the binary the DRIVER will use: `--codex-bin`, else the session's
+        # EUGO_SESSION_CODEX_BIN, which the driver adopts when no `--codex-bin` is passed but
+        # keeps the `--models` this watcher always forwards. Defaulting to `gpt-5.5` in a
+        # kiro session therefore reached the driver as (kiro, gpt-5.5), which its model/binary
+        # check rejects: every tick failed. Read the way the driver reads it (stripped); only a
+        # gateway name changes the default, and an unrecognised value is left to the driver,
+        # which warns once — this adds no second warning.
+        driver_bin = (getattr(cfg, "codex_bin", "")
+                      or (os.environ.get(SESSION_CODEX_BIN_ENV) or "").strip())
         if cfg.engine != "codex":
             cfg.models = _WATCH_DEFAULT_CLAUDE_MODEL
-        elif _is_gateway_binary(getattr(cfg, "codex_bin", "") or ""):
+        elif _is_gateway_binary(driver_bin):
             # §1648 — per BINARY, not only per engine. A gateway binary keeps
             # `engine == "codex"` while serving a different roster entirely.
             cfg.models = _WATCH_DEFAULT_GATEWAY_MODEL
@@ -2184,8 +2459,7 @@ def main(argv: list[str] | None = None) -> int:
     if not Path(cfg.driver).exists():
         print(f"ERROR: driver not found: {cfg.driver}", file=sys.stderr)
         return 1
-    signal.signal(signal.SIGTERM, _sig)
-    signal.signal(signal.SIGINT, _sig)
+    _install_stop_signals()
 
     advice_dir = (Path(cfg.repo) / cfg.advice_dir) if not Path(cfg.advice_dir).is_absolute() else Path(cfg.advice_dir)
     advice_dir.mkdir(parents=True, exist_ok=True)
@@ -2405,7 +2679,8 @@ def main(argv: list[str] | None = None) -> int:
                     entry = _review(cfg.repo, "commit", sha, show, cfg, advice_dir)
                     dispatched += 1  # §3067 — a `_review` call is the unit the budget counts
                     # §3138 — a review STOPPED mid-split is not a review: never anchor past it.
-                    if entry is not None and (entry.get("split") or {}).get("stopped"):
+                    # §2.37 (c) — nor one whose only part was stopped in flight.
+                    if entry is not None and _was_stopped(entry):
                         break
                     if entry is not None and entry.get("driver_exit"):
                         # §2089 — an ACCOUNT-level failure is charged to NOBODY. Spending
@@ -2511,7 +2786,7 @@ def main(argv: list[str] | None = None) -> int:
                     wt_entry = _review(cfg.repo, "worktree", h, diff, cfg, advice_dir)
                     # §3138 — nor may a STOPPED review retire the diff it only half read.
                     if not (wt_entry is not None and (wt_entry.get("driver_exit")
-                                                      or (wt_entry.get("split") or {}).get("stopped"))):
+                                                      or _was_stopped(wt_entry))):
                         last_wt_hash = h
                     last_wt_review = time.time()
             # §833 — retention runs INSIDE the try: a prune failure (a racing

@@ -16,6 +16,7 @@
 #   - file missing  → synchronous fetch, the file is written, the first ~9,000 chars are ALSO
 #                     printed so this session is not blind
 #   - any failure   → exactly one line naming `get_central_instructions`
+#   - EUGO_REVIEW_SUBPROCESS set → silent exit 0: no fetch, no write, no output (§2.38 a2)
 #   - an errexit or xtrace INHERITED through BASH_ENV is disarmed first — the bearer never
 #     reaches a trace (§3142)
 #   - the bearer is sent only to an https EUGO_KB_EDGE_URL whose host is the default's or is
@@ -35,6 +36,14 @@ trap - ERR
 set -u
 exec </dev/null
 
+# §2.38 (a2) — A REVIEWER IS NOT A SESSION. `codex_review.py` spawns the `claude -p` reviewer
+# with `cwd=<the reviewed repo>` and EUGO_REVIEW_SUBPROCESS=1, so this SessionStart hook ran at
+# the start of every review: a bearer-carrying fetch and a write into the REVIEWED tree's
+# .claude/rules/. The same guard as the kit siblings that key on the marker (§2121).
+if [ -n "${EUGO_REVIEW_SUBPROCESS:-}" ]; then
+  exit 0
+fi
+
 ROOT="${CLAUDE_PROJECT_DIR:-.}"
 RULES_DIR="$ROOT/.claude/rules"
 RULES="$RULES_DIR/eugo-central.md"
@@ -43,6 +52,14 @@ EDGE_DEFAULT="https://kb.eugo.io:8443"
 EDGE="${EUGO_KB_EDGE_URL:-$EDGE_DEFAULT}"
 PY="/opt/miniforge3/envs/eugo_kb/bin/python"
 FIRST_SESSION_CHARS=9000
+# §1.114 — both tmp names start EMPTY: `cleanup_tmps` (the EXIT trap of every path that holds one) may
+# run before either is assigned, and `set -u` would stop it on an unbound name.
+TMP=""
+RULES_TMP=""
+cleanup_tmps() {
+  if [ -n "$TMP" ]; then rm -f "$TMP" 2>/dev/null; fi
+  if [ -n "$RULES_TMP" ]; then rm -f "$RULES_TMP" 2>/dev/null; fi
+}
 
 fallback() {
   printf 'eugo-kb central instructions were NOT auto-injected (%s): call the eugo-kb tool get_central_instructions before your first substantive step.\n' "$1"
@@ -158,9 +175,11 @@ write_rules_from() { # atomic: tmp in the same dir, then rename; WORLD-READABLE 
   # rules .md, which Claude Code loads natively as instructions.
   chmod a+rx,o-w "$RULES_DIR" 2>/dev/null
   # The tmp name is GLOBAL, not `local`: the EXIT trap runs after this function returns.
-  # The trap is armed HERE, not at top level, because the `( … ) &` refresh subshell does
-  # not inherit a top-level EXIT trap. Without it an interrupt, a failed write or a failed
-  # mv left the tmp inside the repo (eugo-grpc G017, protomolecule F521(a)).
+  # The trap is armed HERE as well as by each caller, because the `( … ) &` refresh subshell
+  # does not inherit a top-level EXIT trap. Without it an interrupt, a failed write or a failed
+  # mv left the tmp inside the repo (eugo-grpc G017, protomolecule F521(a)). §1.114 — it is
+  # `cleanup_tmps`, which removes the caller's fetch tmp too: `trap … EXIT` REPLACES the earlier
+  # trap, so a trap naming only $RULES_TMP dropped $TMP for the rest of the run.
   # §3142 — the tmp is CREATED by the write itself, O_EXCL (`set -C`) at 0644 (`umask 022`),
   # under an unpredictable name that `mktemp -u` only picks, and afterwards it is only renamed:
   # never copied onto, reopened or chmod'ed. The old `.eugo-central.md.$$.tmp` was predictable,
@@ -172,7 +191,7 @@ write_rules_from() { # atomic: tmp in the same dir, then rename; WORLD-READABLE 
   # A full-path template with trailing X's, like the TMP line below: BSD mktemp replaces only
   # trailing X's.
   RULES_TMP="$(mktemp -u "$RULES_DIR/.eugo-central.md.tmp.XXXXXX" 2>/dev/null)" || return 1
-  trap 'rm -f "$RULES_TMP" 2>/dev/null' EXIT
+  trap cleanup_tmps EXIT
   # §1.100 — `-T` (GNU) / `-h` (BSD): rename ONTO $RULES, never into a directory it names. The
   # `-d` refusal above cannot close the window between that test and this rename: a symlink to a
   # directory planted there in between made plain `mv -f` move the tmp INTO that directory and
@@ -183,19 +202,28 @@ write_rules_from() { # atomic: tmp in the same dir, then rename; WORLD-READABLE 
 }
 
 REASON="unknown"
-TMP="$(mktemp "${TMPDIR:-/tmp}/eugo-central.XXXXXX" 2>/dev/null)" || fallback "cannot create a temp file"
+# §1.114 (run 1226; operator ruling 2026-09-26) — the fetch tmp is created INSIDE each branch, each
+# with its own EXIT trap armed first. It was created once, up here, with no trap: a hook killed
+# mid-fetch (a SessionStart timeout sends SIGTERM) left `eugo-central.XXXXXX` in $TMPDIR, and so did
+# one killed after `write_rules_from`'s trap, which named only its own tmp. The background refresh
+# makes its OWN tmp: a top-level trap in the parent would unlink the file that subshell is still
+# using when the parent reaches `exit 0`.
 
 if [ -f "$RULES" ]; then
   # Present: this session loads it natively already. Refresh for the NEXT session in the
   # background (never on the critical path) and say so.
   size="$(wc -c < "$RULES" 2>/dev/null | tr -d ' ')"
   printf 'eugo-kb central instructions: loaded natively from .claude/rules/eugo-central.md (%s bytes; refreshing in the background for the next session).\n' "${size:-?}"
-  ( fetch_into "$TMP" && write_rules_from "$TMP"; rm -f "$TMP" ) >/dev/null 2>&1 &
+  ( trap cleanup_tmps EXIT
+    TMP="$(mktemp "${TMPDIR:-/tmp}/eugo-central.XXXXXX" 2>/dev/null)" || exit 0
+    fetch_into "$TMP" && write_rules_from "$TMP"; rm -f "$TMP" ) >/dev/null 2>&1 &
   exit 0
 fi
 
 # Missing (a machine's first session): fetch now, write the file, and print the head so
 # this session is not blind — rules are loaded at launch, before hooks run.
+trap cleanup_tmps EXIT
+TMP="$(mktemp "${TMPDIR:-/tmp}/eugo-central.XXXXXX" 2>/dev/null)" || fallback "cannot create a temp file"
 if fetch_into "$TMP"; then
   # The success line prints ONLY when the write succeeded; otherwise $REASON is printed
   # (eugo-grpc G013 — it used to be set here and never read, under an unconditional claim).

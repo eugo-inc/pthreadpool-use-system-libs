@@ -108,7 +108,8 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-# This repo root (/opt/eugo/athena) — `.claude/scripts/watch_drain.py`.parents[2].
+# The repo this script is INSTALLED in — `<repo>/.claude/scripts/watch_drain.py`.parents[2].
+# §2.37 (g): athena for athena's own copy, the consumer for every installed one.
 REPO_ROOT = str(Path(__file__).resolve().parents[2])
 DEFAULT_ADVICE_DIR = ".adversarial-review/watch"
 #: The installed daemon next to this script — the mtime the stale-daemon check compares.
@@ -157,6 +158,23 @@ def account_is_down(obj: dict) -> bool:
     texts = [str(r.get("note") or "") for r in (obj.get("results") or []) if isinstance(r, dict)]
     texts.append(str(obj.get("driver_stderr_tail") or ""))
     return any(marker in t.lower() for t in texts for marker in ACCOUNT_DOWN_MARKERS)
+
+
+#: §2.37 (f) — MIRRORS codex_watch._TERMINAL_MARKERS (pinned equal by test_watch_drain.py): a
+#: note saying the diff was too long for the reviewer, which no retry can change.
+TERMINAL_MARKERS = ("prompt is too long",)
+
+
+def is_terminal(obj: dict) -> bool:
+    """§2.37 (f), report:111 — every OWED verdict on the entry is an ERROR saying the diff was too
+    long to review: an unreviewed GAP, not a finding. False when there is none, and when any
+    owed verdict is something else (a real finding, an ordinary error)."""
+    owed = [r for r in (obj.get("results") or [])
+            if isinstance(r, dict) and r.get("verdict") in OWED_VERDICTS]
+    return bool(owed) and all(
+        r.get("verdict") == "ERROR"
+        and any(marker in str(r.get("note") or "").lower() for marker in TERMINAL_MARKERS)
+        for r in owed)
 def account_hold_until(advice_dir: Path, now: float | None = None) -> str:
     """§3122 — the persisted quota hold (`.account-down`, written by codex_watch) as
     `YYYY-MM-DDTHH:MM:SSZ` while in force, else `-`. Read with the same fail-OPEN rule as
@@ -1352,6 +1370,9 @@ def cmd_status(args: argparse.Namespace, advice_dir: Path) -> int:
     unresolved = [e for e in owed if not hides(resolved.lookup(e))]
     claimed = sum(1 for e in owed if claim_is_live(resolved.lookup(e)))
     down_unresolved = sum(1 for e in unresolved if account_is_down(e.obj))
+    # §2.37 (f) — DISJOINT from the outages: an entry that names both counts as an outage.
+    terminal_unresolved = sum(1 for e in unresolved
+                              if is_terminal(e.obj) and not account_is_down(e.obj))
     # §3043 — who wrote each entry, and whose entries carry an ERROR verdict.
     # §3103 — how many DISTINCT sessions this ledger holds, and how many entries carry no
     # session at all. The second number is the one that matters while the stamp rolls out:
@@ -1385,10 +1406,13 @@ def cmd_status(args: argparse.Namespace, advice_dir: Path) -> int:
         f"other_verdicts={other} no_result={no_result}",
         # §3122 (§1.88) — the HONEST headline beside the two it refines: an unresolved entry
         # whose note is an account outage is a review that never happened, not a finding.
-        # Counted over `unresolved` (claims already hidden), so work + account_down ==
-        # unresolved always; `owed`/`unresolved` keep their meaning for every other reader.
-        f"owed={len(owed)} unresolved={len(unresolved)} unresolved_work={len(unresolved) - down_unresolved} "
-        f"unresolved_account_down={down_unresolved}",
+        # Counted over `unresolved` (claims already hidden), so work + account_down +
+        # terminal == unresolved always; `owed`/`unresolved` keep their meaning for every
+        # other reader. §2.37 (f) — a diff too long to review leaves `unresolved_work` the
+        # same way (ruled at run 1227, R12): it is a gap, not a finding.
+        f"owed={len(owed)} unresolved={len(unresolved)} "
+        f"unresolved_work={len(unresolved) - down_unresolved - terminal_unresolved} "
+        f"unresolved_account_down={down_unresolved} unresolved_terminal={terminal_unresolved}",
         # §3122 — a persisted quota hold is invisible otherwise: reviewing is paused until it.
         f"account_hold_until={account_hold_until(advice_dir)}",
         f"sessions={len(sessions)} unowned={unowned} unowned_owed={unowned_owed}",

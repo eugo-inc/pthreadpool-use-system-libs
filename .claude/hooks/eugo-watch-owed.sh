@@ -15,6 +15,7 @@
 #   - stdin (Claude Code's hook JSON) is closed before any child runs
 #   - exactly ONE line on stdout, always — silence would be indistinguishable from a
 #     hook that no longer runs, which is the failure this whole file argues against
+#   - the ONE exception: EUGO_REVIEW_SUBPROCESS set -> exit 0 with no line (§2.38 a2)
 #   - the drain is READ-ONLY here: `status`, never `rotate`
 #   - a missing repo, a missing drain script or a broken one still prints one line
 #   - bash 3.2 safe (macOS): no mapfile, no ${x,,}, no associative arrays
@@ -33,6 +34,14 @@ set +eE +o pipefail
 trap - ERR
 set -u
 exec </dev/null
+
+# §2.38 (a2) — A REVIEWER IS NOT A SESSION TO INFORM. `codex_review.py` spawns the `claude -p`
+# reviewer with `cwd=<the reviewed repo>` and EUGO_REVIEW_SUBPROCESS=1, so this SessionStart hook
+# ran a `watch_drain.py status` (a `git rev-list`) at the start of every review and put the
+# owed-verdict line into the reviewer's context. The same guard as the kit siblings (§2121).
+if [ -n "${EUGO_REVIEW_SUBPROCESS:-}" ]; then
+  exit 0
+fi
 
 ROOT="${CLAUDE_PROJECT_DIR:-.}"
 DRAIN="$ROOT/.claude/scripts/watch_drain.py"
@@ -241,6 +250,14 @@ OUTAGES=""
 case "$WORK:$DOWN" in
   *[!0-9:]*|:*|*:) WORK="$UNRESOLVED" ;;
   *) [ "$DOWN" -gt 0 ] && OUTAGES=" (+$DOWN failed on account quota, not findings)" ;;
+esac
+# §2.37 (f) — a diff too long for the reviewer also leaves `unresolved_work` (ruled R12, run
+# 1227): an unreviewed gap, not a finding. An older drain prints no such field: nothing added.
+TOOLONG="$(field unresolved_terminal)"   # not `TERM`: that name is the exported terminal type
+case "$TOOLONG" in
+  ''|*[!0-9]*) ;;
+  0) ;;
+  *) OUTAGES="$OUTAGES (+$TOOLONG too long for the reviewer: unreviewed gaps, not findings)" ;;
 esac
 case "$UNRESOLVED" in
   "") say "could not read the owed count from watch_drain.py status — $REVIEW$ABANDON_NOTE" ;;

@@ -37,6 +37,7 @@
 #     systemMessage is the field that shows the user a warning without keeping the model going
 #   - the REAL index is never written — concurrent sessions share it (see the index notes)
 #   - not a work tree, a clean tree, or EUGO_WIP_SNAPSHOT=off -> no file
+#   - EUGO_REVIEW_SUBPROCESS set -> no file and no output: a reviewer has no work to save (§1.128)
 #   - a diff identical to the newest patch's -> no file (the header differs by construction)
 #   - untracked files over 5 MB, nested repositories and submodules with local work are left
 #     out and named; over 50 MB the untracked files go, biggest first, until the patch fits,
@@ -58,6 +59,15 @@ exec </dev/null
 case "${EUGO_WIP_SNAPSHOT:-}" in
   off|OFF|Off) exit 0 ;;
 esac
+
+# §1.128 — A REVIEWER IS NOT A SESSION WITH WORK TO SAVE. `codex_review.py` spawns the
+# `claude -p` reviewer with `cwd=<the reviewed repo>` and EUGO_REVIEW_SUBPROCESS=1, so this
+# Stop hook ran at the end of every review: whenever the reviewed tree was dirty, a snapshot
+# into the ring and its blobs into that repo's .git/objects. The same guard, in the same
+# form, as the three kit siblings that key on the marker (§2121).
+if [ -n "${EUGO_REVIEW_SUBPROCESS:-}" ]; then
+  exit 0
+fi
 
 # C collation: the newest patch is the last name in glob order, and the stamps only sort
 # that way byte-wise. GIT_OPTIONAL_LOCKS=0: plain `git status` opportunistically REWRITES
