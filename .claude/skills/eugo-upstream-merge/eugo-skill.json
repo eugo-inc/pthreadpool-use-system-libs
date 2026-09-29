@@ -4,9 +4,9 @@
   "managed_by": "adapter",
   "adapts": "eugo-upstream-merge-base",
   "base_tree_hash": "a475d86d303df234d7b1bd73ad3ba88e199ffd9d7106da62cdb6837e973c046d",
-  "base_source_commit": "885f12df5b5e3defc53f56466379b01a05d7dc5b",
+  "base_source_commit": "7d98dd156d50cf0f8c10cd1afbaae5a2bbaca27a",
   "generated_by": "eugo-skills pull --as-adapter",
-  "generated_at": "2026-09-29T09:34:24+00:00",
+  "generated_at": "2026-09-29T23:18:07+00:00",
   "params": {
     "upstream_ref": "upstream/main",
     "build_cmd": "configure with `-DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_LIBRARY_TYPE=shared` (the canonical flags from eugo-build-and-test) and build + install",

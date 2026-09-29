@@ -4,9 +4,9 @@
   "managed_by": "adapter",
   "adapts": "eugo-build-and-test-base",
   "base_tree_hash": "6047a17544f4fcfb03255829c9790c3c9363d4073a4c6e6eef3e97e542833f2a",
-  "base_source_commit": "885f12df5b5e3defc53f56466379b01a05d7dc5b",
+  "base_source_commit": "7d98dd156d50cf0f8c10cd1afbaae5a2bbaca27a",
   "generated_by": "eugo-skills pull --as-adapter",
-  "generated_at": "2026-09-29T09:34:24+00:00",
+  "generated_at": "2026-09-29T23:18:06+00:00",
   "params": {
     "configure_cmd": "`cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=\"$PWD/out\" -DPTHREADPOOL_LIBRARY_TYPE=shared -DPTHREADPOOL_SYNC_PRIMITIVE=futex -DPTHREADPOOL_ALLOW_DEPRECATED_API=ON -DUSE_SYSTEM_LIBS=ON -DUSE_SYSTEM_FXDIV=ON -DPTHREADPOOL_BUILD_TESTS=OFF -DPTHREADPOOL_BUILD_BENCHMARKS=OFF` in the eugo container (it has the system FXdiv package — protomolecule native/fxdiv, from the ConnorBaker/FXdiv fork that adds an installable CMake config; outside the container `FIND_PACKAGE(FXdiv REQUIRED)` fails — install FXdiv the same way, or drop USE_SYSTEM_FXDIV to let CMake download it: network required and it bypasses the system-libs path, fine for compile checks only)",
     "artifacts_note": "install-tree checklist under the prefix (libdir may be lib or lib64): `lib*/libpthreadpool.so`; `include/pthreadpool.h`; `lib*/cmake/pthreadpool/pthreadpool-config.cmake` AND `pthreadpoolTargets.cmake` (the config is generated from `cmake/pthreadpool-config.cmake.in`, which must keep its `find_dependency(FXdiv)` line)",

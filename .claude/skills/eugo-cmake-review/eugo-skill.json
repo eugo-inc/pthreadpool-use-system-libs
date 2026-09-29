@@ -4,9 +4,9 @@
   "managed_by": "adapter",
   "adapts": "eugo-cmake-review-base",
   "base_tree_hash": "0effeb9466b495ef4f6ca9659a0e56023ec880a58b8bfd8f65fb2d71d646a22f",
-  "base_source_commit": "885f12df5b5e3defc53f56466379b01a05d7dc5b",
+  "base_source_commit": "7d98dd156d50cf0f8c10cd1afbaae5a2bbaca27a",
   "generated_by": "eugo-skills pull --as-adapter",
-  "generated_at": "2026-09-29T09:34:24+00:00",
+  "generated_at": "2026-09-29T23:18:06+00:00",
   "params": {
     "legacy_marker_forms": "",
     "audit_cmd": "",
