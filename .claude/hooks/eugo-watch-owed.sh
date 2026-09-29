@@ -259,6 +259,11 @@ case "$TOOLONG" in
   0) ;;
   *) OUTAGES="$OUTAGES (+$TOOLONG too long for the reviewer: unreviewed gaps, not findings)" ;;
 esac
+# §2.45 (run 1231) — in a cloud session the review hooks dispatch nothing unless
+# EUGO_REVIEW_IN_CLOUD=1, so "review wired" would read as "this session is reviewed". Say so.
+if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] && [ "${EUGO_REVIEW_IN_CLOUD:-}" != "1" ]; then
+  REVIEW="$REVIEW; review OFF in this cloud session (EUGO_REVIEW_IN_CLOUD=1 turns it on)"
+fi
 case "$UNRESOLVED" in
   "") say "could not read the owed count from watch_drain.py status — $REVIEW$ABANDON_NOTE" ;;
   0) say "nothing owed; $REVIEW$ABANDON_NOTE" ;;

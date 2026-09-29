@@ -21,7 +21,7 @@
 #   (b) normalises (repeated and trailing slashes, leading `./`, `.`/`..` components) to a
 #       protected root, or to one followed by `/*` or `/.*`: / . .. (and any run of ..) * .* ~
 #       /repo /opt /opt/eugo /opt/eugo/<one component> (a whole checkout) /home /home/<user>
-#       /root — `~user` counts as a home. find with no starting point starts at `.`. A find
+#       one component under /home/user not starting with `.` (a cloud session's checkout, §2.45) /root — `~user` counts as a home. find with no starting point starts at `.`. A find
 #       whose delete only reaches NAMED entries — a positive -name/-path/-regex test before the
 #       action, its literal pattern holding a letter or digit, and no -o, `,` or parentheses
 #       (`find . -name __pycache__ -exec rm -rf {} +`) — may start at `.` or another RELATIVE
@@ -111,7 +111,8 @@ import json, posixpath, re, sys
 NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 GUARDED_RE = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+):\?")     # the body of ${X:?…}; ${X?…} passes a SET, EMPTY X
 ASSIGN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=")
-HOME_RE = re.compile(r"(?:/opt/eugo|/home)/[^/]+(?:/\*)?")
+# a repo under /home/user is a cloud checkout; a dot-folder there (.cache, .venv) is not one (audit-w260 #1)
+HOME_RE = re.compile(r"(?:(?:/opt/eugo|/home)/[^/]+|/home/user(?:/[^/.][^/]*))(?:/\*)?")
 TILDE_RE = re.compile(r"~[^/]*(?:/\*)?")
 PROTECTED = frozenset(("/", "/*", ".", "..", "*", ".*", "~", "/repo", "/repo/*", "/opt", "/opt/eugo", "/opt/eugo/*",
                        "/home", "/root"))
@@ -612,8 +613,8 @@ def operand_verdict(a, what, env, roots=True, named=False):
     if roots and (is_root(p, b.tilde) or (p.endswith(("/*", "/.*")) and is_root(p.rsplit("/", 1)[0] or "/", b.tilde))):
         bound = "".join(" (`%s=%s` earlier in this command)" % (n, show(env[n])) for n in used)
         return ("eugo-deletion-guard: blocked %s of `%s`%s — it resolves to `%s`, a protected root (the "
-                "filesystem root, a home, /repo or a whole /opt/eugo checkout, or the current/parent "
-                "directory). Name the literal path below it that you mean (`./build`, `find ./tools …`). %s"
+                "filesystem root, a home, /repo, a whole /opt/eugo checkout or a cloud checkout under /home/user, or "
+                "the current/parent directory). Name the literal path below it that you mean (`./build`, `find ./tools …`). %s"
                 % (what, show(a.text), bound, show(p), FIX))
     return None
 

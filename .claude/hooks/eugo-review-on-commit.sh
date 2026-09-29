@@ -88,6 +88,15 @@ if [ -n "${EUGO_REVIEW_SUBPROCESS:-}" ]; then
   exit 0
 fi
 
+# §2.45 (run 1231) — A CLOUD SESSION DISPATCHES NO REVIEW UNLESS ASKED (operator ruling
+# 2026-09-27). `CLAUDE_CODE_REMOTE=true` is the signal athena's `session-start.sh` keys on.
+# A cloud session pushes its own branch; once a local session merges it, its commits reach
+# HEAD with no ledger entry and the local watcher selects them (`--since-ledger`), so off
+# here loses no review. `EUGO_REVIEW_IN_CLOUD=1` (set in the cloud environment) turns it on.
+if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] && [ "${EUGO_REVIEW_IN_CLOUD:-}" != "1" ]; then
+  exit 0
+fi
+
 # Nothing installed to review with, or nowhere to record it: stay silent and get out.
 [ -f "$WATCH" ] || exit 0
 [ -d "$ADVICE" ] || exit 0
@@ -102,7 +111,10 @@ fi
 if [ "$FULL" -eq 0 ]; then
   HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)" || exit 0
   [ -n "$HEAD_SHA" ] || exit 0
-  if tail -c 20000 "$ADVICE/advice.jsonl" 2>/dev/null | grep -qF "$HEAD_SHA"; then
+  # ANCHORED on the entry's `ref` (the daemon writes `json.dumps` default separators): since run
+  # 1231 an entry also carries `invariants.rev`, a full sha — the reviewed commit's PARENT, or HEAD
+  # itself for a worktree review — so a bare sha match read an UNREVIEWED HEAD as reviewed.
+  if tail -c 20000 "$ADVICE/advice.jsonl" 2>/dev/null | grep -qF "\"ref\": \"$HEAD_SHA\""; then
     exit 0          # HEAD is already reviewed; anything older is the backstop's job
   fi
 else

@@ -31,6 +31,7 @@ gesture, unchanged) and `STOP.worktree` the worktree-only one, so a turn-end one
 from __future__ import annotations
 
 import argparse
+import atexit
 import calendar
 import contextlib
 import fcntl
@@ -43,6 +44,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1824,6 +1826,208 @@ def _dispatch_part(argv: list[str], advice_dir: Path):
                            stopped=stopped)
 
 
+#: §2.37 (i) (run 1231) — WHOSE RULES, AT WHICH REVISION. The driver resolves the triage
+#: invariants from `--repo`'s WORKTREE (`codex_review._resolve_invariants`), so a commit that
+#: rewrote them was judged by the rules it introduced — it could exempt itself — and a commit
+#: reviewed after later ones by rules newer than itself. Ruled 2026-09-27, widened from "only a
+#: commit that edits them": EVERY commit is judged by its PARENT's rules, a root commit by its own
+#: tree, the worktree lane by HEAD's. `_invariants_at` reads them from git objects in the driver's
+#: order and `_review` hands the text over as a materialized `--invariants-file` (a new driver flag
+#: would break epstein-drive's `opus_review.py`). Mirrors of `codex_review.INVARIANTS_FILE_REL` and
+#: `_ADAPTER_SIDECAR_REL`; a parity test holds the two resolvers to one answer on a clean tree.
+_INVARIANTS_FILE_REL = ".adversarial-review/INVARIANTS.md"
+_REVIEW_SIDECAR_REL = ".claude/skills/eugo-adversarial-review/eugo-skill.json"
+#: a full object name, sha1 or sha256 — NOT §2202's `_FULL_SHA` above, which is the anchored sha1
+#: `git log` boundary `_superseded` parses; rebinding that name here (run 1231 B1) switched that
+#: parse to this pattern, caught by test_engine_has_no_shadowed_constants at checkpoint 1.
+_REV_SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+#: d13 — the driver's own source line. Since (i) it reads `explicit` on every watched review, which
+#: says nothing, so the entry records the watcher's answer beside it.
+_DRIVER_INVARIANTS_LINE = re.compile(r"\[codex_review\] invariants: (.*)")
+
+
+def _git_rc(repo: str, *args: str, timeout: int = 30) -> tuple[int, bytes]:
+    """`git <args>` -> (returncode, stdout BYTES). Unlike `_git`, an empty blob and a failed read
+    are told apart, and the caller decodes strictly, as the driver reads the same file. Never
+    raises: no git, no such directory or a timeout is returncode -1."""
+    try:
+        out = subprocess.run(["git", *args], cwd=repo, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return -1, b""
+    data = out.stdout or b""
+    if isinstance(data, str):                     # a test double that speaks text
+        data = data.encode("utf-8", "surrogateescape")
+    return out.returncode, data
+
+
+def _rules_rev(repo: str, kind: str, ref: str) -> str | None:
+    """The revision whose rules judge this review: a commit's first parent, a root commit's own
+    tree, HEAD for the worktree lane. None when git cannot name one (not a repository, an unknown
+    ref, an unborn HEAD)."""
+    rc, out = _git_rc(repo, "rev-list", "--parents", "-n", "1",
+                      "HEAD" if kind == "worktree" else ref, "--")
+    shas = out.decode("ascii", "replace").split() if rc == 0 else []
+    if not shas or not all(_REV_SHA.fullmatch(s) for s in shas):
+        return None
+    return shas[0] if kind == "worktree" or len(shas) == 1 else shas[1]
+
+
+def _unlink_quietly(path: str) -> None:
+    """Remove a materialized rules file; already gone (the explicit removal ran first) is fine."""
+    with contextlib.suppress(OSError):
+        os.unlink(path)
+
+
+class _RevUnusable(Exception):
+    """The committed rules cannot be read FAITHFULLY from git here, so `_review` forwards nothing
+    and the driver resolves them from the worktree, as before run 1231. Deliberately not an
+    OSError: `_invariants_at`'s "unreadable → next source" handlers must not swallow it, or a
+    failed read would forward an EMPTY rules file as if the revision declared none."""
+
+
+def _tree_entry(repo: str, rev: str, rel: str) -> tuple[str, str, str] | None:
+    """(mode, type, oid) of `rel` in `rev`'s tree, or None when the tree has no such path. Reads
+    TREES only (`ls-tree`), so it answers in a blob-less partial clone whose remote is gone —
+    `cat-file -t <rev>:<rel>` fails there exactly as it does for a missing path (the watch's
+    review of run 1231's B1, correctness lens)."""
+    rc, out = _git_rc(repo, "ls-tree", "-z", rev, "--", rel)
+    if rc != 0:
+        raise _RevUnusable(f"git ls-tree {rev[:12]} -- {rel} exited {rc}")
+    for record in out.split(b"\0"):
+        meta, _, path = record.partition(b"\t")
+        fields = meta.decode("ascii", "replace").split()
+        if len(fields) == 3 and path.decode("utf-8", "surrogateescape") == rel:
+            return fields[0], fields[1], fields[2]
+    return None
+
+
+def _blob_at(repo: str, rev: str, rel: str) -> bytes | None:
+    """The file `rel` as committed at `rev`, or None when that revision has no such FILE (a
+    directory or a submodule there is none, as the driver's `_is_file` says). Existence comes
+    from the tree, never from an empty read: an empty blob is a present, empty file.
+
+    Raises `_RevUnusable` where git holds something other than the content the driver would
+    read: a SYMLINK on the path (git stores the link text; the driver follows the link), or a
+    blob git cannot produce (a partial clone offline)."""
+    entry = _tree_entry(repo, rev, rel)
+    if entry is None:
+        parts = rel.split("/")
+        for depth in range(1, len(parts)):
+            ancestor = _tree_entry(repo, rev, "/".join(parts[:depth]))
+            if ancestor is not None and ancestor[0] == "120000":
+                raise _RevUnusable(f"{'/'.join(parts[:depth])} is a symlink in {rev[:12]}'s tree")
+        return None
+    mode, kind, oid = entry
+    if mode == "120000":
+        raise _RevUnusable(f"{rel} is a symlink in {rev[:12]}'s tree")
+    if kind != "blob":
+        return None
+    rc, data = _git_rc(repo, "cat-file", "blob", oid)
+    if rc != 0:
+        raise _RevUnusable(f"git cat-file blob {oid[:12]} ({rel} at {rev[:12]}) exited {rc}")
+    return data
+
+
+def _invariants_at(repo: str, rev: str) -> tuple[str, str, list[str]]:
+    """(text, source, warnings) — the rules committed at `rev`, in `codex_review._resolve_invariants`'s
+    order and with its source names: INVARIANTS.md (authoritative when present, EVEN EMPTY), then
+    the review sidecar's `params.invariants` (a string, or a list joined one item per line) plus
+    the lists of the adapters its `invariants_from` names (§2.37 (ii)), else none. A bad file or
+    sidecar is ONE warning and falls through, as in the driver."""
+    warnings: list[str] = []
+    try:
+        blob = _blob_at(repo, rev, _INVARIANTS_FILE_REL)
+        if blob is not None:
+            return blob.decode("utf-8"), _INVARIANTS_FILE_REL, warnings
+    except (OSError, UnicodeDecodeError) as exc:
+        warnings.append(f"WARNING: {_INVARIANTS_FILE_REL} at {rev[:12]} unreadable ({exc}); "
+                        "trying the next invariants source.")
+    try:
+        blob = _blob_at(repo, rev, _REVIEW_SIDECAR_REL)
+        if blob is None:
+            return "", "none", warnings
+        data = json.loads(blob.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        warnings.append(f"WARNING: {_REVIEW_SIDECAR_REL} at {rev[:12]} unreadable ({exc}); "
+                        "reviewing with no invariants block.")
+        return "", "none", warnings
+    params = data.get("params") if isinstance(data, dict) else None
+    params = params if isinstance(params, dict) else {}
+    value = params.get("invariants")
+    own_text = _invariants_text(value)
+    if own_text is None and value is not None:
+        what = type(value).__name__
+        if isinstance(value, list):
+            what = "list holding " + ", ".join(
+                sorted({type(v).__name__ for v in value if not isinstance(v, str)}))
+        warnings.append(f"WARNING: {_REVIEW_SIDECAR_REL} at {rev[:12]} params.invariants is a "
+                        f"{what}, not a string or a list of strings; reviewing with no "
+                        "invariants block.")
+        return "", "none", warnings
+    pulled, names = _invariants_from_at(repo, rev, params, warnings)
+    text = "\n".join(t for t in (own_text or "", *pulled) if t.strip())
+    if not text.strip():
+        return "", "none", warnings
+    source = "adapter param" + (f" + invariants_from ({', '.join(names)})" if names else "")
+    return text, source, warnings
+
+
+def _invariants_text(value: object) -> str | None:
+    """A sidecar `invariants` value as text (a string, or a list of strings joined one per line),
+    or None when it is neither. Mirrors `codex_review._invariants_text`."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return "\n".join(value)
+    return None
+
+
+#: §2.37 (ii) (run 1231) — mirrors `codex_review._ADAPTER_NAME` / `_invariants_from`.
+_ADAPTER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+
+def _invariants_from_at(repo: str, rev: str, params: dict,
+                        warnings: list[str]) -> tuple[list[str], list[str]]:
+    """`codex_review._invariants_from`, read from `rev`'s tree: (texts, names) of the adapters
+    `params.invariants_from` names, each bad one a warning and skipped. A named sidecar git holds
+    unfaithfully (a symlink, an unreadable blob) raises `_RevUnusable`, like every other read."""
+    names = params.get("invariants_from")
+    if names is None:
+        return [], []
+    if not (isinstance(names, list) and all(isinstance(n, str) for n in names)):
+        warnings.append(f"WARNING: {_REVIEW_SIDECAR_REL} at {rev[:12]} params.invariants_from is "
+                        "not a list of adapter names; ignored.")
+        return [], []
+    texts: list[str] = []
+    used: list[str] = []
+    for name in names:
+        if not _ADAPTER_NAME.fullmatch(name):
+            warnings.append(f"WARNING: invariants_from names {name!r}, which is not an adapter "
+                            "name; skipped.")
+            continue
+        rel = f".claude/skills/{name}/eugo-skill.json"
+        blob = _blob_at(repo, rev, rel)
+        if blob is None:
+            warnings.append(f"WARNING: invariants_from names {name!r}, which has no sidecar at "
+                            f"{rel} in {rev[:12]}; skipped.")
+            continue
+        try:
+            data = json.loads(blob.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            warnings.append(f"WARNING: invariants_from: {rel} at {rev[:12]} unreadable ({exc}); "
+                            "skipped.")
+            continue
+        params_of = data.get("params") if isinstance(data, dict) else None
+        text = _invariants_text(params_of.get("invariants")) if isinstance(params_of, dict) else None
+        if text is None or not text.strip():
+            warnings.append(f"WARNING: invariants_from names {name!r}, whose sidecar declares no "
+                            "invariants; skipped.")
+            continue
+        texts.append(text)
+        used.append(name)
+    return texts, used
+
+
 def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namespace,
             advice_dir: Path) -> dict | None:
     """Review one increment via the driver; append advice; return the entry (or None if empty diff)."""
@@ -1875,8 +2079,45 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
     # repo's OWN block from `--repo` (athena's too, from its own INVARIANTS.md since
     # run 1229), so the served hooks, which forward none, are covered; a file given
     # here still wins.
+    # §2.37 (i) (run 1231) — but `--repo` is the WORKTREE, so without a file the rules were
+    # whatever is on disk now, not those the reviewed change was written under. The rules at
+    # `_rules_rev` are materialized beside the tick's diff and forwarded — an EMPTY file when
+    # that revision declares none, so the driver states the neutral line instead of reading
+    # the worktree. Only when git cannot name the revision is nothing forwarded (the
+    # behaviour before this run). d13 — `inv_record` becomes the entry's `invariants` key.
+    inv_record: dict = {"source": "", "rev": None, "warnings": []}
+    rules_file = ""
     if getattr(cfg, "invariants_file", ""):
         argv_base += ["--invariants-file", cfg.invariants_file]
+        inv_record["source"] = "operator --invariants-file"
+    else:
+        rules_rev = _rules_rev(repo, kind, ref)
+        rules = None
+        why = ""
+        if rules_rev is None:
+            why = f"git could not name the revision whose rules judge {kind} {ref[:12]}"
+        else:
+            try:
+                rules = _invariants_at(repo, rules_rev)
+            except _RevUnusable as exc:
+                why = f"the rules at {rules_rev[:12]} cannot be read from git ({exc})"
+        if rules is None:
+            inv_record["source"] = "worktree"
+            inv_record["warnings"].append(f"WARNING: {why}; the driver resolved them from the "
+                                          "worktree.")
+        else:
+            rules_text, rules_source, rules_warnings = rules
+            # A TEMP file, never one in the tick dir: `review_watch_report` reads a capture that
+            # holds only its inputs (`diff.md`) as "no model output", and a second input file
+            # there made every failed review read as a success (B1's review, consumers lens).
+            fd, rules_file = tempfile.mkstemp(prefix="codex_watch-invariants-", suffix=".md")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(rules_text)
+            atexit.register(_unlink_quietly, rules_file)   # a raise mid-dispatch still cleans up
+            argv_base += ["--invariants-file", rules_file]
+            inv_record.update(source=rules_source, rev=rules_rev)
+            inv_record["warnings"].extend(rules_warnings)
+    driver_says: list[str] = []
     # §1244 — forward the ENGINE. The daemon used to be codex-only, which made it
     # unusable on a box where `codex login status` says `Not logged in`: every tick
     # returned ERROR and the exception handler below swallowed it, so hours of silence
@@ -1960,6 +2201,16 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
             if piece_exit:
                 tail = " | ".join((piece.stderr or "").strip().splitlines()[-3:])
                 tails.append(f"part {piece_label}: {tail}" if piece_label else tail)
+            else:
+                # d13 — an rc-0 run's stderr was dropped whole: keep its invariants line and its
+                # WARNING: lines on the entry, once each however many parts ran — never in
+                # `driver_stderr_tail`, which the outage scanners read.
+                for line in (getattr(piece, "stderr", "") or "").splitlines():
+                    said = _DRIVER_INVARIANTS_LINE.fullmatch(line.strip())
+                    if said and said.group(1) not in driver_says:
+                        driver_says.append(said.group(1))
+                    elif line.startswith("WARNING:") and line not in inv_record["warnings"]:
+                        inv_record["warnings"].append(line)
             part_results.extend(piece_results)
         results.extend(part_results)
         if stopped:
@@ -1996,7 +2247,14 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
             dispatched = index
             stopped = True
             break
+    if rules_file:
+        _unlink_quietly(rules_file)                 # every part has read it
     entry = {"ts": ts, "kind": kind, "ref": ref, "results": results}
+    # d13 — whose rules judged this review. `driver` is what the driver printed ("explicit"
+    # whenever a file was forwarded), "unknown" when no rc-0 part printed its line (a driver
+    # older than that line, or every part failed).
+    inv_record["driver"] = ", ".join(driver_says) or "unknown"
+    entry["invariants"] = inv_record
     if len(parts) > 1 or resplit:
         # §2178 — WHAT THE READER NEEDS TO KNOW THAT THE VERDICTS DO NOT SAY. Recorded as
         # a structured block rather than a new verdict string: `watch_drain`'s status line
@@ -2280,6 +2538,16 @@ def _append_entry(advice_dir: Path, entry: dict) -> None:
             f.write(json.dumps(entry) + "\n")
         with (advice_dir / "advice.md").open("a") as f:
             f.write(f"\n## {ts} · {kind} · {ref}\n")
+            # d13 (run 1231) — whose rules judged the review; entries written before it carry no
+            # key and render exactly as they always did.
+            inv = entry.get("invariants")
+            if isinstance(inv, dict):
+                inv_src = inv.get("source") or "unknown"
+                inv_rev = (inv.get("rev") or "no revision")[:12]
+                inv_drv = inv.get("driver") or "unknown"
+                f.write(f"- invariants: {inv_src} @ {inv_rev} (driver: {inv_drv})\n")
+                for w in inv.get("warnings") or []:
+                    f.write(f"  - {w}\n")
             for r in results:
                 f.write(f"- **{r['model']}**: {r['verdict']}\n")
                 if r.get("resolved_model", r["model"]) != r["model"]:
@@ -2414,9 +2682,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--invariants-file", default="",
                     help="file whose text is the triage-invariants block in the driver's "
                     "`code` prompt (forwarded verbatim to codex_review.py's --invariants-file). "
-                    "Without it the driver resolves the block from --repo: its "
+                    "Without it the watcher reads the rules as COMMITTED at the reviewed "
+                    "commit's parent (HEAD for a worktree review; a root commit's own tree): "
                     ".adversarial-review/INVARIANTS.md, else the review adapter's "
-                    "`invariants` param, else none")
+                    "`invariants` param, else none -- and forwards them as a file")
     ap.add_argument("--once", action="store_true", help="run a single tick then exit (the test hook)")
     ap.add_argument("--max-ticks", type=int, default=0, help="stop after N ticks (0 = unbounded)")
     ap.add_argument("--ignore-account-hold", action="store_true",

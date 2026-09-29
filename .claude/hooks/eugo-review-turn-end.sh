@@ -71,6 +71,15 @@ if [ -n "${EUGO_REVIEW_SUBPROCESS:-}" ]; then
   exit 0
 fi
 
+# §2.45 (run 1231) — A CLOUD SESSION IS NOT REVIEWED AT ITS TURN BOUNDARY UNLESS ASKED (operator
+# ruling 2026-09-27; `CLAUDE_CODE_REMOTE=true` is `session-start.sh`'s signal). The whole hook
+# stands down, not only the dispatch: with no worktree review of its own, whatever this would
+# surface is another session's finding. `EUGO_REVIEW_IN_CLOUD=1` turns it on, as for
+# `eugo-review-on-commit.sh`.
+if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] && [ "${EUGO_REVIEW_IN_CLOUD:-}" != "1" ]; then
+  exit 0
+fi
+
 # THE LOOP GUARD, and it comes first for a reason: if a blocking verdict is outstanding
 # and this hook blocked to report it, the agent's very next stop must be allowed through.
 case "$IN" in

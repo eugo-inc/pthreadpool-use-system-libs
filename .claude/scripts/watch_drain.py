@@ -895,6 +895,15 @@ def render_md(entry: dict) -> str:
     """
     ts, kind, ref, results = entry["ts"], entry["kind"], entry["ref"], entry["results"]
     out = [f"\n## {ts} · {kind} · {ref}\n"]
+    # d13 (run 1231) — the daemon's `invariants` record; absent on every entry written before it.
+    inv = entry.get("invariants")
+    if isinstance(inv, dict):
+        inv_src = inv.get("source") or "unknown"
+        inv_rev = (inv.get("rev") or "no revision")[:12]
+        inv_drv = inv.get("driver") or "unknown"
+        out.append(f"- invariants: {inv_src} @ {inv_rev} (driver: {inv_drv})\n")
+        for w in inv.get("warnings") or []:
+            out.append(f"  - {w}\n")
     for r in results:
         out.append(f"- **{r['model']}**: {r['verdict']}\n")
         if r.get("resolved_model", r["model"]) != r["model"]:
