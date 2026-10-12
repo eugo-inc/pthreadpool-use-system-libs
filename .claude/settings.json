@@ -2,7 +2,7 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup|resume|clear|compact",
+        "matcher": "startup|resume|clear|compact|fork",
         "hooks": [
           {
             "type": "command",
@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "startup|resume|clear|compact",
+        "matcher": "startup|resume|clear|compact|fork",
         "hooks": [
           {
             "type": "command",
@@ -22,7 +22,7 @@
         ]
       },
       {
-        "matcher": "startup|resume|clear|compact",
+        "matcher": "startup|resume|clear|compact|fork",
         "hooks": [
           {
             "type": "command",
@@ -37,7 +37,7 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-prompt-context.sh",
-            "timeout": 10
+            "timeout": 30
           }
         ]
       }
@@ -80,7 +80,7 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-prompt-context.sh",
-            "timeout": 10
+            "timeout": 30
           }
         ]
       }
@@ -92,7 +92,8 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-external-publish-guard.sh",
-            "timeout": 10
+            "timeout": 30,
+            "onFailure": "block"
           }
         ]
       },
@@ -102,7 +103,8 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-external-publish-guard.sh --mcp",
-            "timeout": 10
+            "timeout": 30,
+            "onFailure": "block"
           }
         ]
       },
@@ -112,10 +114,32 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-deletion-guard.sh",
+            "timeout": 30,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "PostModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-prompt-context.sh",
             "timeout": 10
           }
         ]
       }
     ]
+  },
+  "env": {
+    "CLAUDE_CODE_ENABLE_TODO_TOOLS": "1",
+    "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH": "32768",
+    "CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP": "1"
+  },
+  "cleanupPeriodDays": 3650,
+  "bashOutputMaxChars": 60000,
+  "worktree": {
+    "baseRef": "head"
   }
 }

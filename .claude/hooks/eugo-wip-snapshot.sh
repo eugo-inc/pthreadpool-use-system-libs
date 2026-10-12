@@ -45,6 +45,7 @@
 #   - new blobs are written under the caller's umask; a `.work.*` left by a killed run is swept
 #   - bash 3.2 safe (macOS), and no recursive rm anywhere: it deletes only files it named
 #   - an errexit INHERITED through BASH_ENV is disarmed before anything else runs
+#   - a checkout whose path ends in a newline is read whole: the root comes through a sentinel (§1.144)
 #
 # §3143 — THE DISARM COMES FIRST, as in every kit hook: the eugo deploy image's BASH_ENV
 # turns on `set -eE -o pipefail` for every non-interactive bash, and a Stop hook ended by
@@ -123,7 +124,11 @@ fail() {
   exit 0
 }
 
-ROOT="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null)"
+# §1.144 — `$(…)` strips EVERY trailing newline, so for a checkout whose folder name ends in one
+# the root read as another path: the `cd` failed (no snapshot) or, beside a same-named sibling,
+# landed in it and snapshotted THAT checkout. The `x` after git's own newline keeps the path whole.
+ROOT="$(git -C "${CLAUDE_PROJECT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null && printf x)"
+ROOT="${ROOT%x}"; ROOT="${ROOT%$NL}"
 [ -n "$ROOT" ] || exit 0
 cd "$ROOT" 2>/dev/null || exit 0
 
@@ -412,6 +417,7 @@ FINAL="$DIR/$STAMP-$SID8.patch"
 
 R="${ROOT//$NL/?}"; R="${R//$CR/?}"
 B="${BRANCH//$NL/?}"; B="${B//$CR/?}"
+F="${FINAL//$NL/?}"; F="${F//$CR/?}"   # audit-w276 #31: a newline-named checkout's path would split the header
 {
   printf '# eugo-wip-snapshot: the uncommitted work at one turn end (git apply skips these lines)\n'
   printf '# repo: %s\n' "$R"
@@ -420,7 +426,7 @@ B="${BRANCH//$NL/?}"; B="${B//$CR/?}"
   printf '# taken: %s\n' "$ISO"
   printf '# session: %s\n' "${SID:-(none)}"
   printf '%s%s%s%s' "$SKIPPED" "$DROPPED" "$SUBMODS" "$UNREAD"
-  printf "# restore: in a clean checkout at that head, git apply --binary '%s'\n" "$FINAL"
+  printf "# restore: in a clean checkout at that head, git apply --binary '%s'\n" "$F"
   cat "$WORK/body"
 } 2>/dev/null >"$WORK/out" || fail "cannot write in $DIR"
 

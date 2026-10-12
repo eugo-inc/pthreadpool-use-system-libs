@@ -8,6 +8,41 @@ an entry below.
 
 ## Upgrade notes
 
+- **2026-10-10 §7107 (REPORT.md v1.2.6 → v1.2.7)** — R7e corrected after run 1260's close audit: the head line is
+  30 words and opens with a trigger (F1; the §7103 note below claimed the ~30-word limit and the line was 37), an
+  in-flight task-widget row now goes under Running instead of into R7's sweep (the two rules disagreed about it), the
+  prominence is the two bold labels only (a heading dropped the `**Running**` literal the pin reads), and each
+  prohibition carries its replacement (F5). No ID changed (F12).
+- **2026-10-10 §7103 (REPORT.md v1.2.5 → v1.2.6)** — R7e, from the operator's brief of 2026-10-10 (athena §1.184): the
+  close lists every job still in flight (a background task, a detached gate, a monitor) under a bold `**Running**`
+  label ABOVE a bold `**NEXT**` label, one line each with the command that checks it, so "wait for this" no longer reads
+  as "do this". The `NEXT-N (owner): …` line shape `enext` parses is unchanged, and a Running line is never numbered.
+  Prominence is markdown, never ANSI colour. Split into sub-lines under F1's ~30-word limit; no ID changed (F12).
+- **2026-10-07 §6709 (VERIFY.md v1.2.4-eugo → v1.2.5-eugo)** — V14a rewritten after athena's post-close review
+  (audit-w285 #6 #7 #15, operator ruling 2026-10-07). Its trigger read only a comment ON the reverted line, and the
+  incident line it was written for (`SET duckdb.threads = 1`) carries none — the warning sits in the function's
+  docstring — so V14a now reads the line's comment AND its function's docstring, adds "data loss", and drops the
+  over-broad "guard". Its replacement action no longer depends on a CLAUDE.md declaration no consumer has: run the
+  control on a throwaway instance or against a fake connection, and a throwaway instance your CLAUDE.md names wins
+  when there is one (none named -> start one for the control, remove it after). V14a and V14b split into sub-lines
+  under F1's ~30-word limit; no ID changed (F12).
+- **2026-10-06 §6618 (CLAUDE-routing-template.md, which carries no version line)** — the template's `## Hard
+  stops` gains the generated-shell rule athena's own CLAUDE.md has carried since run 1252 (§6301): a fuzz, an oracle
+  or a bash confirmation of test strings runs each sample through athena's `tools/scripts/run_contained.py` (its own
+  session, the whole process group SIGKILLed after every sample, an RLIMIT_NPROC cap, its output bounded by
+  §6617), copied into a repo that lacks it (stdlib only, Python 3.9+, Linux only), never a bare
+  `subprocess.run(…, timeout=…)` — athena 2026-10-04: a top-process timeout left 12,277 forking orphans and the box
+  was rebooted. athena's CLAUDE.md keeps its tailored form; both carry the same five literals
+  (`test_guardrails_kit_is_portable.py` pins the parity). Consumers get it at the next fleet round.
+- **2026-10-06 §6702 (VERIFY.md v1.2.3-eugo → v1.2.4-eugo)** — V14 ("revert the fix, watch it fail") had no
+  exception for a control whose revert IS the hazard. athena ran one: a copy that dropped `SET duckdb.threads = 1`
+  ran against test databases sharing production's Postgres cluster, aborted a backend and restarted the whole
+  cluster (§2.23, 2026-09-24); §3308 and audit-w248 row 12 restated the rule in athena's own docs only, and a mutant
+  that widened a reaper's selection dropped 8 databases (§4408). New **V14a** (a line commented crash / abort /
+  LOAD-BEARING / production / guard is reverted only on an isolated copy or proven with a fake connection) and
+  **V14b** (a mutant widening what a destructive statement selects is the same class). V14's own line is unchanged.
+  athena's isolated copy is the loopback scratch Postgres its CLAUDE.md names (§2.27 (b)); §2.27 (a) is the worked
+  example — a fake connection plus a scratch-only control.
 - **2026-09-25 §3609 (REPORT.md v1.2.4 → v1.2.5)** — R7b narrowed to NEXT items: "no inbox" meant no harvester
   for NEXT lines, and still does. A defect or improvement in content athena SERVES now has its own channel,
   `report_to_athena` (athena §4.37) — never a `donate_fact`.

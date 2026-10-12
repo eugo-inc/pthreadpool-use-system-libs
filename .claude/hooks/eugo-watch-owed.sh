@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §2090 — Claude Code SessionStart hook (startup|resume|clear|compact): say what the
+# §2090 — Claude Code SessionStart hook (startup|resume|clear|compact|fork): say what the
 # review-watch daemon is owed, at the one moment a session is guaranteed to look.
 #
 # WHY THIS EXISTS. The daemon reviews every commit on the shared branch and writes its

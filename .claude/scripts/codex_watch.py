@@ -446,18 +446,111 @@ def _changed_lines(repo: str, *pathspec: str) -> int | None:
     return sum(int(n) for n in found)
 
 
+#: §1.140 — the heading shapes a reviewer actually writes. Measured on 2,248 retained raw captures:
+#: 2,246 use the prompt's `## Critical Issues (Blocking)`; one (eugo-ray-meson, report:124) wrote every
+#: heading in BOLD and one (protomolecule) in lower case. `_critical_section` read only the first shape,
+#: so the bold capture's blocking finding was stored as `critical: ""`.
+_ATX_HEADING = re.compile(r"#{1,6}\s+")
+_CRITICAL_BARE = re.compile(r"critical issues(?:\s*\(blocking\))?")
+_SIBLING_TITLE = re.compile(r"suggestions(?:\s*\([^)]*\))?|what'?s good|verdict")
+#: audit-w276 #12 — the marker names a blocking SECTION, so it wants `critical <issue word>` or a bare `blocking`, and
+#: never a negated form (`No critical issues`, `Nothing blocking`, `Non-critical`, an en-dash `Non–blocking`).
+_LOOSE_CRITICAL = re.compile(r"\bcritical\s+(?:issues?|problems?|findings?|bugs?|defects?|concerns?|errors?)\b"
+                             r"|(?<![\w-])blocking\b")
+_NEGATED_CRITICAL = re.compile(r"^(?:no|not|nothing|none|zero)\b|\bnon[-\s\u2010-\u2015]?(?:critical|blocking)\b")
+_FENCE = ("```", "~~~")
+_SETEXT_UNDERLINE = re.compile(r"[=-]{3,}")
+
+
+def _heading(line: str) -> tuple[str, bool] | None:
+    """(lower-cased title, is_bare) of one line, or None for a blank one. A MARKED heading is an ATX heading
+    at any level or a whole line wrapped in `**…**` / `__…__`; any other line is bare, its text the title. A
+    trailing colon goes whether it sits inside or outside the bold markers."""
+    s = line.strip()
+    if not s:
+        return None
+    if s.endswith(":"):
+        s = s[:-1].rstrip()
+    m = _ATX_HEADING.match(s)
+    if m:
+        title, bare = s[m.end():], False
+    elif len(s) > 4 and s[:2] == s[-2:] and s[:2] in ("**", "__"):
+        title, bare = s[2:-2], False
+    else:
+        title, bare = s, True
+    return title.strip().rstrip(":").strip().replace("’", "'").lower(), bare
+
+
+def _opens_critical(head: tuple[str, bool] | None) -> bool:
+    """A marked heading whose title starts `critical issues` (all HEAD's `## Critical Issues` accepted, in
+    any case), or a bare line that is exactly `Critical Issues`, `(Blocking)` optional, in any case — so
+    prose never opens it (audit-w276 #16 (b) corrected "EXACTLY `Critical Issues (Blocking)`")."""
+    if head is None:
+        return False
+    title, bare = head
+    return _CRITICAL_BARE.fullmatch(title) is not None if bare else title.startswith("critical issues")
+
+
 def _critical_section(md: str) -> str:
-    """Extract the '## Critical Issues (Blocking)' body from a driver code-review output."""
-    lines, grab, buf = md.splitlines(), False, []
-    for ln in lines:
-        if ln.strip().startswith("## Critical Issues"):
-            grab = True
+    """Extract the '## Critical Issues (Blocking)' body from a driver code-review output.
+
+    §1.140 — opens on a bold, bare or lower-case Critical heading too, and ENDS at the next `## ` line (as
+    before) or at a sibling section's heading (Suggestions / What's good / Verdict, in any of those shapes),
+    so a clean review in the bold shape still reads `None.` here. It never ends merely because a line is
+    bold: reviewers put `**1. Title**` finding lines inside the section.
+
+    audit-w276 — #14: a BARE sibling line (`Suggestions:`) stops only a section a bare opener opened, and nothing
+    inside a ``` / ~~~ fence opens or stops it, so a standard-format body keeps a finding after an indented label
+    or a fenced `verdict:`; #16: a later opener restarts the body (a preamble `**Critical issues found: 1**`), and a
+    setext underline under the opener is not the body's first line."""
+    grab, buf, bare_open, fence = False, [], False, False
+    for ln in md.splitlines():
+        s = ln.strip()
+        if s.startswith(_FENCE):
+            fence = not fence
+            if grab:
+                buf.append(ln)
             continue
-        if grab and ln.strip().startswith("## "):
-            break
+        head = None if fence else _heading(ln)
+        if _opens_critical(head):
+            grab, buf, bare_open = True, [], head[1]
+            continue
+        if grab and not fence:
+            if s.startswith("## "):
+                break
+            if head is not None and _SIBLING_TITLE.fullmatch(head[0]) and (bare_open or not head[1]):
+                break
+            if not any(b.strip() for b in buf) and _SETEXT_UNDERLINE.fullmatch(s):
+                continue
         if grab:
             buf.append(ln)
     return "\n".join(buf).strip()
+
+
+def _unparsed_critical_heading(md: str) -> str | None:
+    """§1.140 — the first MARKED heading that looks like a Critical section (`critical <issue word>`, or a bare
+    `blocking`) when no line opens one, cut to 200 characters; else None.
+
+    audit-w276 #12 — never a negated heading (`No critical issues`, `Non-blocking`), a sibling section, or a line
+    inside a fence; and only in a capture that carries a bare `NEEDS_REVISION` verdict line: a cut-off capture has
+    none, and marking it would count an unfinished review as reviewed (never retried)."""
+    lines = md.splitlines()
+    if not any(ln.strip().strip("*_").strip() == "NEEDS_REVISION" for ln in lines):
+        return None
+    heads, fence = [], False
+    for ln in lines:
+        if ln.strip().startswith(_FENCE):
+            fence = not fence
+            continue
+        if not fence:
+            heads.append((ln, _heading(ln)))
+    if any(_opens_critical(h) for _, h in heads):
+        return None
+    for ln, h in heads:
+        if (h is not None and not h[1] and _LOOSE_CRITICAL.search(h[0]) and not _NEGATED_CRITICAL.search(h[0])
+                and not _SIBLING_TITLE.fullmatch(h[0])):
+            return ln.strip()[:200]
+    return None
 
 
 #: §2108 — THE LEDGER IS THE CURSOR (`--since-ledger`).
@@ -528,8 +621,13 @@ def _names_nothing_blocking(result: dict) -> bool:
 
     §3144 — ONE definition of the shape, read by `_is_verdict` (it is not a review) and by
     `_outage_stub` (when it also names an outage, nobody is charged for it).
+    §1.140 — a result carrying `critical_unparsed` (a non-blank string) names a blocking section the
+    parser could not read, so it is NOT this shape: it is a review, whatever `critical` holds.
     """
     if result.get("verdict") != "NEEDS_REVISION":
+        return False
+    unparsed = result.get("critical_unparsed")
+    if isinstance(unparsed, str) and unparsed.strip():
         return False
     critical = result.get("critical")
     critical = critical.strip() if isinstance(critical, str) else ""
@@ -551,7 +649,8 @@ def _is_verdict(result: dict) -> bool:
     `… You've hit your session limit …`. 0 of the other 2,445 non-ERROR results match.
     ⚠ The shape is not PROOF of a capture loss: `_results_of` also stores `critical` as ""
     when a real reviewer answers `None.` under a verdict of NEEDS_REVISION, or words the
-    heading so `_critical_section` misses it. Measured 2026-09-23 on athena's live ledger
+    heading so `_critical_section` misses it (since §1.140 such a result carries
+    `critical_unparsed` and counts as a verdict). Measured 2026-09-23 on athena's live ledger
     (`advice.jsonl` + `archive/`; 226 in the copy committed at 78c744188): 0 of its 227
     NEEDS_REVISION results is such a review —
     the 5 in the shape are the capture losses above — so today the shape costs nothing it
@@ -1728,6 +1827,32 @@ _REVIEW_EXTRA_PART = (
 )
 
 
+#: §3.44 M2 — bounds on the driver's `usage=` field: the child runs one result may record (one
+#: today; two when a keyed attempt falls back to the subscription) and the characters the tracked
+#: ledger may grow by for it.
+_USAGE_MAX_ATTEMPTS = 4
+_USAGE_MAX_CHARS = 8192
+
+
+def _usage_field(raw: str | None) -> list[dict]:
+    """§3.44 M2 — the driver's `usage=` field as a list of objects, or [] when it is not one.
+
+    The driver (`codex_review._usage_token`) sends what each child run cost as compact JSON with
+    no whitespace. Never raises: an unreadable field is dropped and must not cost the result its
+    model, verdict, resolved id or note.
+    """
+    if raw is None or raw == "" or len(raw) > _USAGE_MAX_CHARS:
+        return []
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return []
+    if (not isinstance(value, list) or not value or len(value) > _USAGE_MAX_ATTEMPTS
+            or not all(isinstance(a, dict) and a for a in value)):
+        return []
+    return value
+
+
 def _results_of(stdout: str, out_dir: Path, *, part: str = "") -> list[dict]:
     """The driver's `model=<m> verdict=<v> [note=<free text to EOL>]` lines as results.
 
@@ -1752,14 +1877,28 @@ def _results_of(stdout: str, out_dir: Path, *, part: str = "") -> list[dict]:
         fields = dict(p.split("=", 1) for p in head.split(" ") if "=" in p)
         model, verdict = fields.get("model", "?"), fields.get("verdict", "?")
         md = out_dir / f"{model}.md"
-        crit = _critical_section(md.read_text()) if md.exists() else ""
+        text = md.read_text() if md.exists() else ""
+        crit = _critical_section(text) if text else ""
         result = {"model": model, "verdict": verdict,
                   "critical": crit if crit and crit.lower() != "none." else ""}
+        # §1.140 — a NEEDS_REVISION with no body whose capture HAS a Critical-like heading the parser
+        # could not open: recorded, so the ledger says a blocking section exists (and the turn-end hook
+        # fails closed on it) instead of storing an empty body. Absent otherwise, like `note`.
+        if verdict == "NEEDS_REVISION" and not result["critical"] and text:
+            unparsed = _unparsed_critical_heading(text)
+            if unparsed:
+                result["critical_unparsed"] = unparsed
         # §3118 — the exact id that answered (`resolved=`), beside `model`, which stays the
         # value the settings name (an alias such as `opus`). Omitted when the driver could
         # not tell — absence means UNRECORDED, never a mismatch.
         if fields.get("resolved"):
             result["resolved_model"] = fields["resolved"]
+        # §3.44 M2 — what the run cost (`usage=`), kept in advice.jsonl ONLY: advice.md is what a
+        # person reads and `watch_drain.render_md` regenerates it byte for byte, so the append
+        # below and that function are deliberately untouched. Omitted when the driver sent none.
+        usage = _usage_field(fields.get("usage"))
+        if usage:
+            result["usage"] = usage
         if part:
             result["part"] = part
         if sep and note.strip():
@@ -1796,32 +1935,53 @@ def _kill_part_group(proc: subprocess.Popen) -> None:
             pass
 
 
+#: §1.139 (report:116) — mirror of `codex_review.CODEX_HOME_PARENT_ENV` (the watcher imports
+#: nothing from the driver; a parity test holds the two names to one). `_dispatch_part` makes a
+#: folder per part and hands it to the driver under this name, so the driver seeds its CODEX_HOME
+#: (a copy of `~/.codex/auth.json`) inside it; the watcher removes the folder after the part however
+#: the part ended. That is the backstop for a driver `_kill_part_group` had to SIGKILL, whose own
+#: `finally` never ran (the driver's SIGTERM handler covers the graceful case).
+_CODEX_HOME_PARENT_ENV = "EUGO_REVIEW_CODEX_HOME_PARENT"
+
+
 def _dispatch_part(argv: list[str], advice_dir: Path):
     """Run ONE review part. §2.37 (c) — the ONE seam every driver dispatch goes through, and the
     one the tests fake: `_review` never runs the driver through `subprocess.run`.
 
     Returns `returncode` / `stdout` / `stderr` (text) and `stopped`, True when a STOP ended the
-    part; `_review` then records a top-level `stopped` marker, never a `driver_exit`."""
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            start_new_session=True)
-    stopped = False
+    part; `_review` then records a top-level `stopped` marker, never a `driver_exit`.
+
+    §1.139 — the part's scratch folder (`_CODEX_HOME_PARENT_ENV`) is removed on every exit from
+    here. One that cannot be made is skipped: the backstop is best-effort, the review is not."""
     try:
-        while True:
-            try:
-                # Retrying `communicate` after TimeoutExpired loses no output (the stdlib's contract).
-                out, err = proc.communicate(timeout=_PART_POLL_S)
-                break
-            except subprocess.TimeoutExpired:
-                if _stop_requested(advice_dir):
-                    stopped = True
-                    _kill_part_group(proc)
-                    out, err = proc.communicate()
+        scratch = tempfile.mkdtemp(prefix="eugo_review_part_")
+    except OSError:
+        scratch = None
+    env = {**os.environ, _CODEX_HOME_PARENT_ENV: scratch} if scratch else None
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True, env=env)
+        stopped = False
+        try:
+            while True:
+                try:
+                    # Retrying `communicate` after TimeoutExpired loses no output (the stdlib's contract).
+                    out, err = proc.communicate(timeout=_PART_POLL_S)
                     break
-    except BaseException:
-        # audit-w258 #1 — whatever ends the watcher HERE (an exception out of the poll, a
-        # SystemExit), the part's session must not outlive it unowned: its group dies with it.
-        _kill_part_group(proc)
-        raise
+                except subprocess.TimeoutExpired:
+                    if _stop_requested(advice_dir):
+                        stopped = True
+                        _kill_part_group(proc)
+                        out, err = proc.communicate()
+                        break
+        except BaseException:
+            # audit-w258 #1 — whatever ends the watcher HERE (an exception out of the poll, a
+            # SystemExit), the part's session must not outlive it unowned: its group dies with it.
+            _kill_part_group(proc)
+            raise
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
     return SimpleNamespace(args=argv, returncode=proc.returncode, stdout=out, stderr=err,
                            stopped=stopped)
 
@@ -1860,16 +2020,59 @@ def _git_rc(repo: str, *args: str, timeout: int = 30) -> tuple[int, bytes]:
     return out.returncode, data
 
 
-def _rules_rev(repo: str, kind: str, ref: str) -> str | None:
+class _ShallowBoundary:
+    """FUTURE.md §2.48 (b) (run 1234) — `_rules_rev`'s answer for a commit that NAMES a parent whose
+    object is absent: a shallow clone's boundary commit, whose rules cannot be read. audit-w263 #9 —
+    `parent` is None when the commit object itself could not be read to name one."""
+    __slots__ = ("commit", "parent")
+
+    def __init__(self, commit: str, parent: str | None) -> None:
+        self.commit, self.parent = commit, parent
+
+
+def _rules_rev(repo: str, kind: str, ref: str) -> str | _ShallowBoundary | None:
     """The revision whose rules judge this review: a commit's first parent, a root commit's own
     tree, HEAD for the worktree lane. None when git cannot name one (not a repository, an unknown
-    ref, an unborn HEAD)."""
-    rc, out = _git_rc(repo, "rev-list", "--parents", "-n", "1",
-                      "HEAD" if kind == "worktree" else ref, "--")
-    shas = out.decode("ascii", "replace").split() if rc == 0 else []
-    if not shas or not all(_REV_SHA.fullmatch(s) for s in shas):
+    ref, an unborn HEAD).
+
+    §2.48 (b) (run 1234) — the parent comes from the commit object (`cat-file commit`), which a
+    shallow graft does not hide. It came from `rev-list --parents`, which prints ONE sha at a shallow
+    clone's boundary, so that commit was judged by its OWN rules as if it were a root (the
+    self-exemption §2.37 (i) closed). A parent whose object is absent is a `_ShallowBoundary`; so,
+    since audit-w263 #9, is the rev-list fallback's one-sha answer in a clone not proven unshallow."""
+    rc, out = _git_rc(repo, "rev-parse", "--verify", "--quiet",
+                      ("HEAD" if kind == "worktree" else ref) + "^{commit}")
+    sha = out.decode("ascii", "replace").strip() if rc == 0 else ""
+    if not _REV_SHA.fullmatch(sha):
         return None
-    return shas[0] if kind == "worktree" or len(shas) == 1 else shas[1]
+    if kind == "worktree":
+        return sha
+    rc, body = _git_rc(repo, "cat-file", "commit", sha)
+    if rc != 0:
+        # The commit object cannot be read here (a git that cannot run cat-file at all): the answer
+        # this function gave before §2.48, from rev-list.
+        rc, out = _git_rc(repo, "rev-list", "--parents", "-n", "1", sha, "--")
+        shas = out.decode("ascii", "replace").split() if rc == 0 else []
+        if not shas or not all(_REV_SHA.fullmatch(s) for s in shas):
+            return None
+        if len(shas) > 1:
+            return shas[1]
+        # audit-w263 #9 (run 1234) — ONE sha is a root only in a clone git says is NOT shallow: at a
+        # shallow boundary rev-list hides the parent too, and reading that answer as a root brought
+        # back the self-exemption above. A clone git cannot answer for counts as shallow.
+        rc, out = _git_rc(repo, "rev-parse", "--is-shallow-repository")
+        if rc == 0 and out.strip() == b"false":
+            return shas[0]
+        return _ShallowBoundary(sha, None)
+    header = body.split(b"\n\n", 1)[0].decode("ascii", "replace")
+    parent = next((ln[len("parent "):].strip() for ln in header.splitlines() if ln.startswith("parent ")),
+                  None)
+    if parent is None:
+        return sha                        # a true root commit: its own tree
+    if not _REV_SHA.fullmatch(parent):
+        return None
+    rc, _ = _git_rc(repo, "cat-file", "-e", f"{parent}^{{commit}}")
+    return parent if rc == 0 else _ShallowBoundary(sha, parent)
 
 
 def _unlink_quietly(path: str) -> None:
@@ -2086,6 +2289,10 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
     # the worktree. Only when git cannot name the revision is nothing forwarded (the
     # behaviour before this run). d13 — `inv_record` becomes the entry's `invariants` key.
     inv_record: dict = {"source": "", "rev": None, "warnings": []}
+    # FUTURE.md §2.48 (a) (run 1234) — an rc-0 run's WARNING lines that are NOT about the rules (the
+    # driver's EUGO_SESSION_CODEX_BIN notice) were filed under `invariants`, where advice.md printed
+    # them as a rules problem. They are kept, on the entry's own `driver_warnings`.
+    driver_warnings: list[str] = []
     rules_file = ""
     if getattr(cfg, "invariants_file", ""):
         argv_base += ["--invariants-file", cfg.invariants_file]
@@ -2094,7 +2301,25 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
         rules_rev = _rules_rev(repo, kind, ref)
         rules = None
         why = ""
-        if rules_rev is None:
+        if isinstance(rules_rev, _ShallowBoundary):
+            # §2.48 (b) (run 1234; operator ruling 2026-09-29) — the rules the change was written
+            # under are not in this clone. Forward an EMPTY rules file rather than fall back to the
+            # worktree, which here is the commit's own tree: invariants only ever suppress findings,
+            # so no rules fails safe, and the entry says why (no revision: nothing was read).
+            if rules_rev.parent is not None:
+                parent = rules_rev.parent[:12]
+                source = f"unmeasurable (shallow boundary: parent {parent} absent)"
+                why = f"is a shallow clone's boundary commit: its parent {parent} is not in this clone"
+            else:
+                # audit-w263 #9 — `cat-file commit` failed, so not even the parent can be named.
+                source = "unmeasurable (shallow clone: the commit object is unreadable, its parent unnamed)"
+                why = ("cannot be read to name its parent, and this clone is shallow (or git cannot say "
+                       "it is not), so that parent may be cut off")
+            rules = ("", source,
+                     [f"WARNING: {kind} {ref[:12]} {why}, so the invariants it was written under cannot "
+                      "be read; reviewed with none, never its own."])
+            rules_rev = None
+        elif rules_rev is None:
             why = f"git could not name the revision whose rules judge {kind} {ref[:12]}"
         else:
             try:
@@ -2138,6 +2363,10 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
     dispatched = len(parts)
     stopped = False
     resplit: dict[str, int] = {}      # §2.37 (f) — part index -> the slices it was re-split into
+    #: §3.44 — part index -> the usage the REFUSED dispatch recorded before its re-split replaced
+    #: its result. That run was billed too; without this the ledger lost it (and its key's journal
+    #: end would read as unmatched). Never inside `resplit`, which `_is_real_review` reads as ints.
+    refused_usage: dict[str, list] = {}
     for index, part_text in enumerate(parts, start=1):
         out_dir = raw if len(parts) == 1 else raw / f"part{index}of{len(parts)}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2169,6 +2398,9 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
                   f"reviewer; re-split into {len(subs)} and dispatched once more",
                   file=sys.stderr, flush=True)
             resplit[str(index)] = len(subs)
+            refused_runs = [a for r in pieces[0][1] for a in (r.get("usage") or [])]
+            if refused_runs:
+                refused_usage[str(index)] = refused_runs
             pieces = []
             for j, sub in enumerate(subs, start=1):
                 sub_dir = out_dir / f"sub{j}of{len(subs)}"
@@ -2209,8 +2441,12 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
                     said = _DRIVER_INVARIANTS_LINE.fullmatch(line.strip())
                     if said and said.group(1) not in driver_says:
                         driver_says.append(said.group(1))
-                    elif line.startswith("WARNING:") and line not in inv_record["warnings"]:
-                        inv_record["warnings"].append(line)
+                    elif line.startswith("WARNING:"):
+                        # §2.48 (a) — every warning the driver prints about the rules names them.
+                        bucket = (inv_record["warnings"] if "invariants" in line.lower()
+                                  else driver_warnings)
+                        if line not in bucket:
+                            bucket.append(line)
             part_results.extend(piece_results)
         results.extend(part_results)
         if stopped:
@@ -2255,6 +2491,8 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
     # older than that line, or every part failed).
     inv_record["driver"] = ", ".join(driver_says) or "unknown"
     entry["invariants"] = inv_record
+    if driver_warnings:                       # §2.48 (a) — only when non-empty
+        entry["driver_warnings"] = driver_warnings
     if len(parts) > 1 or resplit:
         # §2178 — WHAT THE READER NEEDS TO KNOW THAT THE VERDICTS DO NOT SAY. Recorded as
         # a structured block rather than a new verdict string: `watch_drain`'s status line
@@ -2265,6 +2503,8 @@ def _review(repo: str, kind: str, ref: str, diff_text: str, cfg: argparse.Namesp
                           "cap": cap}
         if resplit:
             entry["split"]["resplit"] = resplit     # §2.37 (f) — read by `_is_real_review`
+        if refused_usage:
+            entry["split"]["refused_usage"] = refused_usage   # §3.44 — runs, not results
         # §2187 — how many were actually SENT, which is not `parts` once an outage stops
         # the loop. Recorded so the entry cannot be read as five failed reviews when it
         # was one failure and four dispatches that never happened.
@@ -2548,6 +2788,10 @@ def _append_entry(advice_dir: Path, entry: dict) -> None:
                 f.write(f"- invariants: {inv_src} @ {inv_rev} (driver: {inv_drv})\n")
                 for w in inv.get("warnings") or []:
                     f.write(f"  - {w}\n")
+            # §2.48 (a) (run 1234) — a driver warning that is not about the rules; absent on every
+            # entry without one, so those render exactly as they always did.
+            for w in entry.get("driver_warnings") or []:
+                f.write(f"- driver warning: {w}\n")
             for r in results:
                 f.write(f"- **{r['model']}**: {r['verdict']}\n")
                 if r.get("resolved_model", r["model"]) != r["model"]:

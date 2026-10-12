@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.2.5 (§3609 R7b: no NEXT inbox — a report to athena is its own channel) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
+<!-- guardrails-kit: v1.2.7 (§7107 R7e corrected: 30 words, widget rows, labels, F5; §7103 R7e: what is RUNNING apart from what is owed NEXT; §3609 R7b: no NEXT inbox — a report to athena is its own channel) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
 You are here because you are about to write a verdict, finding, recommendation, or the turn's final answer to the user.
 
 Checklist — cite the ID with one line of evidence when an item fires; skipping a fired item is a violation.
@@ -14,6 +14,10 @@ Checklist — cite the ID with one line of evidence when an item fires; skipping
 - R7b. A NEXT item that is NEW work is filed as a body (`### §<id> <title> (<effort>)` under its tier) + its index row + the next-free bump, in the turn's own `§<id>:` commit. There is no harvester and no inbox for NEXT items: the writer files.
 - R7c. Each filed line ends `→ <backlog file> §<id>`; one deliberately not filed ends `(not filed: <why>)` — a report line is the right home for what merely restates, or is owed within the turn.
 - R7d. Pre-send: `grep -n 'NEXT→ <today>' <backlog file>` (athena: FUTURE.md) — every `→` tail in the report has a hit, or the line is rewritten `(not filed: …)`. File only what genuinely changes, extends, deepens or better explains an existing item, must be delivered later, or deserves its own session.
+- R7e. Before writing the `NEXT-N` lines: list each job still in flight (background task, detached gate, monitor) under a bold `**Running**` label, one line each naming the command that checks it.
+  - A task-widget row that is in flight goes here, not into R7's sweep; never number a Running line -> instead: list it unnumbered under `**Running**`.
+  - Then the `NEXT-N (owner): …` lines under a bold `**NEXT**` label, R7's shape unchanged; nothing in flight -> omit the `**Running**` label.
+  - Never ANSI colour codes -> instead: the two bold labels (a list mixing what to wait for with what to do reads as all owed).
 - R8. Any `NEXT:` item needing the user's ACTION, INPUT or ATTENTION goes through AskUserQuestion in THIS turn, not the next one — .claude/docs/guardrails/PLAN.md P10 owns the rule; this is its report-time trigger (a NEXT line is a record, and the record is not the ask).
 
 --- reference ---

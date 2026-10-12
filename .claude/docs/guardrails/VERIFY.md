@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.2.3-eugo stub (§2979 V21 an external report is drafted, never posted; §1996 iron-rule back-pointers say athena's) | full playbook: superpowers:verification-before-completion. Editing? Read .claude/docs/guardrails/_FORMAT.md first. -->
+<!-- guardrails-kit: v1.2.5-eugo stub (§6709 V14a reads the docstring too and names a throwaway instance; §6702 V14a-b a control that removes a guard runs on an isolated copy or a fake; §2979 V21 an external report is drafted, never posted) | full playbook: superpowers:verification-before-completion. Editing? Read .claude/docs/guardrails/_FORMAT.md first. -->
 You are here because you are about to write "done", "fixed", "works", "passing", "complete", "resolved", or "ready", or to run git commit / gh pr create.
 
 Full playbook: invoke `superpowers:verification-before-completion` via the Skill tool — it owns the fuller evidence-before-assertion protocol. Not loaded this session? Follow the anchors below.
@@ -12,6 +12,11 @@ Full playbook: invoke `superpowers:verification-before-completion` via the Skill
 - Multi-part request: quote the original ask (or the plan's Goal) and mark every deliverable VERIFIED / EDITED-UNVERIFIED / NOT-DONE. Reporting NOT-DONE is fine; silently dropping it is not.
 - V13. Measuring an A/B or flag effect: print the value the code RESOLVED at runtime, never the value you passed (a silently-overridden toggle proves the opposite claim).
 - V14. A new regression test is evidence only beside a pasted RED run on the un-fixed baseline — revert the fix, watch it fail, restore (a test that never failed guards nothing).
+  - V14a. Before running a control that reverts or mutates a line: read that line's comment and its function's docstring.
+    - Either says crash, abort, data loss, LOAD-BEARING or production? Never run the control on a shared resource -> instead: run it on a throwaway instance, or against a fake connection.
+    - Your repo's CLAUDE.md names a throwaway instance? Use that one; none named -> start one for the control, remove it after.
+  - V14b. A mutant that widens what a destructive statement selects (a DROP's name filter, a reaper's registry) removes a guard too -> V14a applies.
+    - (athena §2.23: a dropped `SET duckdb.threads = 1` restarted production's Postgres cluster; athena §4408: a widened reaper selection dropped 8 databases.)
 - V15. Read the test-COUNT line, never rc or the output tail — no count line means the suite never ran (`0 collected` exits 0).
 - V16. Background or piped job: completion is a marker file or artifact you check, never `$?` (a pipe's status is the last command's).
 - V17. An instrument or probe that cannot run reports `UNMEASURABLE: <why>` — never a verdict (UNMEASURABLE is not UNOBSERVED, and neither is absence).

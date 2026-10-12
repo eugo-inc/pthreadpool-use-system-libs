@@ -904,6 +904,9 @@ def render_md(entry: dict) -> str:
         out.append(f"- invariants: {inv_src} @ {inv_rev} (driver: {inv_drv})\n")
         for w in inv.get("warnings") or []:
             out.append(f"  - {w}\n")
+    # §2.48 (a) (run 1234) — the daemon's `driver_warnings`; absent on every entry without one.
+    for w in entry.get("driver_warnings") or []:
+        out.append(f"- driver warning: {w}\n")
     for r in results:
         out.append(f"- **{r['model']}**: {r['verdict']}\n")
         if r.get("resolved_model", r["model"]) != r["model"]:

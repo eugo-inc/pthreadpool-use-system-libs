@@ -24,9 +24,16 @@
 #   - `stop_hook_active` true -> exit 0 at once. Without this a finding could block every
 #     turn forever; this is the ONLY thing standing between a blocking verdict and a loop.
 #   - every other path exits 0 or 2 — never anything else, and never a traceback
-#   - it INTERRUPTS (exit 2) only on NEEDS_REVISION carrying a Critical Issues body, and
-#     INFORMS otherwise. ~24% of captures produce no usable output, so anything
+#   - it INTERRUPTS (exit 2) only on NEEDS_REVISION carrying a Critical Issues body (or, since
+#     §1.140, a Critical heading the watcher recorded as present but unparseable,
+#     `critical_unparsed`), and INFORMS otherwise. ~24% of captures produce no usable output, so anything
 #     unparseable, empty or ERROR informs — it must never interrupt on a non-finding.
+#   - an INFORM (exit 0) goes three ways (§3.52 5b, run 1261): the `review watch:` line on stderr
+#     (as before; only the debug log shows it), ONE `{"systemMessage": …}` object on stdout (the
+#     operator), and the line
+#     appended to `<state>/<session_id>.inform`, which eugo-prompt-context.sh says to Claude at the
+#     next prompt — only for a session id of [A-Za-z0-9_-]; a blocking verdict writes none (exit 2
+#     has already said it)
 #   - a missing repo/ledger/script is silent and exit 0
 #   - bash 3.2 safe
 #   - an errexit INHERITED through BASH_ENV is disarmed before anything else runs
@@ -48,6 +55,15 @@ ROOT="${CLAUDE_PROJECT_DIR:-.}"
 WATCH="$ROOT/.claude/scripts/codex_watch.py"
 ADVICE="$ROOT/.adversarial-review/watch"
 STATE="$ROOT/outputs/_state/review-turn-end"
+
+# §3.52 5b — the same function as eugo-session-instructions.sh's (§7209; byte-identical output on bash 3.2-5.2, §7211).
+json_str() { # $1 as a JSON string literal; C0 controls other than tab, LF and CR are dropped (bash 3.2 safe)
+  local s
+  s="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037'; printf x)"; s="${s%x}"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
+  printf '"%s"' "$s"
+}
 
 IN="$(cat 2>/dev/null || true)"
 
@@ -101,10 +117,24 @@ SID="$SESSION_ID"
 [ -n "$SID" ] || SID="nosession"
 mkdir -p "$STATE" 2>/dev/null || exit 0
 MARK="$STATE/$SID.seen"
+# §1.94 L1 (run 1241) — the transcript the payload names, read ONLY for this session's START (the cold-start
+# cutoff, `_session_start`). The same `sed -n` form as `$SESSION_ID` above, never `grep -o`: with no match sed still
+# exits 0, so an inherited pipefail cannot end the hook here. A key quoted inside a JSON string is escaped (`\"`)
+# and cannot match. Only a `.jsonl` path is read; "" keeps the hour.
+TRANSCRIPT="$(printf '%s' "$IN" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+case "$TRANSCRIPT" in *.jsonl) ;; *) TRANSCRIPT="" ;; esac
 
 # ---- surface anything that landed since this session last looked -------------------
 # §3106 — `$SESSION_ID` (never `$SID`: §3105) decides which findings may INTERRUPT.
-OUT="$(python3 - "$ADVICE" "$MARK" "$ROOT/.claude/scripts" "$SESSION_ID" <<'PY' 2>/dev/null
+# §1.94 (run 1239) — THE HERE-DOCUMENT LIVES IN A FUNCTION, NEVER INSIDE `$(…)`. It was
+# `OUT="$(python3 - … <<'PY' … PY )"`, and bash 3.2's command-substitution parser reads a
+# here-document body as shell text: the body's apostrophes and parentheses opened quotes and
+# groups, and `bash -n` under the official bash:3.2 image failed this whole file ("line 486:
+# syntax error near unexpected token `('") — the /bin/bash macOS ships, while the header says
+# "bash 3.2 safe". Same arguments, same stderr discard, same `|| OUT=""`. Guarded by
+# tools/tests/test_hooks_parse_portably.py (the shape) and `make hooks-bash32` (the real 3.2).
+_surface_findings() {
+python3 - "$@" <<'PY' 2>/dev/null
 import importlib.util, json, sys, time
 from pathlib import Path
 advice, mark = Path(sys.argv[1]), Path(sys.argv[2])
@@ -113,6 +143,9 @@ root = advice.parents[1]
 scripts = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 #: §3106 — the session this turn belongs to, "" when the payload carried none (§3105).
 me = sys.argv[4] if len(sys.argv) > 4 else ""
+#: §1.94 L1 — the session's transcript (`transcript_path`), "" when the payload named none.
+transcript = sys.argv[5] if len(sys.argv) > 5 else ""
+_start_cache = []
 _wd_cache = []
 
 
@@ -163,7 +196,54 @@ def _discharged(e):
 #: the commit itself was written some minutes before that — so the window has to be
 #: comfortably wider than the review latency, and an hour is. Anything older than this was
 #: committed before the session existed: inherited backlog, not news.
+#: §1.94 L1 (run 1241) — now the FLOOR, not the whole rule: the cutoff is the EARLIER of this and the
+#: session's start (`_session_start`), and stays this alone when the transcript cannot say.
 COLD_START_NEWS_SECONDS = 3600
+
+#: §1.94 L1 — how far `_session_start` may read. A transcript's first records carry no top-level timestamp
+#: (`mode`, `last-prompt`, `permission-mode`, a `file-history-snapshot` that nests its own); measured
+#: 2026-10-02 over this account's interactive transcripts, the first timestamped record is record 2-21 and
+#: ends by byte ~1.5 KB at p50 (max ~466 KB). Past either budget the start is unknown and the hour stands.
+SESSION_START_SCAN_BYTES = 4 << 20
+SESSION_START_SCAN_LINES = 64
+
+
+def _session_start():
+    """Epoch of the transcript's first record carrying a TOP-LEVEL ISO `timestamp` ending in `Z`, or None.
+
+    §1.94 L1 — top-level only: a `file-history-snapshot` head nests its stamp in `snapshot`. `readline` under a
+    byte budget, never `read`: the record sits ~1.5 KB into a file of MBs. Read once per run, and only when a
+    dateable NEEDS_REVISION commit is checked on a cold Stop (owned or not — the backlog test runs before the
+    ownership one). None on anything unexpected, and the caller then keeps the hour, the old rule.
+
+    Why the transcript and not `codex_watch.session_start_epoch` (the ledger's earliest entry this session
+    stamped): that is the time a REVIEW of this session's first commit landed, so it is always AFTER that
+    commit and cannot vouch for it; the transcript's first record precedes every commit the session makes.
+    """
+    if _start_cache:
+        return _start_cache[0]
+    start = None
+    try:
+        import calendar  # noqa: PLC0415 — only reached on the cold-start path
+        budget = SESSION_START_SCAN_BYTES
+        with open(transcript, "rb") as f:
+            for _ in range(SESSION_START_SCAN_LINES):
+                raw = f.readline(budget)
+                if not raw or not raw.endswith(b"\n"):
+                    break  # EOF, or the byte budget ran out mid-record
+                budget -= len(raw)
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                ts = rec.get("timestamp") if isinstance(rec, dict) else None
+                if isinstance(ts, str) and ts.endswith("Z"):
+                    start = float(calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")))
+                    break
+    except Exception:
+        start = None
+    _start_cache.append(start)
+    return start
 
 
 def _commit_epoch(ref):
@@ -196,14 +276,26 @@ def _is_inherited_backlog(e, cold):
     protomolecule 2026-09-21: two of the commits named were 8½ hours older than the addressed
     session's first commit.
 
-    Only on a COLD start, and that is the whole trick. A cold session's `since` is "" so it
-    scans the entire ledger (§2130 calls this the dominant shape), and its first look is
-    taken as now — so "before the session existed" needs no stored start time, no marker
-    file, and no ledger derivation.
+    Only on a COLD start. A cold session's `since` is "" so it scans the entire ledger (§2130
+    calls this the dominant shape), and "before the session existed" is dated by the
+    session's OWN transcript (§1.94 L1, `_session_start`) — still no stored start time, no
+    marker file, and no ledger derivation.
 
-    ⚠ §3143 (§1.94 L1) — TWO LIMITS OF THAT TRICK. (1) OPEN: "now" is the FIRST STOP, not
-    the session's start, so a first turn longer than COLD_START_NEWS_SECONDS demotes the
-    session's OWN early commits to backlog, against the rule below. (2) BY DESIGN: a warm
+    ⚠ §3143 (§1.94 L1) — TWO LIMITS. (1) CURED (run 1241): the cutoff was the FIRST STOP
+    minus COLD_START_NEWS_SECONDS, so a first turn longer than that demoted the session's
+    OWN early commits. It is now the EARLIER of that and the session's start, so nothing
+    the hour shows as news is ever demoted. Two consequences of the widening, both toward
+    news: an UNOWNED entry on a long first turn now reads "another session's finding"
+    rather than "backlog" (informational either way), and an entry this session OWNS for
+    another session's commit made during that first turn (a shared clone's review is
+    stamped with the dispatching session) now interrupts, as it would on a warm turn. The
+    same holds for a RESUMED session that lost its `.seen` marker: it is cold, and its
+    transcript (resume appends to the same file) dates its ORIGINAL start, so the widening
+    spans the whole idle gap — consistent with the ruled `min()` (audit-w270 #7).
+    RESIDUAL: a transcript that BEGINS at a `compact_boundary` dates its start at the
+    compaction, so its commits from before that AND older than the hour still read as
+    backlog — never more than before (2 of the interactive transcripts measured on this
+    account, none of athena's). (2) BY DESIGN: a warm
     session is bounded by its cursor in REVIEW time only. A `--full` catch-up (every
     SessionStart, resume and compact included) that reviews an old, still-unreviewed commit under this
     session's id still reaches it and still interrupts, which is why the `commit)` lead
@@ -218,7 +310,14 @@ def _is_inherited_backlog(e, cold):
     when = _commit_epoch(e.get("ref") or "")
     if when is None:
         return False
-    return when < time.time() - COLD_START_NEWS_SECONDS
+    # §1.94 L1 (run 1241; operator ruling 2026-10-02) — the EARLIER of the hour and the session's start: a long first
+    # turn no longer demotes the session's own early commits, and a start the transcript misstates (one that BEGINS
+    # at a compaction, a future stamp) can only widen what blocks — this file's direction.
+    cutoff = time.time() - COLD_START_NEWS_SECONDS
+    start = _session_start()
+    if start is not None:
+        cutoff = min(cutoff, start)
+    return when < cutoff
 
 
 def _owns(e):
@@ -403,6 +502,18 @@ for line in lines:
         continue
     for r in e.get("results") or ():
         v, crit = r.get("verdict"), (r.get("critical") or "").strip()
+        # §1.140 — the watcher records `critical_unparsed` when the review wrote a blocking section
+        # under a heading its parser could not read. It becomes the finding HERE, before the branches,
+        # so the discharge above, the backlog, ownership and supersession checks and the CAP all apply
+        # to it exactly as to a parsed body. Its text is not in the ledger, so the line points at the
+        # raw capture (`<kind>-<ref[:24]>-<epoch>-<pid>`, codex_watch's own naming).
+        unparsed = r.get("critical_unparsed")
+        if v == "NEEDS_REVISION" and not crit and isinstance(unparsed, str) and unparsed.strip():
+            crit = ("the review wrote a blocking section under a heading the watcher could not parse "
+                    "(%s); its text is not in the ledger: read %s.md under "
+                    ".adversarial-review/watch/raw/%s-%s-*/"
+                    % (" ".join(unparsed.split())[:120], r.get("model"), str(e.get("kind")),
+                       str(e.get("ref") or "").replace("/", "_")[:24]))
         label = "%s %s" % (str(e.get("kind"))[:8], str(e.get("ref"))[:12])
         # INTERRUPT only on a real finding: NEEDS_REVISION carrying a critical body.
         # ~24% of captures produce nothing usable, so everything else informs.
@@ -482,7 +593,8 @@ for line in lines:
             # prints depends on it and nothing else can tell the two apart down there.
             blocking.append((label, crit.split("\n")[0][:400], ref, str(e.get("kind") or "")))
         elif v == "NEEDS_REVISION":
-            # A finding with no Critical body: real, but not worth interrupting for.
+            # A finding with no Critical body and no unparsed Critical heading (§1.140): real, but
+            # not worth interrupting for.
             informational.append("%s: NEEDS_REVISION (no critical body)" % label)
         # ⚠ §2120 — ERROR IS NOT SURFACED AT ALL, and that is a deliberate narrowing.
         # An ERROR entry means the REVIEW failed, not that the code is wrong — 23% of
@@ -541,7 +653,8 @@ elif informational:
     if len(informational) > CAP:
         print("(+%d more — %s)" % (len(informational) - CAP, OWED))
 PY
-)" || OUT=""
+}
+OUT="$(_surface_findings "$ADVICE" "$MARK" "$ROOT/.claude/scripts" "$SESSION_ID" "$TRANSCRIPT")" || OUT=""
 
 # ---- dispatch a review of the work so far, in the background ----------------------
 # Gated inside codex_watch by the LEDGER: the diff must have changed, be big enough to be
@@ -609,7 +722,9 @@ case "$OUT" in
     #     was an hour AFTER the addressed session's last commit, and that session had no
     #     uncommitted work at all. Saying NOTHING about ownership is the cheapest correct
     #     form; the reader is pointed at the one command that settles it.
-    KINDS="$(printf '%s' "$OUT" | head -n1)"; KINDS="${KINDS#BLOCK}"; KINDS="${KINDS# }"
+    # report:128 (§1.94, run 1236) — a parameter expansion, not `printf | head -n1`: the head could SIGPIPE the printf
+    # on a long multi-line $OUT, exit 141 under pipefail (latent: :43 disarms it; measured 84-90/200 with it forced on).
+    KINDS="${OUT%%$'\n'*}"; KINDS="${KINDS#BLOCK}"; KINDS="${KINDS# }"
     case "$KINDS" in
       worktree) WHOSE='in the shared working tree — it holds every account'"'"'s uncommitted work, so these may or may not be yours; `git diff -U0 -- <path>` before acting' ;;
       commit)   WHOSE='in commit(s) whose review LANDED since this session last looked — the commit itself may be older or merged in (shared clone — git cannot attribute the author)' ;;
@@ -625,6 +740,22 @@ case "$OUT" in
     # STDERR, so everything the inform path wrote went into the void and no finding could
     # ever reach the model. That is the exact failure this hook exists to prevent, shipped
     # inside the hook meant to prevent it. Exit stays 0: informing must never interrupt.
-    printf 'review watch: %s\n' "$(printf '%s' "$OUT" | tail -n +2 | tr '\n' ' ')" >&2 ;;
+    #
+    # ⚠ §3.52 5b (run 1261) — AND STDERR ALONE STILL REACHED NO ONE. hooks.md: "Claude never sees
+    # stderr from a hook that exits 0. To read it yourself …, enable debug logging." So the line
+    # stays on stderr and also goes out as a `systemMessage` (stdout, the one JSON object this path
+    # prints: "Warning message shown to the user") and into `<state>/<session>.inform`, which
+    # eugo-prompt-context.sh's review arm says to Claude at the next prompt and deletes. NOT the Stop
+    # event's `additionalContext`: hooks.md says that one keeps the conversation going ("The
+    # conversation continues so Claude can act on it"), and informing must never continue a turn.
+    # Appended, not replaced: each inform names only what landed since the last look. Only a plain
+    # session id names a file: the prompt hook reads the file its own session id names, nothing else.
+    LINE="review watch: $(printf '%s' "$OUT" | tail -n +2 | tr '\n' ' ')"
+    printf '%s\n' "$LINE" >&2
+    case "$SESSION_ID" in
+      ''|*[!A-Za-z0-9_-]*) ;;
+      *) printf '%s\n' "$LINE" >>"$STATE/$SESSION_ID.inform" 2>/dev/null || true ;;
+    esac
+    printf '{"systemMessage": %s}\n' "$(json_str "$LINE")" ;;
 esac
 exit 0

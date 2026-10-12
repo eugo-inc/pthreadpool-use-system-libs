@@ -46,6 +46,8 @@
 #   - a checkout with a remote outside the allowlist and no explicit -R on a gh write ASKS
 #     (gh may default to the upstream parent of a fork)
 #   - malformed stdin, no python3, no git -> silent pass; bash 3.2 safe
+#   - a CRASH while classifying a call ASKS (§3.52 S3.7, ruled 2026-10-11): it used to pass, byte-identical to a real
+#     pass (§3022's UnboundLocalError let every by-name push through). An ask, not a block: the operator decides
 #   - an errexit INHERITED through BASH_ENV is disarmed first: the eugo deploy image's /usr/local/etc/bash_env
 #     turns on `set -eE -o pipefail` + an ERR trap, and under it `MSG="$(verdict)"` died with the ask's own
 #     exit 3 before the JSON printed — a non-2 exit is non-blocking, so the write ran UNASKED (measured
@@ -396,8 +398,11 @@ def check_mcp(name, tool_input, cwd):
 
 try:
     d = json.loads(sys.stdin.read())
-    if not isinstance(d, dict):
-        sys.exit(0)
+except Exception:
+    sys.exit(0)                                       # not a hook payload: nothing to classify
+if not isinstance(d, dict):
+    sys.exit(0)
+try:
     name = str(d.get("tool_name") or "")
     ti = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
     cwd = str(d.get("cwd") or os.environ.get("PG_ROOT") or ".")
@@ -409,8 +414,11 @@ try:
         check_mcp(name, ti, cwd)
 except SystemExit:
     raise
-except Exception:
-    sys.exit(0)
+except Exception as e:                                # §3.52 S3.7: a checker that broke cannot say "inside the org"
+    ask("external publication is a human step (§publish-manual): this guard's checker failed (%s) on this call, so "
+        "it cannot tell whether it writes outside the org. Approve only if it does not, or if the operator named the "
+        "draft and asked to publish it; otherwise draft it to %s and hand the path over via AskUserQuestion."
+        % (type(e).__name__, DRAFTS))
 sys.exit(0)
 PY
 }

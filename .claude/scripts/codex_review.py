@@ -44,17 +44,24 @@ Load-bearing codex gotchas baked in (see memory `codex-cli-operational-setup`):
 from __future__ import annotations
 
 import argparse
+import calendar
 import concurrent.futures
+import decimal
+import errno
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_MODELS = ["gpt-5.5", "gpt-5.3-codex-spark"]
@@ -339,7 +346,23 @@ CLAUDE_PERMISSION_MODE = "dontAsk"
 #: two-token form behaved the same. Not measured: the sandbox auto-allow path
 #: (`autoAllowBashIfSandboxed`), which no probe run had switched on. VARIADIC, like
 #: `--allowed-tools`: ONE token, followed by another flag.
-CLAUDE_DENIED_TOOLS = "Bash(docker:*),Bash(psql:*)"
+#: §3.44 row 6 (§7014, CLI 2.1.296, fake keys only) — `Read(//proc/**)`: the Read tool refuses
+#: `/proc/self/environ` as a device file, but GREP of it was allowed, returned the reviewer's own
+#: environment, and its transcript kept the whole value, so a keyed reviewer could copy its key
+#: into a transcript. A Read rule binds Grep and Glob too: with it, that Grep was refused. No
+#: review needs /proc. (`//` is the CLI's absolute-path form; `/proc/**` would be repo-relative.)
+CLAUDE_DENIED_TOOLS = "Bash(docker:*),Bash(psql:*),Read(//proc/**)"
+#: §3.52 S3.9 (run 1261) — THE REVIEWER READS NOTHING OUTSIDE ITS REPO, BY SETTING. Probe P5 (CLI 2.1.296, a throwaway
+#: repo, the flags above): the reviewer's Read AND Grep returned a file outside the repo; with
+#: `permissions.blockReadsOutsideWorkingDirectories` both were refused ("… is outside …") while an in-repo `git log`
+#: still ran (settings-reference.md: it denies Read, Grep, Glob and LSP outside the working directories in every
+#: permission mode; v2.1.257+). `crossSessionInbound: "refuse"`: a review is not a session the operator's other sessions
+#: may message, and a `--settings` value outranks a project's. ONE inline JSON value (the flag takes a path or a string).
+#: NOT `--setting-sources user` (ruled 2026-10-12): P5 measured that it also stops the repo's CLAUDE.md and
+#: `.claude/rules/` from loading; its review-quality A/B is §3.52 Wave 2 work.
+CLAUDE_REVIEW_SETTINGS = json.dumps(
+    {"permissions": {"blockReadsOutsideWorkingDirectories": True}, "crossSessionInbound": "refuse"},
+    separators=(",", ":"))
 
 #: §2121 — THE REVIEWER MUST NOT BE INTERRUPTED BY THE REPO IT IS REVIEWING.
 #:
@@ -750,10 +773,26 @@ def _has_bare_verdict(text: str) -> bool:
     return any(ln.strip() in ("APPROVED", "NEEDS_REVISION") for ln in text.splitlines())
 
 
+#: §1.139 (report:116) — the folder a seeded CODEX_HOME is made in. `codex_watch._dispatch_part`
+#: sets it to a per-part folder of its own and removes that folder after the part, so a part it had
+#: to SIGKILL (no `finally` runs) still leaves no copy of `auth.json` behind. Unset (a hand run) →
+#: the system temp folder, as before. An environment variable, not a flag, for §3044's reason (see
+#: REVIEW_ENV_PASS_ENV): an older driver ignores it, an unknown flag would be an argparse exit 2.
+CODEX_HOME_PARENT_ENV = "EUGO_REVIEW_CODEX_HOME_PARENT"
+
+
 def _seed_codex_home() -> str:
     """A fresh CODEX_HOME with the saved auth, so parallel codex runs don't contend
-    on the shared ~/.codex sqlite state. Caller must rmtree it."""
-    home = tempfile.mkdtemp(prefix="codex_home_")
+    on the shared ~/.codex sqlite state. Caller must rmtree it.
+
+    §1.139 — made under CODEX_HOME_PARENT_ENV when that names a usable folder; one that cannot
+    take it (gone, not a folder) falls back to the temp folder: the backstop is best-effort, the
+    review is not."""
+    parent = os.environ.get(CODEX_HOME_PARENT_ENV) or None
+    try:
+        home = tempfile.mkdtemp(prefix="codex_home_", dir=parent)
+    except OSError:
+        home = tempfile.mkdtemp(prefix="codex_home_")
     src = Path.home() / ".codex"
     for name in ("auth.json", "config.toml"):
         f = src / name
@@ -852,6 +891,204 @@ def _unwrap_claude_json(stdout: str) -> tuple[str, str, bool]:
     return obj["result"], resolved, obj.get("is_error") is True
 
 
+# --- §3.44 M1: what a review cost -----------------------------------------------------------------
+#: The CLI's json envelope reports tokens per meter, per model, and its own dollar estimate. Until
+#: §3.44 the driver read three keys of it and dropped the rest, so nothing could say what a review
+#: costs or which billing path paid for it. One object per child run now travels on the summary line
+#: as `usage=<compact JSON list>` — the `resolved=` precedent (§3118): an older watcher ignores an
+#: unknown `k=v` field, and an older driver prints none.
+#:
+#: ⚠ NUMBERS AND FIXED CODES ONLY. `codex_watch._results_of` splits the head of the line on spaces,
+#: so one value holding whitespace would cost the line its `note=` — the field the outage matcher
+#: reads. Text is copied from the envelope only when it has one of the three shapes below.
+USAGE_TOKEN_VERSION = "summary-token-v1"
+_USAGE_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@\[\]/-]{0,79}")
+_USAGE_SESSION_ID = re.compile(r"[0-9A-Fa-f-]{8,64}")
+_USAGE_CODE = re.compile(r"[a-z][a-z0-9_]{0,39}")
+#: (key in the field, key in the envelope). The names are the CLI's own (read from the 2.1.295
+#: binary); a renamed key simply goes absent, which the report shows as lost coverage.
+_USAGE_TOP = (("in", "input_tokens"), ("out", "output_tokens"),
+              ("cr", "cache_read_input_tokens"), ("cw", "cache_creation_input_tokens"))
+#: ⚠ The 5-minute / 1-hour write split covers the MAIN model only. A helper model (the advisor)
+#: bills under its own id in `modelUsage`, which is why every key of that map is kept.
+_USAGE_SPLIT = (("cw5", "ephemeral_5m_input_tokens"), ("cw1", "ephemeral_1h_input_tokens"))
+_USAGE_MODEL = (("in", "inputTokens"), ("out", "outputTokens"),
+                ("cr", "cacheReadInputTokens"), ("cw", "cacheCreationInputTokens"))
+_USAGE_RUN = (("turns", "num_turns"), ("ms", "duration_ms"), ("api_ms", "duration_api_ms"),
+              ("err", "api_error_status"))
+_USAGE_METERS = frozenset({"in", "out", "cr", "cw", "cw5", "cw1", "mu"})
+_USAGE_MAX_MODELS = 8
+_USAGE_MAX_ATTEMPTS = 4
+
+_USAGE_LOCK = threading.Lock()
+#: str(out_file) -> the child runs made for it, oldest first. `main` runs the models in a thread
+#: pool, so each runner records under its own capture path and `main` collects after the join.
+_USAGE_ATTEMPTS: dict[str, list[dict]] = {}
+
+
+def _usage_count(value) -> int | None:
+    """A token, turn or millisecond counter: a non-negative int. (`True` is an int in Python.)"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _usage_dollars(value) -> float | None:
+    """The CLI's own cost figure, passed through — it is never computed with here."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return round(float(value), 6)
+
+
+def _envelope_usage(stdout: str) -> dict:
+    """§3.44 M1 — the meters a `claude -p --output-format json` envelope reports. Never raises.
+
+    A key the envelope lacks is ABSENT here, never zero: a zero is a measurement ("no cache write"),
+    absence is "the CLI did not say" (an older CLI, a failed run), and the report must be able to
+    tell the two apart. Stdout that is not a `type: result` object yields `{}`.
+    """
+    try:
+        obj = json.loads(stdout)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(obj, dict) or obj.get("type") != "result":
+        return {}
+    out: dict = {}
+    usage = obj.get("usage")
+    if isinstance(usage, dict):
+        split = usage.get("cache_creation")
+        for src, pairs in ((usage, _USAGE_TOP),
+                           (split if isinstance(split, dict) else {}, _USAGE_SPLIT)):
+            for short, key in pairs:
+                n = _usage_count(src.get(key))
+                if n is not None:
+                    out[short] = n
+    for short, key in _USAGE_RUN:
+        n = _usage_count(obj.get(key))
+        if n is not None:
+            out[short] = n
+    usd = _usage_dollars(obj.get("total_cost_usd"))
+    if usd is not None:
+        out["usd"] = usd
+    sub, sid = obj.get("subtype"), obj.get("session_id")
+    if isinstance(sub, str) and _USAGE_CODE.fullmatch(sub):
+        out["sub"] = sub
+    if isinstance(sid, str) and _USAGE_SESSION_ID.fullmatch(sid):
+        out["sid"] = sid
+    models = obj.get("modelUsage")
+    if isinstance(models, dict):
+        mu: dict = {}
+        for name in sorted(k for k in models if isinstance(k, str) and _USAGE_MODEL_ID.fullmatch(k)):
+            row = models[name]
+            if not isinstance(row, dict) or len(mu) >= _USAGE_MAX_MODELS:
+                continue
+            kept: dict = {}
+            for short, key in _USAGE_MODEL:
+                n = _usage_count(row.get(key))
+                if n is not None:
+                    kept[short] = n
+            usd = _usage_dollars(row.get("costUSD"))
+            if usd is not None:
+                kept["usd"] = usd
+            if kept:
+                mu[name] = kept
+        if mu:
+            out["mu"] = mu
+    return out
+
+
+#: Every provider switch the CLI knows (names read from the 2.1.295 binary). Owned by `_auth_of`
+#: and deliberately NOT merged into `_ENV_CLOUD_SWITCHES`, which decides whether the cloud's own
+#: credentials pass the allowlist: the label must name the path even where the filter does not.
+_AUTH_CLOUD_SWITCHES = _ENV_CLOUD_SWITCHES + ("CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE")
+
+
+def _auth_of(env) -> str:
+    """§3.44 M1 — which credential a child env NAMES first: `cloud`, `gateway`, `env-token`,
+    `env-key`, `env-oauth`, else `sub` (the saved login).
+
+    The CLI's documented precedence, in order: a provider switch; ANTHROPIC_AUTH_TOKEN (a bearer);
+    ANTHROPIC_API_KEY ("in non-interactive mode the key is always used when present");
+    CLAUDE_CODE_OAUTH_TOKEN (a `claude setup-token` token — it bills the SUBSCRIPTION, so it has its
+    own code and ranks below the key); the saved login. A base-URL override is named ahead of the
+    credentials because it moves the whole request to another host. Reads names and emptiness
+    only: no value is returned, logged or stored. Not modelled: `apiKeyHelper` (a settings key,
+    invisible here) and a named profile.
+    """
+    def named(name: str) -> bool:
+        value = env.get(name)
+        return value is not None and value.strip() != ""
+
+    if any((env.get(s) or "").strip().lower() in ("1", "true", "yes", "on")
+           for s in _AUTH_CLOUD_SWITCHES):
+        return "cloud"
+    if named("ANTHROPIC_BASE_URL"):
+        return "gateway"
+    if named("ANTHROPIC_AUTH_TOKEN"):
+        return "env-token"
+    if named("ANTHROPIC_API_KEY"):
+        return "env-key"
+    if named("CLAUDE_CODE_OAUTH_TOKEN"):
+        return "env-oauth"
+    return "sub"
+
+
+def _usage_put(out_file, attempt: dict) -> None:
+    with _USAGE_LOCK:
+        _USAGE_ATTEMPTS.setdefault(str(out_file), []).append(attempt)
+
+
+def _usage_take(out_file) -> list[dict]:
+    with _USAGE_LOCK:
+        return _USAGE_ATTEMPTS.pop(str(out_file), [])
+
+
+def _record_attempt(out_file, prompt: str, *, env=None, proc=None, outcome: str = "") -> None:
+    """§3.44 M1 — note one child run under its capture path.
+
+    Measurement never fails a review: whatever goes wrong in here is dropped, and the run's own
+    result is returned to the caller unchanged.
+    """
+    try:
+        attempt: dict = {"id": secrets.token_hex(6), "pb": len(prompt.encode("utf-8", "replace"))}
+        if env is not None:
+            attempt["auth"] = _auth_of(env)
+        if proc is not None:
+            rc = proc.returncode       # negative when a signal ended the child: kept as it is
+            if isinstance(rc, int) and not isinstance(rc, bool):
+                attempt["rc"] = rc
+            attempt.update(_envelope_usage(proc.stdout or ""))
+        if outcome:
+            attempt["outcome"] = outcome
+        _usage_put(out_file, attempt)
+    except Exception:  # noqa: BLE001 — see the docstring
+        pass
+
+
+def _usage_token(out_file, verdict: str, note: str) -> str:
+    """§3.44 M1 — the `usage=` field for one model's summary line, or "" when there is nothing to say.
+
+    Printed only when some child run carried a meter: stdout that was not the envelope (an older
+    CLI, a wrapper) or a run that never returned (a timeout) leaves the line exactly as it was
+    before §3.44. The LAST run's outcome is the review's own; a runner may have set it already.
+    """
+    attempts = _usage_take(out_file)[-_USAGE_MAX_ATTEMPTS:]
+    if not attempts:
+        return ""
+    if "outcome" not in attempts[-1]:
+        attempts[-1]["outcome"] = ("ok" if verdict != "ERROR"
+                                   else "noverdict" if note == "no verdict line" else "error")
+    if not any(_USAGE_METERS & set(a) for a in attempts):
+        return ""
+    try:
+        token = json.dumps(attempts, separators=(",", ":"), sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return ""
+    return "" if any(c.isspace() for c in token) else token
+
+
 def _run_one_claude(
     model: str, prompt: str, review_type: str, effort: str, repo: str, out_file: Path
 ) -> tuple[str, str, str]:
@@ -879,6 +1116,10 @@ def _run_one_claude(
       * Output goes to STDOUT, so this writes `out_file` itself; the codex path gets
         the same file written for it by `codex -o`.
     """
+    # §3.44 M1 — `child_env` is bound before the `try` so the handlers below can name the billing
+    # path of a run that never returned; `recorded` keeps a late failure from noting the run twice.
+    child_env = None
+    recorded = False
     try:
         # §1969 — `or "claude"` is deliberate: when NOTHING resolves, argv keeps the
         # bare name and `subprocess.run` raises FileNotFoundError into the handler
@@ -889,6 +1130,14 @@ def _run_one_claude(
         # handler that keeps that promise.
         binary = resolve_claude_binary() or "claude"
         _resolved_path(out_file).unlink(missing_ok=True)
+        # §2121 — see REVIEW_SUBPROCESS_ENV. `cwd=repo` is what makes this necessary:
+        # the reviewer loads the reviewed repo's hooks, so it must be able to say
+        # "I am the reviewer" to them. §2.38 (a1) — and no claude.ai connectors. §2.38 (b) —
+        # from the allowlist, never the session's whole environment; the marker is set
+        # HERE, after the filter, so no allowlist edit can drop it (a reviewer without it
+        # dispatches reviews: the SessionStart `--full` hook fires in every one).
+        child_env = {**_review_child_env("claude"), REVIEW_SUBPROCESS_ENV: "1",
+                     CLAUDE_NO_CONNECTORS_ENV: "false"}
         proc = subprocess.run(
             [
                 binary, "-p",
@@ -897,6 +1146,8 @@ def _run_one_claude(
                 # §3118 — json, not text: the envelope names the model that answered
                 # (`modelUsage`), which is how an alias gets recorded as an exact id.
                 "--output-format", "json",
+                # §3.52 S3.9 — see CLAUDE_REVIEW_SETTINGS.
+                "--settings", CLAUDE_REVIEW_SETTINGS,
                 # §2.38 (a1) — see CLAUDE_MCP_ISOLATION; kept ahead of another flag.
                 *CLAUDE_MCP_ISOLATION,
                 # §2.38 (e) — see CLAUDE_DENIED_TOOLS; one token, kept ahead of another flag.
@@ -908,16 +1159,12 @@ def _run_one_claude(
             capture_output=True,
             text=True,
             cwd=repo,
-            # §2121 — see REVIEW_SUBPROCESS_ENV. `cwd=repo` is what makes this necessary:
-            # the reviewer loads the reviewed repo's hooks, so it must be able to say
-            # "I am the reviewer" to them. §2.38 (a1) — and no claude.ai connectors. §2.38 (b) —
-            # from the allowlist, never the session's whole environment; the marker is set
-            # HERE, after the filter, so no allowlist edit can drop it (a reviewer without it
-            # dispatches reviews: the SessionStart `--full` hook fires in every one).
-            env={**_review_child_env("claude"), REVIEW_SUBPROCESS_ENV: "1",
-                 CLAUDE_NO_CONNECTORS_ENV: "false"},
+            env=child_env,
             timeout=CLAUDE_TIMEOUT_S,
         )
+        # §3.44 M1 — noted HERE, ahead of the rc branch: a failed run bills tokens too.
+        _record_attempt(out_file, prompt, env=child_env, proc=proc)
+        recorded = True
         # Same fail-safe rule as the codex path (dogfood f2): a nonzero exit is a FAILED
         # run — never let partial output masquerade as a clean review (a sweep would
         # otherwise report a false NO_FINDINGS).
@@ -979,14 +1226,1480 @@ def _run_one_claude(
             return (model, "ERROR", "no verdict line")
         return (model, _verdict(review_type, text), "")
     except subprocess.TimeoutExpired:
+        _record_attempt(out_file, prompt, env=child_env, outcome="timeout")
         return (model, "ERROR", f"timeout after {CLAUDE_TIMEOUT_S}s")
     except FileNotFoundError:
+        if not recorded:
+            _record_attempt(out_file, prompt, env=child_env, outcome="no_cli")
         return (model, "ERROR", "claude CLI not found on PATH")
     except Exception as exc:  # noqa: BLE001 — isolate any per-model failure
+        if not recorded:
+            _record_attempt(out_file, prompt, env=child_env, outcome="error")
         return (model, "ERROR", str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
 
 
 _ENGINE_RUNNERS = {"codex": _run_one, "claude": _run_one_claude}
+
+
+# --- §3.44 review credits: keyring loader + gate (M5, dark) ----------------------------------
+# Each Max plan's API credits sit in a Console organization of their own; the review watch is to
+# pay from those keys, pooled and soonest-expiry first, with the subscription as the fallback.
+# DARK until M7: nothing in the review path calls this block, so it cannot change a review.
+
+#: §3.44 M5 — where the keyring lives. A DIRECTORY, never a key. NO default: unset or empty is
+#: the feature OFF and not one file is read; the value `off` is the kill switch.
+#: Layout: `keyring.json` (metadata, no secret), `keys/<label>` (one key per file — nothing in
+#: this block opens `keys/`), `journal/` (M6) and `DISABLED` (a second kill switch, any content).
+REVIEW_CREDITS_DIR_ENV = "EUGO_REVIEW_CREDITS_DIR"
+#: The Linux managed-settings file and its drop-in directory, as the official docs name them
+#: (code.claude.com/docs/en/managed-settings, read 2026-10-09). The child loads both, so the gate
+#: reads both; server-managed (console) settings never reach a local file and are not seen here.
+CLAUDE_MANAGED_SETTINGS = "/etc/claude-code/managed-settings.json"
+CLAUDE_MANAGED_SETTINGS_DIR = "/etc/claude-code/managed-settings.d"
+#: keyring.json defaults. The writers are the two review hooks (`codex_watch.WRITERS`); an
+#: operator pass (`once`) or a manual driver run stays on the subscription.
+CREDITS_GRANT_USD = 200
+CREDITS_WRITERS = ("hook-commit", "hook-turn-end")
+_CREDITS_WRITER_ENV = "EUGO_REVIEW_WRITER"
+_CREDITS_LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,15}")
+#: strptime alone takes `2026-1-5`; the shape is checked first.
+_CREDITS_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_CREDITS_FILE_MAX = 1 << 20
+#: The launches the credits FAQ covers: a terminal `claude` and the SDK's CLI. An IDE, desktop or
+#: GitHub-Action session stays on the subscription — refused, never relabelled (operator ruling;
+#: the Usage Policy bans misrepresenting the client).
+_CREDITS_ENTRYPOINTS = frozenset({"", "cli", "sdk-cli"})
+#: Parent-env names that mean the session already bills somewhere else (a gateway, a setup-token,
+#: a GitHub Action), any value, even empty; ANTHROPIC_* is matched as a prefix.
+_CREDITS_ENV_REFUSED = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_ACTION"})
+#: Names EUGO_REVIEW_ENV_PASS may not carry into a keyed child (plus any ANTHROPIC_*).
+_CREDITS_PASS_REFUSED = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_ACTION"})
+#: A settings `env` block naming one of these would re-point the keyed child's credential.
+_CREDITS_SETTINGS_REFUSED = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+_CREDITS_SETTINGS_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_")
+
+
+def _credits_label_ok(label) -> bool:
+    """§3.44 D9 — a keyring label: the shape, and never `pool` (the pool's own name in reset scopes
+    and alerts) nor anything holding `invariants` (codex_watch files a WARNING holding that word
+    as a rules warning)."""
+    return (isinstance(label, str) and _CREDITS_LABEL.fullmatch(label) is not None
+            and label != "pool" and "invariants" not in label)
+
+
+def _credits_dir(env) -> str | None:
+    """§3.44 M5 — the keyring directory `env` names, stripped; None when unset or empty."""
+    return (env.get(REVIEW_CREDITS_DIR_ENV) or "").strip() or None
+
+
+def _credits_errno(exc: BaseException) -> str:
+    """An OSError's errno name (`EACCES`), else the exception's class name."""
+    code = getattr(exc, "errno", None)
+    if isinstance(code, int) and code in errno.errorcode:
+        return errno.errorcode[code]
+    return type(exc).__name__
+
+
+def _credits_date(text) -> datetime | None:
+    """A `YYYY-MM-DD` string as 00:00 UTC that day; None for any other value."""
+    if not isinstance(text, str) or not _CREDITS_DATE.fullmatch(text):
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _credits_object(pairs: list) -> dict:
+    """json `object_pairs_hook`: a name given twice is a parse error, not last-one-wins."""
+    out: dict = {}
+    for name, value in pairs:
+        if name in out:
+            raise ValueError(f"duplicate name {name!r}")
+        out[name] = value
+    return out
+
+
+def _credits_constant(name: str):
+    """json `parse_constant`: NaN and Infinity are not numbers here."""
+    raise ValueError(name)
+
+
+def _credits_read_json(path: str, nofollow: bool = False, want_uid: int | None = None):
+    """One small JSON file, strictly parsed. Raises OSError or ValueError.
+
+    §3.44 D4: opened O_NONBLOCK and fstat-checked as a regular file before a byte is read, so a
+    FIFO or a device in its place is an error (EINVAL), never a hang — a group member can plant
+    one in the 2770 keyring dir or a shared checkout's `.claude/`. `nofollow` also refuses a
+    symlink (ELOOP): right for the keyring's own files, wrong for settings, which are often
+    dotfile symlinks (fstat still sees a symlinked FIFO's type). §3.48: `want_uid` also refuses
+    a file another uid owns (EPERM) — any member can swap a file in the 2770 dir, so the key
+    vending machine trusts only a keyring.json its own uid wrote."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    if nofollow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+        if want_uid is not None and st.st_uid != want_uid:
+            raise OSError(errno.EPERM, "wrong owner", path)
+        fh = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with fh:
+        raw = fh.read(_CREDITS_FILE_MAX + 1)
+    if len(raw) > _CREDITS_FILE_MAX:
+        raise ValueError("too large")
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=_credits_object,
+                      parse_constant=_credits_constant)
+
+
+def _credits_meta(doc) -> tuple[dict | None, str]:
+    """keyring.json v1 validated and normalised, defaults filled. Unknown top-level names are
+    dropped; `True == 1` in Python, so every number and flag is checked by type."""
+    if not isinstance(doc, dict):
+        return None, "not an object"
+    version = doc.get("version")
+    if type(version) is not int or version != 1:
+        return None, "version"
+    grant = doc.get("grant_usd", CREDITS_GRANT_USD)
+    if (isinstance(grant, bool) or not isinstance(grant, (int, float)) or grant <= 0
+            or (isinstance(grant, float) and not math.isfinite(grant)) or grant > 10 ** 9):
+        return None, "grant_usd"
+    repos = doc.get("repos", [])
+    if not isinstance(repos, list) or not all(isinstance(r, str) and os.path.isabs(r) for r in repos):
+        return None, "repos"
+    writers = doc.get("writers", list(CREDITS_WRITERS))
+    if not isinstance(writers, list) or not all(isinstance(w, str) and w for w in writers):
+        return None, "writers"
+    # D13: the uid `init` recorded as the keyring's owner (`check` compares every file to it).
+    owner = doc.get("owner_uid")
+    if owner is not None and (type(owner) is not int or owner < 0):
+        return None, "owner_uid"
+    keys = doc.get("keys", [])
+    if not isinstance(keys, list):
+        return None, "keys"
+    seen: set = set()
+    out: list = []
+    for i, key in enumerate(keys):
+        if not isinstance(key, dict):
+            return None, f"keys[{i}]"
+        label = key.get("label")
+        if not _credits_label_ok(label):
+            return None, f"keys[{i}].label"
+        if label in seen:
+            return None, f"keys[{i}].label duplicate"
+        seen.add(label)
+        enabled = key.get("enabled", True)
+        if not isinstance(enabled, bool):
+            return None, f"keys[{i}].enabled"
+        renews = key.get("renews")
+        if _credits_date(renews) is None:
+            return None, f"keys[{i}].renews"
+        org = key.get("org")
+        if org is not None and not isinstance(org, str):
+            return None, f"keys[{i}].org"
+        # D12: `org` is the operator's free text; `org_id` is the organization id `verify` read
+        # from the API, the only one the duplicate-organization refusal compares.
+        org_id = key.get("org_id")
+        if org_id is not None and (not isinstance(org_id, str) or not org_id):
+            return None, f"keys[{i}].org_id"
+        out.append({"label": label, "enabled": enabled, "renews": renews, "org": org, "org_id": org_id})
+    return {"version": 1, "grant_usd": grant, "repos": list(repos), "writers": list(writers),
+            "owner_uid": owner, "keys": out}, ""
+
+
+def _load_keyring(path_to_dir, want_uid: int | None = None) -> tuple[dict | None, str]:
+    """§3.44 M5 — `<dir>/keyring.json`, validated, defaults filled: (meta, "") or (None, a short
+    error). Never raises, and never opens `keys/`: the keyring holds no secret, so everything that
+    only needs metadata (the gate, `review_credits.py status`, the report) stays key-blind.
+    §3.48: with `want_uid`, a keyring.json another uid owns is `keyring.json unreadable EPERM`.
+    """
+    try:
+        doc = _credits_read_json(os.path.join(os.fspath(path_to_dir), "keyring.json"), nofollow=True,
+                                 want_uid=want_uid)
+    except FileNotFoundError:
+        return None, "keyring.json missing"
+    except OSError as exc:
+        return None, f"keyring.json unreadable {_credits_errno(exc)}"
+    except (ValueError, RecursionError):
+        return None, "keyring.json is not valid JSON"
+    except Exception as exc:  # noqa: BLE001 — never raises
+        return None, f"keyring.json {type(exc).__name__}"
+    return _credits_meta(doc)
+
+
+def _credits_env_refused(src) -> bool:
+    """The `env` gate: the parent env names a credential or a provider other than the key."""
+    if any(name.startswith("ANTHROPIC_") or name in _CREDITS_ENV_REFUSED for name in src):
+        return True
+    if any((src.get(s) or "").strip().lower() in ("1", "true", "yes", "on") for s in _AUTH_CLOUD_SWITCHES):
+        return True
+    # Parsed exactly as `_review_child_env` parses it, so the gate sees the names the child gets.
+    passed = {n for n in re.split(r"[\s,]+", src.get(REVIEW_ENV_PASS_ENV) or "") if _ENV_NAME.fullmatch(n)}
+    return any(n.startswith("ANTHROPIC_") or n in _CREDITS_PASS_REFUSED for n in passed)
+
+
+def _credits_settings_files(repo, src) -> list[str] | None:
+    """Every settings file the reviewer child (cwd = repo) would load; None when that cannot be
+    known — no CLAUDE_CONFIG_DIR and no HOME, a relative one (the CLI resolves it against the
+    child's cwd, this process against its own), CLAUDE_CODE_USE_COWORK_PLUGINS in the env (the CLI
+    then reads `cowork_settings.json` instead; refused on any value, fail closed), or a drop-in
+    directory that cannot be listed.
+
+    D10: an empty CLAUDE_CONFIG_DIR counts as unset, so HOME's file is read — AND `<repo>/
+    settings.json`, because CLI 2.1.296 keeps the empty value (`CLAUDE_CONFIG_DIR ?? ~/.claude`)
+    and resolves it against the child's cwd. Reading both refuses whichever one the child loads.
+    """
+    config = src.get("CLAUDE_CONFIG_DIR")
+    home = src.get("HOME") or ""
+    root = os.fspath(repo)
+    if "CLAUDE_CODE_USE_COWORK_PLUGINS" in src:
+        return None
+    if config:
+        if not os.path.isabs(config):
+            return None
+        users = [os.path.join(config, "settings.json")]
+    elif home:
+        if not os.path.isabs(home):
+            return None
+        users = [os.path.join(home, ".claude", "settings.json")]
+        if config is not None:  # set but empty
+            users.append(os.path.join(root, "settings.json"))
+    else:
+        return None
+    project = os.path.join(root, ".claude")
+    files = [*users, os.path.join(project, "settings.json"), os.path.join(project, "settings.local.json"),
+             CLAUDE_MANAGED_SETTINGS]
+    try:
+        names = sorted(os.listdir(CLAUDE_MANAGED_SETTINGS_DIR))
+    except (FileNotFoundError, NotADirectoryError):
+        names = []
+    except OSError:
+        return None
+    # The docs: every `*.json` in the drop-in directory, hidden files ignored.
+    files += [os.path.join(CLAUDE_MANAGED_SETTINGS_DIR, n) for n in names
+              if n.endswith(".json") and not n.startswith(".")]
+    return files
+
+
+def _credits_settings_refused(path: str) -> bool:
+    """One settings file: True when it cannot be read or parsed, sets `apiKeyHelper`, or has an
+    `env` block naming a credential or provider switch. A missing file is fine."""
+    try:
+        doc = _credits_read_json(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except Exception:  # noqa: BLE001 — unreadable or unparseable: the child's credential is unknown
+        return True
+    if not isinstance(doc, dict) or "apiKeyHelper" in doc:
+        return True
+    env = doc.get("env")
+    if env is None:
+        return False
+    if not isinstance(env, dict):
+        return True
+    return any(n in _CREDITS_SETTINGS_REFUSED or n.startswith(_CREDITS_SETTINGS_PREFIXES) for n in env)
+
+
+def _credits_gate(repo, env=None) -> tuple[dict | None, str]:
+    """§3.44 M5 — may this review pay from a keyring key? (meta, "ok"), else (meta or None, the
+    reason). Never raises: anything unexpected refuses with the reason of the check it hit.
+
+    First failure wins, in this order: `unset` (no file read at all), `off`, `entrypoint`, `env`,
+    `path` (relative, missing, not a directory, inside the reviewed repo or this checkout, or a
+    world permission bit on the directory or keyring.json), `disabled`, `parse`, `repo` (not
+    listed, or not a main checkout at its root: `<repo>/.git` must be a directory), `writer`,
+    `settings`, `nokeys`. `env` defaults to `os.environ`; it is the PARENT's environment, read
+    raw, because the allowlisted child env would hide what the session bills through.
+    """
+    src = os.environ if env is None else env
+    meta = None
+    stage = "unset"
+    try:
+        value = _credits_dir(src)
+        if value is None:
+            return None, "unset"
+        stage = "off"
+        if value == "off":
+            return None, "off"
+        stage = "entrypoint"
+        entry = src.get("CLAUDE_CODE_ENTRYPOINT")
+        if entry is not None and entry not in _CREDITS_ENTRYPOINTS:
+            return None, "entrypoint"
+        stage = "env"
+        if _credits_env_refused(src):
+            return None, "env"
+        stage = "path"
+        if not os.path.isabs(value):
+            return None, "path"
+        home = os.path.realpath(value)
+        try:
+            st = os.stat(home)
+        except OSError:
+            return None, "path"
+        if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o007:
+            return None, "path"
+        # Components, not string prefixes: /opt/eugo/athena-backups is not inside /opt/eugo/athena.
+        for root in (repo, REPO_ROOT):
+            inner = os.path.realpath(os.fspath(root))
+            if home == inner or home.startswith(inner.rstrip(os.sep) + os.sep):
+                return None, "path"
+        try:
+            if os.stat(os.path.join(home, "keyring.json")).st_mode & 0o007:
+                return None, "path"
+        except FileNotFoundError:
+            pass  # `parse` names it
+        except OSError:
+            return None, "path"
+        stage = "disabled"
+        if os.path.lexists(os.path.join(home, "DISABLED")):
+            return None, "disabled"
+        stage = "parse"
+        meta, _err = _load_keyring(home)
+        if meta is None:
+            return None, "parse"
+        stage = "repo"
+        mine = os.path.realpath(os.fspath(repo))
+        if not any(os.path.realpath(r) == mine for r in meta["repos"]):
+            return meta, "repo"
+        # D11: a main checkout at its root only. In a worktree (`.git` is a file) or a
+        # subdirectory, CLI >= 2.1.211 reads the main checkout's settings.local.json, which the
+        # `settings` stage does not read.
+        if not os.path.isdir(os.path.join(mine, ".git")):
+            return meta, "repo"
+        stage = "writer"
+        if (src.get(_CREDITS_WRITER_ENV) or "").strip() not in meta["writers"]:
+            return meta, "writer"
+        stage = "settings"
+        files = _credits_settings_files(repo, src)
+        if files is None or any(_credits_settings_refused(f) for f in files):
+            return meta, "settings"
+        stage = "nokeys"
+        if not any(k["enabled"] for k in meta["keys"]):
+            return meta, "nokeys"
+    except Exception:  # noqa: BLE001 — see the docstring
+        return meta, stage
+    return meta, "ok"
+
+
+def _credits_boundary(year: int, month: int, day: int) -> datetime:
+    """00:00 UTC on `day` of that month, clamped to the month's last day."""
+    return datetime(year, month, min(day, calendar.monthrange(year, month)[1]), tzinfo=timezone.utc)
+
+
+def _cycle_bounds(renews: str, now: datetime) -> tuple[datetime, datetime]:
+    """§3.44 M5 — the billing cycle [start, end) holding `now`, for a key whose Console shows its
+    next credit on `renews` (YYYY-MM-DD). Only the day of `renews` matters, so it may lie before or
+    after `now`. Raises ValueError for a naive `now` or a malformed `renews`.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    anchor = _credits_date(renews)
+    if anchor is None:
+        raise ValueError(f"renews is not YYYY-MM-DD: {renews!r}")
+    # Boundaries are 00:00 UTC on the anchor day, clamped to each month's length and taken from
+    # the ANCHOR every month, never from the previous boundary: chaining Jan 31 -> Feb 28 ->
+    # Mar 28 would drift. Traces, anchor day 31:
+    #   now 2026-01-31T00:00Z -> [2026-01-31, 2026-02-28)  a boundary starts its own cycle
+    #   now 2026-02-15        -> [2026-01-31, 2026-02-28)  February's boundary is still ahead
+    #   now 2026-03-01        -> [2026-02-28, 2026-03-31)  back to the 31st, no drift
+    #   now 2028-02-29T00:00Z -> [2028-02-29, 2028-03-31)  a leap February clamps to the 29th
+    # Anchor Dec 31: now 2026-12-31T00:00Z -> [2026-12-31, 2027-01-31); now 2027-01-15 -> the same.
+    # No DST case: every value is UTC.
+    now = now.astimezone(timezone.utc)
+    year, month, day = now.year, now.month, anchor.day
+    here = _credits_boundary(year, month, day)
+    if now >= here:
+        nxt = (year + 1, 1) if month == 12 else (year, month + 1)
+        return here, _credits_boundary(nxt[0], nxt[1], day)
+    prev = (year - 1, 12) if month == 1 else (year, month - 1)
+    return _credits_boundary(prev[0], prev[1], day), here
+
+
+def _pick_key(meta, states, now) -> str | None:
+    """§3.44 M5 — the label to pay from: None unless the pool is `ok`; else, over keys enabled in
+    `meta` whose state is `usable`, the minimum by (cycle end, label) — the credits that expire
+    soonest are spent first, one key drained before the next. Deterministic, so every UNIX user
+    and lane picks the same key with no shared pointer. Never raises (None).
+    """
+    try:
+        if ((states or {}).get("pool") or {}).get("state") != "ok":
+            return None
+        key_states = states.get("keys") or {}
+        best = None
+        for key in (meta or {}).get("keys") or []:
+            label = key.get("label")
+            state = key_states.get(label)
+            if key.get("enabled", True) is not True or not isinstance(state, dict):
+                continue
+            if state.get("state") != "usable":
+                continue
+            try:
+                end = _cycle_bounds(key.get("renews"), now)[1]
+            except (TypeError, ValueError):
+                continue
+            if best is None or (end, label) < best:
+                best = (end, label)
+        return None if best is None else best[1]
+    except Exception:  # noqa: BLE001 — see the docstring
+        return None
+
+
+# --- §3.44 review credits: journal, key state, classifier, reports (M6, dark) ---------------------
+# A key's state is DERIVED from an append-only journal, never kept in a state file: six UNIX users
+# and two lanes write at once, and a read-modify-write file loses one writer's update. Each user
+# appends to a shard of its own under flock; every reader merges every shard.
+# DARK until M7, like the M5 block above.
+
+#: §3.44 M6 — journal events, v1. Every event: {"v": 1, "t": "<UTC YYYY-MM-DDTHH:MM:SSZ>", "ev"}.
+#:   start  id (the SAME 12 hex as that child run's ledger usage object), key, fp, user, repo,
+#:          writer, capture; §3.48 adds cap (the dollars reserved), lease (seconds), tok (16 hex:
+#:          the first half of sha256 over the end's token) and batch (only when true)
+#:   end    id, key, class (`_KEYED_CLASSES`), and the run's meters when its usage object has
+#:          them: in, out, cr, cw, cw5, cw1, usd, mu; §3.48 adds writer (its start's, so a lane's
+#:          end is told from a review's without a join — an end with none counts as a review)
+#:   reset  scope (`pool` or a label), user
+#:   alert  key (a label or `pool`), code (`_CREDIT_REPORTS`), cycle (the dedupe id)
+CREDITS_JOURNAL_VERSION = 1
+_JOURNAL_KINDS = frozenset({"start", "end", "reset", "alert"})
+#: An end event's class. `ok` (a review was produced) and `timeout` are the caller's to say;
+#: `_classify_keyed` names the rest.
+_KEYED_CLASSES = ("ok", "credit", "auth", "spend_limit", "rate", "api", "too_long", "timeout", "unknown")
+_CREDITS_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_CREDITS_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_JOURNAL_SHARD = re.compile(r"([0-9]{4}-[0-9]{2})\.([^/]+)\.jsonl")
+#: A user name that makes a plain file name; any other is replaced by the uid.
+_JOURNAL_USER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
+#: `journal/` is group-writable (3770, §3.44 D8: setgid + sticky), so a member could plant a symlink (an append would land in
+#: its target) or a FIFO (an open would block a review forever). O_NOFOLLOW refuses the first;
+#: O_NONBLOCK plus a regular-file check refuse the second.
+_JOURNAL_OPEN = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+#: D4: a shard is group-readable and flock ignores the open mode, so any member can hold its lock.
+#: An append retries a non-blocking lock this long, then gives up ("EWOULDBLOCK"), never waits.
+_JOURNAL_LOCK_S = 2.0
+_JOURNAL_LOCK_STEP_S = 0.02
+_CREDITS_COOL_S = 600                     # a 429 or a 5xx rests the key for 10 minutes
+#: D1: the Console shows the renewal DATE only, and the grant may land hours after 00:00 UTC. A
+#: credit fault this soon after a cycle start may predate the grant: it rests the key an hour.
+_CREDITS_RENEW_GRACE_S = 36 * 3600
+_CREDITS_RENEW_COOL_S = 3600
+_CREDITS_PAUSE_S = 3600                   # two unexplained failures in a row rest the pool an hour
+_CREDITS_REPEAT_S = 24 * 3600             # D7: a third pause inside this disables the pool
+_CREDITS_OVER = decimal.Decimal("1.1")    # spend at 110% of the grant is real money: stop
+_CREDITS_EARLY = decimal.Decimal("0.5")
+_CREDITS_CENT = decimal.Decimal("0.01")
+
+
+def _credits_time(text) -> datetime | None:
+    """A journal time (`YYYY-MM-DDTHH:MM:SSZ`) as an aware UTC datetime; None for any other value.
+    strptime, never fromisoformat: Python 3.9's refuses the `Z`."""
+    if not isinstance(text, str) or not _CREDITS_TIME.fullmatch(text):
+        return None
+    try:
+        return datetime.strptime(text, _CREDITS_TIME_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _credits_iso(when: datetime) -> str:
+    """An aware datetime as a journal time: UTC, whole seconds, `Z`."""
+    return when.astimezone(timezone.utc).strftime(_CREDITS_TIME_FORMAT)
+
+
+def _credits_plus(when: datetime, seconds: int) -> datetime:
+    """`when` plus whole `seconds`, in UTC. Journal times are whole seconds, so the sum is exact."""
+    return datetime.fromtimestamp(when.timestamp() + seconds, tz=timezone.utc)
+
+
+def _key_fp(key_text) -> str:
+    """§3.44 M6 — a key's fingerprint: the first 8 hex of sha256 over its stripped text. The journal
+    names the key a run used by it, so an auth park can lift when the key file changes, without
+    ever holding the key; 32 bits of a hash tell keys apart and recover nothing."""
+    if isinstance(key_text, str):
+        raw = key_text.strip().encode("utf-8")
+    elif isinstance(key_text, bytes):
+        raw = key_text.strip()
+    else:
+        raise TypeError("key_text must be str or bytes")
+    return hashlib.sha256(raw).hexdigest()[:8]
+
+
+def _credits_user() -> str:
+    """The effective user's name — its journal shard's, and the `user` of the events it writes —
+    or its uid when the name is unknown or would not make a plain file name."""
+    return _credits_user_of(os.geteuid())
+
+
+def _credits_user_of(uid: int) -> str:
+    """The shard-name user `_credits_user` gives the user with `uid`: one rule for the writer that
+    names a shard and the reader that checks who owns it (D14)."""
+    import pwd  # POSIX-only, like fcntl: imported where it is used, so the driver imports anywhere
+
+    try:
+        name = pwd.getpwuid(uid).pw_name
+    except (KeyError, OSError):
+        return str(uid)
+    return name if isinstance(name, str) and _JOURNAL_USER.fullmatch(name) else str(uid)
+
+
+def _journal_lock(fd: int) -> bool:
+    """flock LOCK_EX on `fd`, retried without blocking for at most `_JOURNAL_LOCK_S`; False when it
+    never came free. A legitimate holder keeps it for microseconds (one write). Raises OSError
+    for any failure other than the lock being held."""
+    import fcntl  # POSIX-only: see `_credits_user_of`
+    import time
+
+    deadline = time.monotonic() + _JOURNAL_LOCK_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+        else:
+            return True
+        time.sleep(_JOURNAL_LOCK_STEP_S)
+
+
+def _journal_open(path: str) -> tuple[int, bool]:
+    """(fd, created) for appending to one shard; raises OSError. O_EXCL says who created the
+    file, so only the creator sets its mode. Read access is for the torn-tail check."""
+    flags = os.O_RDWR | os.O_APPEND | _JOURNAL_OPEN
+    for _attempt in range(3):
+        try:
+            fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o640)
+        except FileExistsError:
+            pass
+        else:
+            return fd, True
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            continue  # removed between the two opens: create it again
+        else:
+            return fd, False
+    raise FileNotFoundError(errno.ENOENT, "journal shard vanished three times", path)
+
+
+def _journal_append(path_to_dir, event) -> str:
+    """§3.44 M6 — append one event to this user's shard, `journal/<YYYY-MM>.<user>.jsonl` (the UTC
+    month of the event's `t`): "" on success, else an error name — an errno name (`EACCES`,
+    `ENOENT`, ...) or an exception class name (`ValueError` for an event that is not v1-shaped).
+    Never raises: M7 calls it on the review path, where a journal fault may cost only the key.
+
+    Absent `v` and `t` (now) are filled, and `user` on `start` and `reset`, from the lookup that
+    names the shard. A missing `journal/` is `ENOENT`: the operator tool owns the layout, and
+    nothing here creates a directory. A new shard is 0640 whatever the umask. The line goes out in
+    ONE `os.write` under `flock`, so writers never interleave; a tail a crashed writer left without
+    its newline is closed first, so that damage stays in its own line.
+
+    D8: a shard this user does not own is `EPERM` — another member planted it under this user's
+    name, and appending would put this user's events in a file the planter controls. D4: a lock
+    still held after `_JOURNAL_LOCK_S` is `EWOULDBLOCK`, never a wait.
+    """
+    try:
+        if not isinstance(event, dict) or event.get("ev") not in _JOURNAL_KINDS:
+            return "ValueError"
+        line = dict(event)
+        line.setdefault("v", CREDITS_JOURNAL_VERSION)
+        line.setdefault("t", _credits_iso(datetime.now(timezone.utc)))
+        user = _credits_user()
+        if line["ev"] in ("start", "reset"):
+            line.setdefault("user", user)
+        if (type(line["v"]) is not int or line["v"] != CREDITS_JOURNAL_VERSION
+                or _credits_time(line["t"]) is None):
+            return "ValueError"
+        data = (json.dumps(line, separators=(",", ":"), sort_keys=True, allow_nan=False)
+                + "\n").encode("utf-8")
+        shard = os.path.join(os.fspath(path_to_dir), "journal", f"{line['t'][:7]}.{user}.jsonl")
+        fd, created = _journal_open(shard)
+        try:
+            if created:
+                os.fchmod(fd, 0o640)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return "EINVAL"
+            if st.st_uid != os.geteuid():
+                return "EPERM"
+            if not _journal_lock(fd):  # released by the close
+                return "EWOULDBLOCK"
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                data = b"\n" + data
+            if os.write(fd, data) != len(data):
+                os.ftruncate(fd, size)  # a short write would glue the next event onto its tail
+                return "EIO"
+        finally:
+            os.close(fd)
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        return _credits_errno(exc)
+    return ""
+
+
+def _journal_event(raw: bytes, now: datetime):
+    """(t, event) for one complete journal line, or None when it holds no usable event."""
+    try:
+        event = json.loads(raw.decode("utf-8"), object_pairs_hook=_credits_object,
+                           parse_constant=_credits_constant)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(event, dict) or not isinstance(event.get("ev"), str):
+        return None
+    t = _credits_time(event.get("t"))
+    if t is None or t > now:
+        return None
+    return t, event
+
+
+def _journal_shard(path: str, name: str, now: datetime, user: str) -> tuple[list, str | None]:
+    """(rows, None): (t, shard name, line number, event) for each usable line of one shard. A line
+    without its newline can only be the last, torn or still being written, and is skipped even if
+    it parses. (rows, why) when the shard was skipped, or read only in part — `why` is one of
+    `symlink`, `fifo`, `not a regular file`, `unreadable <ERRNO>`, `wrong owner (<owner>)` (its
+    owner, named as `_credits_user_of` names it, is not `user`, the user its name gives) or
+    `read failed <ERRNO>` (the rows read before the failure are kept)."""
+    rows: list = []
+    try:
+        fd = os.open(path, os.O_RDONLY | _JOURNAL_OPEN)
+    except OSError as exc:
+        return rows, "symlink" if exc.errno == errno.ELOOP else f"unreadable {_credits_errno(exc)}"
+    try:
+        st = os.fstat(fd)
+        why = ("fifo" if stat.S_ISFIFO(st.st_mode)
+               else None if stat.S_ISREG(st.st_mode) else "not a regular file")
+        fh = os.fdopen(fd, "rb") if why is None else None
+    except Exception as exc:  # noqa: BLE001 — the descriptor is still ours to close
+        os.close(fd)
+        return rows, f"unreadable {_credits_errno(exc)}"
+    if fh is None:
+        os.close(fd)
+        return rows, why
+    with fh:
+        owner = _credits_user_of(st.st_uid)
+        if owner != user:
+            return rows, f"wrong owner ({owner})"
+        try:
+            for number, raw in enumerate(fh, 1):
+                if not raw.endswith(b"\n"):
+                    break
+                got = _journal_event(raw, now)
+                if got is not None:
+                    rows.append((got[0], name, number, got[1]))
+        except Exception as exc:  # noqa: BLE001 — a shard failing mid-read keeps the lines read so far
+            return rows, f"read failed {_credits_errno(exc)}"
+    return rows, None
+
+
+def _journal_scan(path_to_dir, now, users=None) -> tuple[list[dict], list[str]]:
+    """§3.44 D14 — (events, problems). `events` is every user's journal events for the UTC month of
+    `now` and the month before, oldest first by (t, shard name, line number). Skips a line that
+    does not parse, an object without a journal-time `t` or a string `ev`, an event after `now`,
+    and a last line with no newline. `problems` holds one `<shard name>: <reason>` line for every
+    shard of those two months skipped or read only in part (reasons: `_journal_shard`), plus
+    `journal: unreadable <ERRNO>` when journal/ exists but cannot be listed — a caller shows
+    them, because every figure built on `events` is then LOW. Never raises: ([], []) when `now`
+    is naive or there is no journal/.
+
+    A shard is read only when its owner is the user its name gives — the name `_journal_append`
+    would have made for that owner — so a shard a member planted under another user's name is
+    skipped (`wrong owner`), as is any hand-made shard named for no user on this box.
+
+    Two months always hold the current billing cycle, whose start is at most a month back. Older
+    events are never read, so every state built on them lasts at most that long (see `_key_states`).
+
+    §3.48 (O9): `users`, a set of shard-name users, reads only their shards; any other shard is
+    left out silently, not named as a problem. The key vending machine reads its own shard only,
+    so another member's `reset` or a forged end cannot steer it; `status` still reads them all.
+    """
+    try:
+        if now.tzinfo is None or now.utcoffset() is None:
+            return [], []
+        now = now.astimezone(timezone.utc)
+        # The month before comes from (year, month), never from "now minus 31 days":
+        #   now 2026-01-15 -> shards 2026-01 and 2025-12 (January's month before is last December)
+        #   now 2026-03-31 -> 2026-03 and 2026-02;  now 2026-12-31T23:59:59Z -> 2026-12 and 2026-11
+        # No DST case: every value is UTC.
+        year, month = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
+        months = {f"{now.year:04d}-{now.month:02d}", f"{year:04d}-{month:02d}"}
+        journal = os.path.join(os.fspath(path_to_dir), "journal")
+    except Exception:  # noqa: BLE001 — see the docstring
+        return [], []
+    try:
+        names = sorted(os.listdir(journal))
+    except (FileNotFoundError, NotADirectoryError):
+        return [], []  # no journal yet: nothing was skipped
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        return [], [f"journal: unreadable {_credits_errno(exc)}"]
+    rows: list = []
+    problems: list = []
+    for name in names:
+        shard = _JOURNAL_SHARD.fullmatch(name)
+        if not (shard and shard.group(1) in months):
+            continue
+        if users is not None and shard.group(2) not in users:
+            continue
+        try:
+            got, why = _journal_shard(os.path.join(journal, name), name, now, shard.group(2))
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            got, why = [], f"unreadable {_credits_errno(exc)}"
+        rows.extend(got)
+        if why is not None:
+            problems.append(f"{name}: {why}")
+    rows.sort(key=lambda row: row[:3])
+    return [row[3] for row in rows], problems
+
+
+def _journal_read(path_to_dir, now) -> list[dict]:
+    """§3.44 M6 — `_journal_scan`'s events (see there), without its problem lines. Never raises:
+    [] when the journal cannot be listed or `now` is naive."""
+    try:
+        return _journal_scan(path_to_dir, now)[0]
+    except Exception:  # noqa: BLE001 — see the docstring
+        return []
+
+
+#: §3.44 M6 — what a FAILED keyed attempt says, first match wins: (class, phrases, HTTP statuses).
+#: ⚠ PROVISIONAL. These are the API's documented error types and the CLI's wording as read on
+#: 2026-10-09, not shapes recorded under a key: preflight row 2 (a made-up key) records the real
+#: exit code, envelope and text, and this table is re-pinned from it before M7 relies on it.
+_KEYED_FAULTS = (
+    ("credit", ("credit balance is too low", "credit balance too low", "billing_error"), ()),
+    ("auth", ("invalid x-api-key", "invalid api key", "authentication_error", "permission_error",
+              "failed to authenticate"), (401, 403)),
+    ("spend_limit", ("enforced_spend_limit_reached", "specified api usage limits"), ()),
+    ("rate", ("rate_limit_error",), (429,)),
+    ("api", ("overloaded",), tuple(range(500, 600))),
+    ("too_long", ("prompt is too long",), ()),
+)
+
+
+def _classify_keyed(rc, envelope, text) -> str:
+    """§3.44 M6 — the class of a FAILED keyed attempt, for its journal `end` event: the first of
+    `_KEYED_FAULTS` that matches, else `unknown`. Phrases are matched case-blind in `text` (the
+    run's note) and in the envelope's `result` and `errors`; statuses on its `api_error_status`.
+    A bare 400 is `unknown`: that is the request's fault, not the key's. `ok` (a review came
+    back) and `timeout` are the caller's to decide, so `rc` is not read — an exit status does not
+    say which side failed. Never raises.
+    """
+    try:
+        env = envelope if isinstance(envelope, dict) else {}
+        status = _usage_count(env.get("api_error_status"))
+        said = [text, env.get("result")]
+        errors = env.get("errors")
+        said.extend(errors if isinstance(errors, list) else [errors])
+        low = "\n".join(str(s) for s in said if s is not None).lower()
+        for name, phrases, statuses in _KEYED_FAULTS:
+            if status in statuses or any(p in low for p in phrases):
+                return name
+    except Exception:  # noqa: BLE001 — see the docstring
+        pass
+    return "unknown"
+
+
+#: #25 — the largest dollar figure an end event or a grant may carry, the bound the ledger report
+#: (`review_watch_report._MAX_USD`) already applies. Far above any real review; one absurd value in
+#: the group-writable journal (1e22) otherwise overflowed `round()` inside `_key_states`.
+_CREDITS_MAX_USD = decimal.Decimal(10 ** 9)
+
+
+def _credits_usd(value) -> decimal.Decimal | None:
+    """An end event's `usd` (the CLI's own figure) as a Decimal; None unless a finite number in
+    [0, _CREDITS_MAX_USD]."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value < 0:
+        return None
+    amount = decimal.Decimal(str(value))
+    return amount if amount <= _CREDITS_MAX_USD else None
+
+
+def _credits_text(event: dict, field: str) -> str | None:
+    """The event's `field` when it is a string (labels and ids are compared and hashed), else None."""
+    value = event.get(field)
+    return value if isinstance(value, str) else None
+
+
+def _credits_lane(event: dict) -> bool:
+    """§3.48 (O7) — True for a direct-API lane's event (`writer` starts `lane-`). A lane's end counts
+    toward spend, runs, ok, over-grant and the credit/auth/spend-limit parks, never toward the
+    pool's breakers (they detect `claude -p` not being covered, which a Messages-API lane cannot
+    show) and never cools a key. An end with no `writer` is a review's: today's journals."""
+    writer = event.get("writer")
+    return isinstance(writer, str) and writer.startswith("lane-")
+
+
+#: §3.48 — what an end event may carry from a usage object: the int meters, `usd`, and per model
+#: (`mu`) in, out, cr, cw and usd. Never turns, ms, api_ms, err, sub or sid.
+_JOURNAL_INT_METERS = ("in", "out", "cr", "cw", "cw5", "cw1")
+_JOURNAL_MU_METERS = ("in", "out", "cr", "cw")
+
+
+def _journal_meters(usage) -> dict:
+    """§3.48 — one usage attempt (`_envelope_usage`'s shape) reduced to an end event's meters. An
+    absent meter stays absent (zero is a measurement); a bool, a negative or a non-finite value is
+    dropped; `mu` keeps at most `_USAGE_MAX_MODELS` well-formed model ids, in sorted order, as
+    `_envelope_usage` does. `usd` is passed through, never computed with. The vending machine
+    refuses an end whose meters are not already in this form. Never raises."""
+    out: dict = {}
+    try:
+        if not isinstance(usage, dict):
+            return out
+        for name in _JOURNAL_INT_METERS:
+            if _usage_count(usage.get(name)) is not None:
+                out[name] = usage[name]
+        if _credits_usd(usage.get("usd")) is not None:
+            out["usd"] = usage["usd"]
+        models = usage.get("mu")
+        if isinstance(models, dict):
+            kept: dict = {}
+            for model in sorted(k for k in models if isinstance(k, str) and _USAGE_MODEL_ID.fullmatch(k)):
+                row = models[model]
+                if not isinstance(row, dict) or len(kept) >= _USAGE_MAX_MODELS:
+                    continue
+                meters = {m: row[m] for m in _JOURNAL_MU_METERS if _usage_count(row.get(m)) is not None}
+                if _credits_usd(row.get("usd")) is not None:
+                    meters["usd"] = row["usd"]
+                if meters:
+                    kept[model] = meters
+            if kept:
+                out["mu"] = kept
+    except Exception:  # noqa: BLE001 — see the docstring
+        return {}
+    return out
+
+
+def _credits_timed(events, now: datetime) -> list:
+    """(t, event) for every event dict with a journal time at or before `now`, oldest first; ties
+    keep the input order, which `_journal_read` has made (shard name, line number). Raises
+    ValueError for a naive `now`."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    rows = []
+    for index, event in enumerate(events or ()):
+        if isinstance(event, dict):
+            t = _credits_time(event.get("t"))
+            if t is not None and t <= now:
+                rows.append((t, index, event))
+    rows.sort(key=lambda row: row[:2])
+    return [(t, event) for t, _index, event in rows]
+
+
+def _credits_pool(meta, timed, now) -> tuple[dict, str | None]:
+    """The pool's state from `_credits_timed` pairs, and the journal time of the event that set it
+    (its alert's dedupe id). Only end events of keyring keys after the last pool reset count.
+
+    disabled (credit-breaker): two or more DIFFERENT keys each have a credit fault in their current
+      cycle and no ok end anywhere in it. A credit fault reads the same whether the key is spent or
+      the credits do not cover this use, and two keys failing before either worked is the second.
+      The trigger is the second key's first fault, so a third key mints no new alert. A fault in
+      the first 36 hours of its key's cycle never counts (D1: it may predate the grant).
+    paused (unknown-streak): a pause begins at the second of two unknown-or-timeout end events in
+      a row, pool-wide; it lasts an hour, and any other end after it lifts it. D7: the NEXT pause
+      needs two more in a row after this one began — a lapsed pause plus one more unexplained
+      failure is not a pause, so a persistent fault probes at most once an hour.
+    disabled (unknown-repeat): D7 — the third pause within 24 hours of the first of the three;
+      until a pool reset (bounded, like everything here, by the two-month journal read). The
+      trigger is that third pause's start, so it alerts once.
+    Order: credit-breaker, unknown-repeat, paused.
+    """
+    cycles = {k["label"]: _cycle_bounds(k["renews"], now) for k in meta["keys"]}
+    reset_at = None
+    ends = []
+    for t, event in timed:
+        ev = event.get("ev")
+        if ev == "reset" and event.get("scope") == "pool":
+            reset_at = t
+        elif ev == "end" and _credits_text(event, "key") in cycles and not _credits_lane(event):
+            ends.append((t, event))  # §3.48 (O7): a lane's end never reaches the pool's rules
+    worked = {e["key"] for t, e in ends if e.get("class") == "ok" and t >= cycles[e["key"]][0]}
+    live = [(t, e) for t, e in ends if reset_at is None or t > reset_at]
+    first: dict = {}
+    for t, event in live:
+        label = event["key"]
+        settled = _credits_plus(cycles[label][0], _CREDITS_RENEW_GRACE_S)
+        if event.get("class") == "credit" and t >= settled and label not in worked:
+            first.setdefault(label, t)
+    if len(first) >= 2:
+        trigger = sorted(first.values())[1]
+        return {"state": "disabled", "until": None, "reason": "credit-breaker"}, _credits_iso(trigger)
+    pauses: list = []   # the start of each pause, oldest first
+    streak = 0          # unexplained ends in a row since the last pause began (or any other end)
+    standing = False    # no other end since the last pause began
+    for t, event in live:
+        if event.get("class") in ("unknown", "timeout"):
+            streak += 1
+            if streak == 2:
+                pauses.append(t)
+                streak, standing = 0, True
+        else:
+            streak, standing = 0, False
+    # pauses p0 p1 p2 at 00:00 05:00 23:59 -> p2 < p0 + 24h: disabled from p2; at 00:00 05:00 24:00
+    # -> not (the window is [p0, p0 + 24h)); with fewer than three pauses the range is empty.
+    for i in range(2, len(pauses)):
+        if pauses[i] < _credits_plus(pauses[i - 2], _CREDITS_REPEAT_S):
+            return ({"state": "disabled", "until": None, "reason": "unknown-repeat"},
+                    _credits_iso(pauses[i]))
+    if pauses and standing:
+        until = _credits_plus(pauses[-1], _CREDITS_PAUSE_S)
+        if until > now:
+            return ({"state": "paused", "until": _credits_iso(until), "reason": "unknown-streak"},
+                    _credits_iso(pauses[-1]))
+    return {"state": "ok", "until": None, "reason": None}, None
+
+
+def _credits_next_month(when: datetime) -> datetime:
+    """00:00 UTC on the 1st of the calendar month after `when`'s (in UTC). The day is always the
+    1st, so a month's length never matters. Traces: 2026-01-31T12:00Z -> 2026-02-01;
+    2026-12-31T23:59:59Z -> 2027-01-01; 2026-02-01T00:00:00Z -> 2026-03-01. No DST case: UTC."""
+    when = when.astimezone(timezone.utc)
+    year, month = (when.year + 1, 1) if when.month == 12 else (when.year, when.month + 1)
+    return datetime(year, month, 1, tzinfo=timezone.utc)
+
+
+def _credits_over_grant(label: str, renews: str, timed: list, limit: decimal.Decimal) -> bool:
+    """D2/D3 — True while the key's over-grant tripwire is latched. Walks its end events oldest
+    first, adding each one's `usd` to its OWN cycle's running total (a new cycle starts the total
+    at 0). The tripwire fires when a total reaches `limit` and then STAYS fired across cycle rolls
+    until a reset of the label. A reset at R made after the tripwire fired (at or before R)
+    clears it and rebases the total: only spend after R counts again. A reset made before any
+    firing changes nothing for the tripwire. Only events in the journal read window are seen,
+    so a crossing older than the two months `_journal_read` covers no longer latches anything.
+    Ties: an end at the reset's own second is before the reset."""
+    rows = []
+    for index, (t, event) in enumerate(timed):
+        ev = event.get("ev")
+        if ev == "end" and _credits_text(event, "key") == label:
+            rows.append((t, 0, index, event))
+        elif ev == "reset" and event.get("scope") == label:
+            rows.append((t, 1, index, event))
+    rows.sort(key=lambda row: row[:3])
+    fired = False
+    total = decimal.Decimal(0)
+    total_cycle = None
+    for t, kind, _index, event in rows:
+        if kind == 1:
+            if fired:
+                fired, total = False, decimal.Decimal(0)
+            continue
+        cycle = _cycle_bounds(renews, t)[0]
+        if cycle != total_cycle:
+            total_cycle, total = cycle, decimal.Decimal(0)
+        usd = _credits_usd(event.get("usd"))
+        total += usd if usd is not None else 0
+        if total >= limit:
+            fired = True
+    return fired
+
+
+def _credits_key_state(key: dict, timed: list, now: datetime, grant: decimal.Decimal, current_fp) -> dict:
+    """One key's entry in `_key_states` (see there for the rules)."""
+    label = key["label"]
+    start, end = _cycle_bounds(key["renews"], now)
+    settled = _credits_plus(start, _CREDITS_RENEW_GRACE_S)  # D1: [start, settled) is renewal day
+    reset_at = None
+    for t, event in timed:
+        if event.get("ev") == "reset" and event.get("scope") == label:
+            reset_at = t
+    spend = decimal.Decimal(0)
+    runs = oks = review_oks = 0  # review_oks: §3.48 (O7) — `early` reads reviews' oks only
+    fp = None
+    start_fp: dict = {}
+    credit = None  # (spend, review ok ends) at the first credit fault this cycle that counts
+    auth = None    # (run id,) of the last auth fault that counts
+    limit = None   # D5: when the latest spend_limit fault's park lifts (the next month's 1st)
+    cool = None    # (until, reason) of the cool that counts and ends last
+    for t, event in timed:
+        if _credits_text(event, "key") != label:
+            continue
+        ev, cls, here = event.get("ev"), event.get("class"), t >= start
+        if ev == "start":
+            fp = _credits_text(event, "fp")
+            run_id = _credits_text(event, "id")
+            if run_id is not None:
+                start_fp[run_id] = fp
+            runs += 1 if here else 0
+            continue
+        if ev != "end":
+            continue
+        lane = _credits_lane(event)
+        if here:
+            usd = _credits_usd(event.get("usd"))
+            spend += usd if usd is not None else 0
+            oks += 1 if cls == "ok" else 0
+            review_oks += 1 if cls == "ok" and not lane else 0
+        if reset_at is not None and t <= reset_at:
+            continue  # a reset forgives everything up to and including its own second
+        rest = None
+        # §3.48 (O7): a lane's end never cools the key — no renewal-day rest, no rate or api rest —
+        # and a lane's renewal-day credit fault neither rests nor parks it (the first branch takes
+        # it and does nothing). Its later credit, auth and spend-limit faults park as a review's do.
+        if cls == "credit" and here and t < settled:
+            if not lane:
+                rest = (_credits_plus(t, _CREDITS_RENEW_COOL_S), "credit-renewal")  # D1: no park, no early
+        elif cls == "credit" and here and credit is None:
+            credit = (spend, review_oks)
+        elif cls == "auth":
+            auth = (_credits_text(event, "id"),)
+        elif cls == "spend_limit":
+            lifts = _credits_next_month(t)
+            limit = lifts if limit is None or lifts > limit else limit
+        elif cls in ("rate", "api") and not lane:
+            rest = (_credits_plus(t, _CREDITS_COOL_S), cls)
+        # The cool that ends LAST wins: a 10-minute rate cool after an hour's renewal cool must not
+        # end the hour early.
+        if rest is not None and (cool is None or rest[0] >= cool[0]):
+            cool = rest
+    over_grant = _credits_over_grant(label, key["renews"], timed, grant * _CREDITS_OVER)
+    # The auth park lifts on a KNOWN rotation only. One TRUE row: the faulting run's fingerprint is
+    # known, the key file's current one is known, and they differ. A missing start event, fp or
+    # key file keeps the park (fail closed: the next attempt would fail the same way) — while the
+    # fault is still in the two-month journal read; past it the key is tried again (D6).
+    bad = start_fp.get(auth[0]) if auth is not None and auth[0] is not None else None
+    rotated = bool(bad) and isinstance(current_fp, str) and bool(current_fp) and current_fp != bad
+    early = credit is not None and credit[1] == 0 and credit[0] < grant * _CREDITS_EARLY
+    if key.get("enabled", True) is not True:
+        state, reason, until = "off", None, None
+    elif over_grant:
+        state, reason, until = "disabled", "over-grant", None
+    elif auth is not None and not rotated:
+        state, reason, until = "parked", "auth", None
+    elif credit is not None:
+        state, reason, until = "parked", "credit", _credits_iso(end)
+    elif limit is not None and limit > now:
+        state, reason, until = "parked", "spend-limit", _credits_iso(limit)
+    elif cool is not None and cool[0] > now:
+        state, reason, until = "cooling", cool[1], _credits_iso(cool[0])
+    else:
+        state, reason, until = "usable", None, None
+    return {"state": state, "reason": reason, "until": until,
+            "cycle_start": _credits_iso(start), "cycle_end": _credits_iso(end),
+            "spend_usd": float(round(spend, 6)), "runs": runs, "ok": oks, "early": early, "fp": fp}
+
+
+def _key_states(meta, events, now, fps=None) -> dict:
+    """§3.44 M6 — every keyring key's state, and the pool's, derived from journal events. Pure: the
+    same inputs give the same answer for every UNIX user and lane. Raises ValueError for a naive
+    `now`.
+
+    {"pool": {"state": ok|paused|disabled, "until",
+              "reason": None|unknown-streak|credit-breaker|unknown-repeat},
+     "keys": {label: {"state": usable|off|parked|cooling|disabled,
+                      "reason": None|credit|credit-renewal|auth|spend-limit|rate|api|over-grant,
+                      "until", "cycle_start", "cycle_end", "spend_usd", "runs", "ok", "early",
+                      "fp"}}}
+    Times are journal times. In the key's current cycle [cycle_start, cycle_end): `spend_usd` sums
+    end events' `usd` (Decimal; reported as a float rounded to 6), `runs` counts start events and
+    `ok` ok ends; `fp` is the latest start event's. The state, first match wins:
+      off       `enabled` is false in the keyring (the meters are still counted, for `status`)
+      disabled  over-grant: a cycle's spend reached 1.1 x grant_usd, which is real money. It stays
+                across cycle rolls until a reset of the label made at or after the crossing (D2);
+                that reset rebases the tripwire to the spend after it, and a reset made before any
+                crossing changes nothing (D3). See `_credits_over_grant`.
+      parked    auth: an auth fault, until `fps[label]` (the key file's fingerprint now) differs
+                from the faulting run's (its start event, joined by id)
+      parked    credit: a credit fault this cycle more than 36 hours after its start, until the
+                cycle ends. `early`: no ok end before it and spend at it < 0.5 x grant_usd — the
+                credits stopped long before the grant
+      parked    spend-limit: a spend_limit fault (the Console's monthly limit), until 00:00 UTC on
+                the 1st of the calendar month after it (D5)
+      cooling   credit-renewal: a credit fault in the first 36 hours of the cycle, when the grant
+                may not have landed yet (D1) — an hour, never `early`, never the breaker; rate or
+                api: 10 minutes. The cool that ends last counts.
+      usable    none of these
+    A reset of the label at R forgives that key's events at or before R for park and cool; it
+    never changes `spend_usd`. Events naming no keyring label, and events after `now`, are
+    ignored. The pool's rules are `_credits_pool`'s.
+
+    Every state is derived from `_journal_read`'s two months, so none outlives its event's shard
+    leaving that window. D6: an auth-parked key whose fault is older than that (key file never
+    rotated) is tried once more — one failed, fallback-protected attempt, which journals a fresh
+    fault, so the key parks and alerts again. An over-grant latch and an unknown-repeat disable
+    lapse the same way.
+    """
+    timed = _credits_timed(events, now)
+    pool, _trigger = _credits_pool(meta, timed, now)
+    grant = decimal.Decimal(str(meta["grant_usd"]))
+    fps = fps if isinstance(fps, dict) else {}
+    keys = {key["label"]: _credits_key_state(key, timed, now, grant, fps.get(key["label"]))
+            for key in meta["keys"]}
+    return {"pool": pool, "keys": keys}
+
+
+#: §3.44 M6 — the one vocabulary the credits feature warns in (M7 prints a line on stderr).
+#: ⚠ PINNED by tools/tests/test_review_credits.py to hold none of codex_watch's account-down or
+#: terminal markers, nor watch_drain's copies, and not the word `invariants`, which routes a
+#: driver WARNING into an entry's rules bucket: a key-side fault must never read as an outage or
+#: cost a commit a strike. Only numbers follow the code, so no vendor text reaches a report.
+_CREDIT_REPORTS = {
+    "PARKED-CREDIT": ("WARNING: review-credits {label} PARKED-CREDIT"
+                      " spend_usd={spend_usd} grant_usd={grant_usd} days_left={days_left}"),
+    "EARLY-CREDIT": ("WARNING: review-credits {label} EARLY-CREDIT"
+                     " spend_usd={spend_usd} grant_usd={grant_usd} ok={ok}"),
+    "PARKED-AUTH": "WARNING: review-credits {label} PARKED-AUTH runs={runs} ok={ok}",
+    "PARKED-LIMIT": "WARNING: review-credits {label} PARKED-LIMIT spend_usd={spend_usd} days_left={days_left}",
+    "OVER-GRANT": ("WARNING: review-credits {label} OVER-GRANT"
+                   " spend_usd={spend_usd} grant_usd={grant_usd} limit_usd={limit_usd}"),
+    "POOL-PAUSED": "WARNING: review-credits {label} POOL-PAUSED minutes={minutes}",
+    "POOL-DISABLED": "WARNING: review-credits {label} POOL-DISABLED parked={parked} keys={keys}",
+}
+_CREDIT_REPORT_FIELD = re.compile(r"\{([a-z_]+)\}")
+
+
+def _credits_number(value) -> str:
+    """One report number: an int as it is, any other number to the cent, never with an exponent."""
+    if isinstance(value, bool):
+        raise ValueError("a flag is not a number")
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        value = decimal.Decimal(str(value))
+    if not isinstance(value, decimal.Decimal) or not value.is_finite():
+        raise ValueError(f"not a finite number: {value!r}")
+    try:
+        return format(value.quantize(_CREDITS_CENT, rounding=decimal.ROUND_HALF_UP), "f")
+    except decimal.InvalidOperation as exc:
+        raise ValueError("number too large") from exc
+
+
+def _credit_report(code, label, **numbers) -> str:
+    """§3.44 M6 — one `_CREDIT_REPORTS` line: `WARNING: review-credits <label> <CODE>`, then the
+    code's ` name=value` pairs. `label` is a keyring label, or `pool` for the POOL- codes. Raises
+    ValueError for an unknown code, a wrong label, a missing or extra number, or a non-number."""
+    template = _CREDIT_REPORTS.get(code) if isinstance(code, str) else None
+    if template is None:
+        raise ValueError(f"unknown report code {code!r}")
+    if code.startswith("POOL-"):
+        fits = label == "pool"
+    else:
+        fits = _credits_label_ok(label)
+    if not fits:
+        raise ValueError(f"{code} cannot name {label!r}")
+    names = set(_CREDIT_REPORT_FIELD.findall(template)) - {"label"}
+    if set(numbers) != names:
+        raise ValueError(f"{code} takes {sorted(names)}, not {sorted(numbers)}")
+    return template.format(label=label, **{n: _credits_number(v) for n, v in numbers.items()})
+
+
+def _credit_report_numbers(code, label, meta, states, now) -> dict:
+    """The numbers `_credit_report(code, label, ...)` takes, from `_key_states` output, so a
+    `_due_reports` tuple renders with no knowledge of each code's fields."""
+    grant = decimal.Decimal(str(meta["grant_usd"]))
+    if code == "POOL-PAUSED":
+        until = _credits_time(states["pool"].get("until"))
+        left = 0 if until is None else max(0, math.ceil((until - now).total_seconds() / 60))
+        return {"minutes": left}
+    if code == "POOL-DISABLED":
+        parked = sum(1 for s in states["keys"].values()
+                     if (s.get("state"), s.get("reason")) == ("parked", "credit"))
+        return {"parked": parked, "keys": sum(1 for k in meta["keys"] if k.get("enabled", True) is True)}
+    st = states["keys"][label]
+    spend = decimal.Decimal(str(st["spend_usd"]))
+    if code == "PARKED-CREDIT":
+        left = _credits_time(st["cycle_end"]) - now
+        return {"spend_usd": spend, "grant_usd": grant,
+                "days_left": decimal.Decimal(int(left.total_seconds())) / 86400}
+    if code == "EARLY-CREDIT":
+        return {"spend_usd": spend, "grant_usd": grant, "ok": st["ok"]}
+    if code == "PARKED-AUTH":
+        return {"runs": st["runs"], "ok": st["ok"]}
+    if code == "PARKED-LIMIT":
+        left = _credits_time(st["until"]) - now
+        return {"spend_usd": spend, "days_left": decimal.Decimal(int(left.total_seconds())) / 86400}
+    if code == "OVER-GRANT":
+        return {"spend_usd": spend, "grant_usd": grant, "limit_usd": grant * _CREDITS_OVER}
+    raise ValueError(f"unknown report code {code!r}")
+
+
+def _due_reports(meta, states, events, now) -> list[tuple[str, str, str]]:
+    """§3.44 M6 — (code, label, cycle) for each report `states` calls for that no alert event in
+    `events` has made yet, matched on (code, key, cycle). A key's cycle id is its cycle-start date
+    (YYYY-MM-DD), so a park — or an over-grant latch that outlives its cycle — reports once a
+    cycle; a pool report's is the journal time of the event that set the pool's state, so a
+    pause reports once per pause and a disable once. EARLY-CREDIT goes out BESIDE PARKED-CREDIT:
+    the park says the key rests until it renews, the early flag that its credits stopped long
+    before the grant was spent. A cooling key (rate, api, credit-renewal) and an `off` key report
+    nothing. Order: keys in keyring order, then the pool.
+    """
+    timed = _credits_timed(events, now)
+    sent = set()
+    for _t, event in timed:
+        if event.get("ev") == "alert":
+            sent.add((_credits_text(event, "code"), _credits_text(event, "key"),
+                      _credits_text(event, "cycle")))
+    due: list = []
+    key_states = states.get("keys") or {}
+    for key in meta["keys"]:
+        label = key["label"]
+        st = key_states.get(label)
+        if not isinstance(st, dict) or st.get("state") in (None, "off"):
+            continue
+        cycle = str(st.get("cycle_start") or "")[:10]
+        pair = (st.get("state"), st.get("reason"))
+        codes = []
+        if pair == ("disabled", "over-grant"):
+            codes.append("OVER-GRANT")
+        elif pair == ("parked", "auth"):
+            codes.append("PARKED-AUTH")
+        elif pair == ("parked", "credit"):
+            codes.append("PARKED-CREDIT")
+        elif pair == ("parked", "spend-limit"):
+            codes.append("PARKED-LIMIT")
+        if st.get("early") is True:
+            codes.append("EARLY-CREDIT")
+        due.extend((code, label, cycle) for code in codes if (code, label, cycle) not in sent)
+    pool_state = (states.get("pool") or {}).get("state")
+    if pool_state in ("paused", "disabled"):
+        pool, trigger = _credits_pool(meta, timed, now)
+        code = "POOL-PAUSED" if pool_state == "paused" else "POOL-DISABLED"
+        if pool["state"] == pool_state and trigger is not None and (code, "pool", trigger) not in sent:
+            due.append((code, "pool", trigger))
+    return due
+
+
+# --- §3.48 review credits: the key vending machine's client (dark) -------------------------------
+# One host-side server, `tools/scripts/review_credits_vend.py`, run as the keyring's owner (its own
+# compose project), is the ONLY reader of `keys/`. At §3.44 M7 the driver asks it for one key for
+# one child's environment (`_credits_vend`) and reports that run's end (`_credits_end`); the server
+# picks the key, reserves its cap and writes the journal. Nothing in the review path calls this
+# block yet. Every function here never raises, and the key never enters os.environ, argv, a log,
+# the ledger or the journal: it lives in the returned lease only.
+
+CREDITS_VEND_SOCKET = "vend.sock"
+CREDITS_VEND_PROTOCOL = 1
+CREDITS_REVIEW_CAP_USD = decimal.Decimal("5")   # O6: reserved per review (ledger max $4.13 on 2026-10-11)
+CREDITS_VEND_LEASE_S = CLAUDE_TIMEOUT_S + 600   # O6: the child is killed at 1800 s; 600 s slack = 2400
+CREDITS_VEND_LANE_LEASE_MAX_S = 93600           # a lane's longest lease: a Batch job's 24 h plus 2 h
+_VEND_TIMEOUT_S = 30.0
+_VEND_REQUEST_MAX = 16384
+_VEND_REPLY_MAX = 16384
+_VEND_SUN_MAX = 107                             # sockaddr_un.sun_path: 108 bytes with its NUL
+_VEND_ID = re.compile(r"[0-9a-f]{12}")
+_VEND_TOKEN = re.compile(r"[0-9a-f]{32}")
+_VEND_FP = re.compile(r"[0-9a-f]{8}")
+#: The server's refusal codes; a reply naming any other is `reply`. The client's own reasons are
+#: unsupported, path, nosock, refused, peer, timeout, reply, error (and `class` from `_credits_end`).
+_VEND_REFUSALS = frozenset({
+    "request", "caller", "ancestry", "cmdline", "cap", "parse", "disabled", "repo", "writer", "journal",
+    "busy", "pool", "keyfile", "batch", "headroom", "nokey", "start", "lease", "ended", "class", "meters",
+    "internal"})
+#: The tripwire table: a writer's prefix, and the script basename its caller must be running.
+_VEND_SCRIPTS = (("hook-", "codex_review.py"), ("lane-", "credits_lane.py"))
+#: A warning the server returns is printed only when it is a `_CREDIT_REPORTS` line.
+_VEND_WARNING = re.compile(r"WARNING: review-credits (?:pool|[a-z0-9][a-z0-9-]{0,15}) [A-Z]+(?:-[A-Z]+)*"
+                           r"(?: [a-z_]+=[0-9]+(?:\.[0-9]+)?)*")
+
+
+def _vend_peer(sock) -> tuple[int, int, int] | None:
+    """(pid, uid, gid) of the process at the other end of a connected AF_UNIX socket (SO_PEERCRED),
+    or None — on any error, or where the platform has no SO_PEERCRED."""
+    try:
+        import socket
+        import struct
+
+        opt = getattr(socket, "SO_PEERCRED", None)
+        if opt is None:
+            return None
+        pid, uid, gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, opt, struct.calcsize("3i")))
+    except Exception:  # noqa: BLE001 — see the docstring
+        return None
+    return pid, uid, gid
+
+
+def _vend_sock_path(home) -> str:
+    """The vending machine's socket: `<keyring dir>/vend.sock`."""
+    return os.path.join(os.fspath(home), CREDITS_VEND_SOCKET)
+
+
+def _vend_call(home, request, owner_uid, timeout: float = _VEND_TIMEOUT_S) -> tuple[dict | None, str]:
+    """§3.48 — one request to the vending machine: (reply, "") or (None, reason). Never raises.
+
+    Checks before a byte is sent: AF_UNIX and SO_PEERCRED exist (`unsupported`); `owner_uid` is a
+    uid (`peer`); the path fits sun_path (`path`); the socket file exists (`nosock`), is a socket
+    and belongs to `owner_uid` (`peer`); the connect succeeds (`refused`, `nosock`, `timeout`); and
+    the LISTENING process runs as `owner_uid` (`peer`) — a member who renamed the socket aside and
+    bound their own gets nothing. Then one JSON line goes out, the reply is read to EOF (at most
+    `_VEND_REPLY_MAX`) and parsed strictly; a refusal is (None, its code) when the code is one of
+    `_VEND_REFUSALS`, and anything malformed is `reply`. The server's text is never echoed: a
+    reason is always one of the fixed codes."""
+    import socket
+    import time
+
+    try:
+        if not hasattr(socket, "AF_UNIX") or getattr(socket, "SO_PEERCRED", None) is None:
+            return None, "unsupported"
+        if type(owner_uid) is not int or owner_uid < 0:
+            return None, "peer"
+        path = _vend_sock_path(home)
+        if len(os.fsencode(path)) > _VEND_SUN_MAX:
+            return None, "path"
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None, "nosock"
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != owner_uid:
+            return None, "peer"
+        payload = (json.dumps(request, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+        if len(payload) > _VEND_REQUEST_MAX:
+            return None, "error"
+        deadline = time.monotonic() + timeout
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | getattr(socket, "SOCK_CLOEXEC", 0))
+        chunks: list = []
+        try:
+            sock.settimeout(max(0.001, deadline - time.monotonic()))
+            try:
+                sock.connect(path)
+            except FileNotFoundError:
+                return None, "nosock"
+            except (ConnectionRefusedError, PermissionError):
+                return None, "refused"
+            peer = _vend_peer(sock)
+            if peer is None or peer[1] != owner_uid:
+                return None, "peer"
+            sock.sendall(payload)
+            sock.shutdown(socket.SHUT_WR)
+            size = 0
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None, "timeout"
+                sock.settimeout(left)
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > _VEND_REPLY_MAX:
+                    return None, "reply"
+                chunks.append(chunk)
+        finally:
+            sock.close()
+        try:
+            reply = json.loads(b"".join(chunks).decode("utf-8"), object_pairs_hook=_credits_object,
+                               parse_constant=_credits_constant)
+        except (ValueError, RecursionError):
+            return None, "reply"
+        if (not isinstance(reply, dict) or type(reply.get("v")) is not int
+                or reply["v"] != CREDITS_VEND_PROTOCOL or not isinstance(reply.get("ok"), bool)):
+            return None, "reply"
+        if reply["ok"] is not True:
+            refused = reply.get("refused")
+            return None, refused if isinstance(refused, str) and refused in _VEND_REFUSALS else "reply"
+    except socket.timeout:
+        return None, "timeout"
+    except Exception:  # noqa: BLE001 — see the docstring
+        return None, "error"
+    return reply, ""
+
+
+def _vend_key_ok(text) -> bool:
+    """A key as the vending machine may hand it out: 20 to 4096 printable ASCII characters, no space."""
+    return isinstance(text, str) and 20 <= len(text) <= 4096 and all("!" <= ch <= "~" for ch in text)
+
+
+def _vend_warnings(lines) -> list:
+    """The `_CREDIT_REPORTS` lines among a reply's `warnings`; anything else is dropped unprinted."""
+    if not isinstance(lines, list):
+        return []
+    return [w for w in lines if isinstance(w, str) and _VEND_WARNING.fullmatch(w)]
+
+
+def _credits_vend(home, meta, *, repo, writer, capture="", cap_usd=None, batch=False) -> tuple[dict | None, str]:
+    """§3.48 — ask the vending machine for one key for one run: ({id, tok, label, key, fp, lease_s,
+    warnings}, "") or (None, reason). Never raises. `cap_usd`, `batch` and a longer lease are
+    lanes' to ask for; a review's cap is the server's (O6). A reply is accepted only when every
+    field checks out — an id and token of the right shape, a label in `meta`, a key that is
+    printable ASCII and whose fingerprint is the reply's `fp`, a positive lease — else `reply`.
+    At M7 the caller puts `key` into ONE child's environment and passes the lease to
+    `_credits_end`; nothing here stores or prints it."""
+    try:
+        owner = meta.get("owner_uid") if isinstance(meta, dict) else None
+        request: dict = {"v": CREDITS_VEND_PROTOCOL, "op": "vend", "repo": repo, "writer": writer,
+                         "capture": capture}
+        if cap_usd is not None:
+            request["cap_usd"] = float(cap_usd)
+        if batch:
+            request["batch"] = True
+        reply, why = _vend_call(home, request, owner)
+        if reply is None:
+            return None, why
+        labels = {k.get("label") for k in meta.get("keys", []) if isinstance(k, dict)}
+        key = reply.get("key")
+        good = (isinstance(reply.get("id"), str) and _VEND_ID.fullmatch(reply["id"]) is not None
+                and isinstance(reply.get("tok"), str) and _VEND_TOKEN.fullmatch(reply["tok"]) is not None
+                and reply.get("label") in labels and _vend_key_ok(key) and reply.get("fp") == _key_fp(key)
+                and type(reply.get("lease_s")) is int and reply["lease_s"] > 0
+                and isinstance(reply.get("warnings"), list))
+        if not good:
+            return None, "reply"
+        lease = {name: reply[name] for name in ("id", "tok", "label", "key", "fp", "lease_s")}
+        lease["warnings"] = _vend_warnings(reply["warnings"])
+    except Exception:  # noqa: BLE001 — see the docstring
+        return None, "error"
+    return lease, ""
+
+
+def _credits_end(home, meta, lease, cls, usage=None) -> tuple[list, str]:
+    """§3.48 — report a keyed run's end to the vending machine: (warnings, "") or ([], reason). Never
+    raises. `cls` is one of `_KEYED_CLASSES` (else `class`, nothing sent); `usage` is that run's
+    usage object, reduced to `_journal_meters`. Up to three tries inside one `_VEND_TIMEOUT_S`
+    budget, retried only on nosock, refused or timeout; `ended` counts as done (an earlier try
+    landed). An end never reported leaves its start open: the server keeps its cap reserved (O5)."""
+    import time
+
+    try:
+        if cls not in _KEYED_CLASSES:
+            return [], "class"
+        if (not isinstance(lease, dict) or not isinstance(lease.get("id"), str)
+                or not isinstance(lease.get("tok"), str)):
+            return [], "error"
+        owner = meta.get("owner_uid") if isinstance(meta, dict) else None
+        request = {"v": CREDITS_VEND_PROTOCOL, "op": "end", "id": lease["id"], "tok": lease["tok"],
+                   "class": cls, "meters": _journal_meters(usage)}
+        deadline = time.monotonic() + _VEND_TIMEOUT_S
+        why = "timeout"
+        for attempt in range(3):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            reply, why = _vend_call(home, request, owner, timeout=left)
+            if reply is not None:
+                return _vend_warnings(reply.get("warnings")), ""
+            if why == "ended":
+                return [], ""
+            if why not in ("nosock", "refused", "timeout") or attempt == 2:
+                break
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    except Exception:  # noqa: BLE001 — see the docstring
+        return [], "error"
+    return [], why
+
+
+def _vend_fps(home, meta) -> tuple[tuple[dict, dict] | None, str]:
+    """§3.48 — the key files' fingerprints and verdicts, from the vending machine (no key text ever
+    crosses): (({label: 8 hex or None}, {label: "ok" or a reason}), "") or (None, reason). Never
+    raises. `review_credits.py status` and `check` use it inside a Claude Code session instead of
+    opening `keys/` themselves (O10)."""
+    try:
+        owner = meta.get("owner_uid") if isinstance(meta, dict) else None
+        reply, why = _vend_call(home, {"v": CREDITS_VEND_PROTOCOL, "op": "fps"}, owner)
+        if reply is None:
+            return None, why
+        fps, files = reply.get("fps"), reply.get("files")
+        if not isinstance(fps, dict) or not isinstance(files, dict):
+            return None, "reply"
+        if not all(_credits_label_ok(k) and (v is None or (isinstance(v, str) and _VEND_FP.fullmatch(v)))
+                   for k, v in fps.items()):
+            return None, "reply"
+        if not all(_credits_label_ok(k) and isinstance(v, str) and len(v) <= 80 for k, v in files.items()):
+            return None, "reply"
+        return (dict(fps), dict(files)), ""
+    except Exception:  # noqa: BLE001 — see the docstring
+        return None, "error"
 
 
 # --- subsystem partition (the skill's `complete` mode: --list-units) -----------------------------
@@ -1543,10 +3256,12 @@ def main(argv: list[str] | None = None) -> int:
             "engines": sorted(VALID_ENGINES),
             "efforts": sorted(VALID_EFFORTS),
             "codex_binaries": sorted(CODEX_BINARIES) + ["kiro3..kiro9 (derived)"],
-            "env": [SESSION_CODEX_BIN_ENV, REVIEW_ENV_PASS_ENV],
+            "env": [SESSION_CODEX_BIN_ENV, REVIEW_ENV_PASS_ENV, REVIEW_CREDITS_DIR_ENV, CODEX_HOME_PARENT_ENV],
             # §2.38 (b) — lets a caller tell this driver from one that hands the reviewer the
             # session's whole environment (the key is absent there).
             "child_env": "allowlist",
+            # §3.44 M1 — a claude review's summary line carries `usage=` (absent on an older driver).
+            "usage": USAGE_TOKEN_VERSION,
             "gateway_default_models": list(GATEWAY_DEFAULT_MODELS),
             "units_config": UNITS_CONFIG_REL,
         }, indent=2))
@@ -1725,6 +3440,11 @@ def main(argv: list[str] | None = None) -> int:
                     else model if args.engine == "codex" and verdict != "ERROR" else "")
         if resolved and " " not in resolved:
             line += f" resolved={resolved}"
+        # §3.44 M1 — what the run cost, one object per child run; "" when the CLI reported no
+        # meter (and always for codex). Ahead of `note=`, which is free text to the end of line.
+        usage = _usage_token(out_dir / f"{model}.md", verdict, note)
+        if usage:
+            line += f" usage={usage}"
         if note:
             line += f" note={note}"
         print(line)
@@ -1733,5 +3453,37 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if produced else 2
 
 
+#: §1.139 (report:116) — the signals that END the driver by SystemExit instead of the default action.
+_EXIT_SIGNALS = ("SIGTERM", "SIGHUP")
+
+
+def _exit_on_signal(signum, _frame):
+    """§1.139 — turn SIGTERM / SIGHUP into SystemExit(128 + signum), so every `finally` runs.
+
+    The default action killed the driver on the spot, and `_run_one` removes its seeded CODEX_HOME
+    (a copy of `~/.codex/auth.json`) only in a `finally`; `codex_watch`'s STOP SIGTERMs the part's
+    whole process group (`_kill_part_group`), so every STOP during a codex-engine part left that
+    copy behind. Now the main thread unwinds, the executor waits for its workers, each worker's
+    engine CLI (in the same group) has had the same SIGTERM, and the `finally` runs inside
+    `_PART_KILL_GRACE_S`. A SIGINT already took this path (KeyboardInterrupt)."""
+    raise SystemExit(128 + signum)
+
+
+def _install_exit_signals() -> None:
+    """Install `_exit_on_signal` for `_EXIT_SIGNALS`, except one the driver was started ignoring.
+
+    `nohup` asks it to outlive the terminal, and a launcher that ignores SIGTERM asks the same of a
+    STOP: either way that signal stays ignored. This is BROADER than the watcher's
+    `_install_stop_signals`, which keeps only an ignored SIGHUP or SIGQUIT and re-arms an ignored
+    SIGTERM. A driver that ignores the STOP's SIGTERM is SIGKILLed after the watcher's
+    `_PART_KILL_GRACE_S`, and the watcher's per-part folder (`CODEX_HOME_PARENT_ENV`) still takes
+    its seeded home with it."""
+    for name in _EXIT_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is not None and signal.getsignal(sig) != signal.SIG_IGN:
+            signal.signal(sig, _exit_on_signal)
+
+
 if __name__ == "__main__":
+    _install_exit_signals()
     raise SystemExit(main())

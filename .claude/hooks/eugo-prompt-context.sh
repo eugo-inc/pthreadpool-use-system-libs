@@ -18,8 +18,11 @@
 # ONE FILE, INDEPENDENT ARMS. Each arm is a function that prints zero or more context lines
 # on stdout and returns 0. MAIN runs each inside its own `$(…)` subshell, so an arm that
 # dies, `exit`s or prints garbage cannot silence another arm or change this script's exit
-# status. The arm bodies hold their python as heredocs inside the FUNCTION (never lexically
-# inside `$(…)`: bash 3.2's paren/quote scanning of a command substitution is the trap).
+# status; and prints each arm's lines as soon as that arm returns (§2.84), the slow context
+# arm last, so an arm still running when the event's timeout fires has not held back the
+# lines of the arms before it. The arm bodies hold their python as heredocs inside the
+# FUNCTION (never lexically inside `$(…)`: bash 3.2's paren/quote scanning of a command
+# substitution is the trap).
 #
 # PAYLOAD. Measured on the installed CLI (2026-09-19): the stdin JSON carries
 # `prompt` (the text), `session_id`, `transcript_path`, `cwd`, `hook_event_name`,
@@ -57,7 +60,16 @@
 #     `.claude/data/handoff/<UTC>-<sid8>.md` (mode 0640, git-ignored) with a paste-ready
 #     continuation prompt. Silent once said this cycle or once a hand-off for this session is
 #     newer than the newest compaction. NOT a stop. Python starts only when the newest usage in
-#     the last 1 MiB reaches the smallest window's 80% (133.6k)
+#     the last 1 MiB reaches the smallest window's 80% (133.6k) and, when the transcript has a
+#     `"modelId"` line naming a `[1m]` model (one early-exit grep, the same line python reads as
+#     1M evidence), the 1M window's 80% (773.6k). Its python spends at most
+#     EUGO_PROMPT_CONTEXT_BUDGET seconds (default 20) counted from the hook's start, git and ps
+#     calls included, and says nothing on a prompt where it ran out (§2.84)
+#   - review arm (§3.52 5b, run 1261): `outputs/_state/review-turn-end/<session_id>.inform` — the
+#     review watch's end-of-turn inform line(s), which eugo-review-turn-end.sh hands over because a
+#     Stop hook's exit-0 stderr reaches no one — is moved aside, said as ONE `REVIEW WATCH` line (its
+#     newest 5 lines, C0 controls and DEL stripped, at most 1,500 characters) and deleted; only this
+#     prompt's session, only a session id of [A-Za-z0-9_-]; no python
 #   - SESSION START (§3801): the same script bound to SessionStart `resume` runs ONLY the two
 #     resume arms. Effort-resume: ultracode on before the resume (the newest `ultra_effort_enter|exit` or
 #     `/effort <level>` record says so) and nothing re-enabling it — no `--effort ultracode`
@@ -70,6 +82,9 @@
 #     `tool_use` left without a `tool_result` (name + 120 chars of its input) or that none was,
 #     and the orphan check before any re-run; without python3 the line prints minus the
 #     pending-call detail. Any other source (startup, compact, clear): silent
+#   - MODEL SWITCH (§3.52 S3.4, run 1261): the same script bound to PostModelSwitch runs ONLY the
+#     model arm: ONE `MODEL STATE (<from>→<to>, <source>)` line, silent on `resume`, the ids and
+#     source kept to [A-Za-z0-9._:-]; no python
 #   - EUGO_REVIEW_SUBPROCESS set -> silent (a reviewer is not a session to inform);
 #     EUGO_PROMPT_CONTEXT_OFF set -> silent (the kill switch, every arm)
 #   - malformed or empty stdin, no python3, unreadable transcript -> silent
@@ -117,11 +132,14 @@ GLOSSARY_FALLBACK='- `eipl` — "explain in plain language": LOOK the reference 
 - `enext` / `/enext [N2 | §id | all]` — plan the NEXT items: resolve the last report'"'"'s NEXT-N lines (or the named §-ids), verify each with the grep gates + DUPLICATE + OWNER, ask items · duration · involvement, file what is unfiled, write a plan file /eugo-run-overnight executes unchanged. Skill eugo-plan-next-base (adapter /eugo-plan-next).'
 
 glossary_lines() {
-  # The served section, else the fallback. sed's range end is searched from the line AFTER
-  # the start, so the start line's own `## ` does not close it; the FIRST section wins.
+  # The served section, else the fallback. Only the FIRST `## Shorthand glossary` section is read, up to the next
+  # `## `: audit-w265 k2 — the former sed range RE-OPENED at every later match, so a glossary heading inside a
+  # fenced shared memory block (`## Memory`, §4703) injected its lines as trusted shorthand.
   local out=""
   if [ -r "$RULES" ]; then
-    out="$(sed -n '/^## Shorthand glossary/,/^## /{/^- `/p;}' "$RULES" 2>/dev/null)"
+    out="$(awk '/^## Shorthand glossary/ { if (seen) exit; seen = 1; on = 1; next }
+                on && /^## / { exit }
+                on && /^- `/ { print }' "$RULES" 2>/dev/null)"
   fi
   if [ -n "$out" ]; then
     printf '%s\n' "$out"
@@ -385,14 +403,43 @@ arm_effort_resume() {
   [ -r "$tp" ] || return 0
   cap="${EUGO_EFFORT_TAIL_BYTES:-4194304}"
   case "$cap" in ''|*[!0-9]*) cap=4194304 ;; esac
-  hits="$(tail -c "$cap" "$tp" 2>/dev/null | grep -a -c -e 'ultra_effort_enter' -e 'command-args>ultracode' -e 'effort level to ultracode' 2>/dev/null)" || true
+  # §2.52 (i) (run 1238) — and the effort PICKER's wording: a bare `/effort` prints "Ultracode on …" and can leave no
+  # `ultra_effort_enter` attachment (2 of 5 measured records), so the gate stayed closed and the parser never saw it.
+  hits="$(tail -c "$cap" "$tp" 2>/dev/null | grep -a -c -e 'ultra_effort_enter' -e 'command-args>ultracode' -e 'effort level to ultracode' -e 'Ultracode on' 2>/dev/null)" || true
   case "${hits:-0}" in ''|0|*[!0-9]*) return 0 ;; esac
   command -v python3 >/dev/null 2>&1 || return 0
   python3 -S - "$tp" "$cap" <<'PY' 2>/dev/null || true
 import json, os, re, subprocess, sys
 path, cap = sys.argv[1], int(sys.argv[2])
-CMD = re.compile(r"<command-name>/effort</command-name>.*?<command-args>\s*([A-Za-z]*)\s*</command-args>", re.S)
-SET = re.compile(r"Set effort level to ([A-Za-z]+)")
+# audit-w267 #10 — MATCHED at the record's start, never searched: a prompt QUOTING the picker's stdout or an `/effort`
+# command (a pasted review of this hook's fixtures) is not the harness's record. Every real one starts with its tag.
+# §3.52 S3.3 (run 1261) — 2.1.284 made ultracode ITS OWN TOGGLE (`/effort ultracode on|off`: "it no longer forces xhigh
+# effort and stays on at any effort level"; probe P6 on 2.1.295: `/effort high` after `/effort ultracode on` left it on,
+# and `/effort ultracode off` printed "Ultracode off. Effort stays high."). So an effort change says nothing about
+# ultracode in a record from 2.1.284 on, and the toggle's two words are read; a record with no `version` (and every
+# legacy fixture) keeps the old reading, where `/effort <level>` replaced ultracode.
+CMD = re.compile(r"\s*<command-name>/effort</command-name>.*?<command-args>\s*([A-Za-z]*)(?:\s+([A-Za-z]+))?\s*</command-args>", re.S)
+OUT = re.compile(r"\s*<local-command-stdout>\s*(?:Set effort level to ([A-Za-z]+)|(Ultracode on)|(Ultracode off))")
+VER = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+def toggle_era(rec):
+    m = VER.match(str(rec.get("version") or ""))
+    return bool(m) and tuple(int(x) for x in m.groups()) >= (2, 1, 284)
+def ultra_of(s, toggle):
+    """True / False from an `/effort` command or its stdout; None when it says nothing about ultracode."""
+    m = OUT.match(s)
+    if m:
+        if m.group(2) or m.group(3):
+            return m.group(2) is not None
+        return None if toggle else m.group(1).lower() == "ultracode"
+    m = CMD.match(s)
+    if m and m.group(1):
+        word, arg = m.group(1).lower(), (m.group(2) or "").lower()
+        if word == "ultracode" and arg in ("on", "off"):
+            return arg == "on"
+        if toggle:
+            return None             # a level leaves the toggle as it was; a bare `ultracode` waits for its stdout
+        return word == "ultracode"
+    return None
 def text_of(rec):
     c = (rec.get("message") or {}).get("content")
     if isinstance(c, str):
@@ -409,6 +456,7 @@ lines = blob.split(b"\n")
 if size > cap:
     lines = lines[1:]
 on = None                      # the newest ultracode state before this resume
+toggle_now = False             # §3.52 S3.3: the newest record's era names the command to suggest
 for raw in lines:
     try:
         r = json.loads(raw)
@@ -417,6 +465,8 @@ for raw in lines:
     if not isinstance(r, dict) or r.get("isSidechain"):
         continue
     t = r.get("type")
+    if r.get("version"):
+        toggle_now = toggle_era(r)
     if t == "attachment":
         a = r.get("attachment")
         if isinstance(a, dict) and a.get("type") == "ultra_effort_enter":
@@ -424,10 +474,9 @@ for raw in lines:
         elif isinstance(a, dict) and a.get("type") == "ultra_effort_exit":
             on = False
     elif t == "user":
-        s = text_of(r)
-        m = CMD.search(s) or SET.search(s)
-        if m and m.group(1):
-            on = m.group(1).lower() == "ultracode"
+        v = ultra_of(text_of(r), toggle_era(r))
+        if v is not None:
+            on = v
 if on is not True:
     sys.exit(0)
 
@@ -489,7 +538,8 @@ print("EFFORT STATE (ultracode→off): this session ran with ultracode before th
       "resume does not restore it — the harness drops it and the next reply runs at the model's "
       "default effort (measured 2026-09-25); nothing here re-enables it (no --effort ultracode on "
       "this claude process, no \"ultracode\": true in the settings it reads). Before any work runs, "
-      "ask the operator (AskUserQuestion) whether to type /effort ultracode. [central §resume]")
+      "ask the operator (AskUserQuestion) whether to type %s. [central §resume]"
+      % ("/effort ultracode on" if toggle_now else "/effort ultracode"))
 PY
   return 0
 }
@@ -524,6 +574,11 @@ lines = blob.split(b"\n")
 if size > cap:
     lines = lines[1:]
 pending, last_ts = {}, None
+# §3.52 S3.2 (run 1261) — from 2.1.265 the client answers a call a dead process left running with a synthetic result
+# (probe P12, 2.1.295: `is_error`, "[Tool call interrupted: … its outcome is unknown …]", `toolDenialKind: "interrupted"`
+# on the record), written by the first reply after the resume. That is no result: at a SECOND resume the call is still
+# the one whose outcome nobody knows. A later tool call means the session went on past that outage, so it retires it.
+interrupted = set()
 for raw in lines:
     try:
         r = json.loads(raw)
@@ -541,9 +596,15 @@ for raw in lines:
         if not isinstance(b, dict):
             continue
         if r.get("type") == "assistant" and b.get("type") == "tool_use":
+            for k in interrupted:
+                pending.pop(k, None)
+            interrupted.clear()
             pending[b.get("id")] = (b.get("name") or "?", b.get("input"))
         elif r.get("type") == "user" and b.get("type") == "tool_result":
-            pending.pop(b.get("tool_use_id"), None)
+            if r.get("toolDenialKind") == "interrupted" or str(b.get("content") or "").startswith("[Tool call interrupted"):
+                interrupted.add(b.get("tool_use_id"))
+            else:
+                pending.pop(b.get("tool_use_id"), None)
 secs = int(gap) if gap else None
 if secs is None and last_ts:
     try:
@@ -557,11 +618,12 @@ elif secs >= 3600:
 else:
     when = "%dm %ds" % (secs // 60, secs % 60)
 if pending:
-    name, inp = list(pending.values())[-1]
+    tid, (name, inp) = list(pending.items())[-1]
     what = inp.get("command") if isinstance(inp, dict) and isinstance(inp.get("command"), str) else json.dumps(inp)
     what = re.sub(r"[\x00-\x1f\x7f`]", " ", str(what)).strip()[:120]
-    detail = ("Its last tool call never returned a result: %s `%s` — it may still be running, or may have "
-              "half-run." % (name, what))
+    detail = ("Its last tool call never returned a result: %s `%s` — %sit may still be running, or may have "
+              "half-run." % (name, what, "an earlier stop cut it off (the client marked it interrupted); "
+                             if tid in interrupted else ""))
 else:
     detail = ("No tool call was left without a result, but a backgrounded or container-side run the old "
               "process started can still be going.")
@@ -589,7 +651,7 @@ arm_context() {
   local tp="${1:-}" sid="${2:-}" u w fill gate
   [ -n "$tp" ] || return 0
   [ -r "$tp" ] || return 0
-  u="$(tail -c 1048576 "$tp" 2>/dev/null | grep -a -o -E '"usage"[[:space:]]*:[[:space:]]*[{][[:space:]]*"input_tokens"[[:space:]]*:[[:space:]]*[0-9]+[[:space:]]*,[[:space:]]*"cache_creation_input_tokens"[[:space:]]*:[[:space:]]*[0-9]+[[:space:]]*,[[:space:]]*"cache_read_input_tokens"[[:space:]]*:[[:space:]]*[0-9]+' 2>/dev/null | tail -n 1)" || true
+  u="$(tail -c 1048576 "$tp" 2>/dev/null | grep -a -v -E '"isSidechain"[[:space:]]*:[[:space:]]*true' | grep -a -o -E '"usage"[[:space:]]*:[[:space:]]*[{][[:space:]]*"input_tokens"[[:space:]]*:[[:space:]]*[0-9]+[[:space:]]*,[[:space:]]*"cache_creation_input_tokens"[[:space:]]*:[[:space:]]*[0-9]+[[:space:]]*,[[:space:]]*"cache_read_input_tokens"[[:space:]]*:[[:space:]]*[0-9]+' 2>/dev/null | tail -n 1)" || true
   [ -n "$u" ] || return 0
   set -- $(printf '%s' "$u" | sed 's/[^0-9][^0-9]*/ /g')
   [ $# -eq 3 ] || return 0
@@ -598,10 +660,28 @@ arm_context() {
   case "$w" in ''|*[!0-9]*) w="" ;; esac
   gate=$(((${w:-200000} - 33000) * 4 / 5))
   [ "$fill" -ge "$gate" ] || return 0
+  # §2.84 — a session whose transcript names a `[1m]` model is read against the 1M window by
+  # the python below whatever else it finds, so below that window's warning point it can only
+  # exit silently: in a 1M session it started on every prompt past 133.6k and scanned the whole
+  # transcript to say nothing (1.9 s on a 70 MB one at load 87). The grep is the same test on
+  # the same lines, and since §7108 the fill above is the newest MAIN-CHAIN usage (a sidechain
+  # line no longer stands in), as python's is, so this skips only runs that would print nothing.
+  if [ -z "$w" ] && grep -a -q -E -e '"modelId".*\[1m\]' -e '\[1m\].*"modelId"' "$tp" 2>/dev/null; then
+    [ "$fill" -ge $(((1000000 - 33000) * 4 / 5)) ] || return 0
+  fi
   command -v python3 >/dev/null 2>&1 || return 0
-  python3 -S - "$tp" "$sid" "${CLAUDE_PROJECT_DIR:-.}" "$w" <<'PY' 2>/dev/null || true
+  # §2.84 — the budget runs from the hook's start ($SECONDS) and reaches python as an epoch
+  # deadline, so time spent before python starts is counted too.
+  b="${EUGO_PROMPT_CONTEXT_BUDGET:-}"
+  case "$b" in ''|*[!0-9]*) b=20 ;; esac
+  b=$((10#$b))                       # §7108: decimal, so `08` is 8 and `010` is 10 (never an error, never octal)
+  [ "$SECONDS" -lt "$b" ] || return 0
+  dl="$(date +%s 2>/dev/null)"
+  case "$dl" in ''|*[!0-9]*) dl="" ;; *) dl=$((dl + b - SECONDS)) ;; esac
+  python3 -S - "$tp" "$sid" "${CLAUDE_PROJECT_DIR:-.}" "$w" "$dl" "$b" <<'PY' 2>/dev/null || true
 import calendar, collections, json, os, re, subprocess, sys, time
-path, sid, root, wover = sys.argv[1:5]
+path, sid, root, wover, dl, budget = sys.argv[1:7]
+DEADLINE = float(dl) if dl else time.time() + float(budget)
 MARGIN, WARN, IMM, FLOOR = 33000, 0.80, 0.95, 0.10
 PLAN = re.compile(r"(?:~|/[A-Za-z0-9._/-]*)/\.claude/plans/[A-Za-z0-9._-]+\.md")
 def ep(ts):
@@ -612,8 +692,197 @@ def ep(ts):
 comps, post, bts, one_m, said, said_imm = 0, None, None, False, False, False
 ultra, plan = None, None
 recent = collections.deque(maxlen=64)       # raw lines that may carry the newest main-chain usage
+# §2.52 (report:131, run 1236) — the effort and the plan come from PARSED records, in the §3801 resume arm's shape: a
+# raw-byte match let a tool_result or tool_use QUOTING an effort change (a grep of a transcript, this hook's own
+# tests) flip the `ultracode:` line and the level handed to the fresh session. The byte prefilters stay (the scan is
+# bounded by them); only a line that passes is parsed. audit-w267 #10: both MATCH at the record's start (see the
+# resume arm's copy) — a user prompt that quotes them is not the harness's record.
+# §3.52 S3.3 (run 1261) — 2.1.284 made ultracode ITS OWN TOGGLE (`/effort ultracode on|off`: "it no longer forces xhigh
+# effort and stays on at any effort level"; probe P6 on 2.1.295: `/effort high` after `/effort ultracode on` left it on,
+# and `/effort ultracode off` printed "Ultracode off. Effort stays high."). So an effort change says nothing about
+# ultracode in a record from 2.1.284 on, and the toggle's two words are read; a record with no `version` (and every
+# legacy fixture) keeps the old reading, where `/effort <level>` replaced ultracode.
+CMD = re.compile(r"\s*<command-name>/effort</command-name>.*?<command-args>\s*([A-Za-z]*)(?:\s+([A-Za-z]+))?\s*</command-args>", re.S)
+OUT = re.compile(r"\s*<local-command-stdout>\s*(?:Set effort level to ([A-Za-z]+)|(Ultracode on)|(Ultracode off))")
+VER = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+def toggle_era(rec):
+    m = VER.match(str(rec.get("version") or ""))
+    return bool(m) and tuple(int(x) for x in m.groups()) >= (2, 1, 284)
+def ultra_of(s, toggle):
+    """True / False from an `/effort` command or its stdout; None when it says nothing about ultracode."""
+    m = OUT.match(s)
+    if m:
+        if m.group(2) or m.group(3):
+            return m.group(2) is not None
+        return None if toggle else m.group(1).lower() == "ultracode"
+    m = CMD.match(s)
+    if m and m.group(1):
+        word, arg = m.group(1).lower(), (m.group(2) or "").lower()
+        if word == "ultracode" and arg in ("on", "off"):
+            return arg == "on"
+        if toggle:
+            return None             # a level leaves the toggle as it was; a bare `ultracode` waits for its stdout
+        return word == "ultracode"
+    return None
+def main_record(raw):
+    try:
+        r = json.loads(raw)
+    except ValueError:
+        return None
+    return r if isinstance(r, dict) and not r.get("isSidechain") else None
+def text_of(rec):
+    c = (rec.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b["text"] for b in c if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return ""
+def effort_state(raw):
+    """True / False from an ultracode enter / exit, a `/effort` command or its stdout; None for anything else."""
+    r = main_record(raw)
+    if r is None:
+        return None
+    if r.get("type") == "attachment":
+        a = r.get("attachment")
+        kind = a.get("type") if isinstance(a, dict) else None
+        return {"ultra_effort_enter": True, "ultra_effort_exit": False}.get(kind)
+    if r.get("type") != "user":
+        return None
+    return ultra_of(text_of(r), toggle_era(r))   # §3.52 S3.3
+def plan_in(raw):
+    """The last plan path in a main-chain record, never one quoted inside a tool_result."""
+    r = main_record(raw)
+    if r is None:
+        return None
+    # audit-w265 k1 — a tool-result record carries its output AGAIN in the top-level `toolUseResult`.
+    r = {k: v for k, v in r.items() if k != "toolUseResult"}
+    msg = r.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+        r = {**r, "message": {**msg, "content": [b for b in msg["content"]
+                                                 if not (isinstance(b, dict) and b.get("type") == "tool_result")]}}
+    hits = PLAN.findall(json.dumps(r))
+    return hits[-1] if hits else None
+# §2.52 (ii) (run 1238; ruled §4900) — the plan the session APPROVED, every repo it committed to, a closed plan.
+def approved_in(raw):
+    """`planFilePath` of a main-chain `plan_mode_exit` attachment whose plan exists, else None."""
+    r = main_record(raw)
+    a = r.get("attachment") if r is not None and r.get("type") == "attachment" else None
+    if isinstance(a, dict) and a.get("type") == "plan_mode_exit" and a.get("planExists") is True \
+            and isinstance(a.get("planFilePath"), str):
+        return a["planFilePath"]
+    return None
+def exit_plan_in(raw):
+    """`planFilePath` of a main-chain ExitPlanMode tool_use, else None. audit-w267 #14: a resume that resets the
+    permission mode also emits `plan_mode_exit`, with no ExitPlanMode — only this record says the plan was approved."""
+    r = main_record(raw)
+    msg = r.get("message") if r is not None and r.get("type") == "assistant" else None
+    for b in msg.get("content") if isinstance(msg, dict) and isinstance(msg.get("content"), list) else []:
+        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "ExitPlanMode" \
+                and isinstance(b.get("input"), dict) and isinstance(b["input"].get("planFilePath"), str):
+            return b["input"]["planFilePath"]
+    return None
+SEG = re.compile(r"\s*(?:&&|\|\||;|\n)\s*")
+HEREDOC = re.compile(r"(?<!<)<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
+def shell_words(cmd):
+    """audit-w267 #9 — the command with every heredoc BODY and every quoted span that is more than one plain word
+    blanked, so a `cd` inside `bash -lc '…'` or inside a heredoc never re-homes a later outer `git commit` (a quoted
+    single word such as `cd '/opt/x'` keeps its word). Comment lines go first: an apostrophe there opens no quote."""
+    cmd = "\n".join(ln for ln in (cmd or "").split("\n") if not ln.lstrip().startswith("#"))
+    out, pos = [], 0
+    while (m := HEREDOC.search(cmd, pos)) is not None:
+        nl = cmd.find("\n", m.end())
+        end = re.compile(r"^\t*%s[ \t]*$" % re.escape(m.group(2)), re.M).search(cmd, nl + 1) if nl >= 0 else None
+        if end is None:
+            break
+        out += [cmd[pos:nl], "\n"]
+        pos = end.end()
+    cmd = "".join(out) + cmd[pos:]
+    return QUOTED.sub(lambda q: q.group(0)[1:-1] if re.fullmatch(r"[^\s;&|]+", q.group(0)[1:-1]) else "_Q_", cmd)
+def commit_repos(cmd):
+    """Repos a Bash command commits in: `git -C <repo> … commit`, or a `git … commit` segment after `cd <repo>`.
+    Only an absolute (or ~) path counts, and only a segment that STARTS with git — a `grep "git commit"` is not one;
+    quoted text and heredoc bodies are not read as commands (`shell_words`)."""
+    out, cwd = [], None
+    for seg in SEG.split(shell_words(cmd)):
+        words = seg.split()
+        if len(words) == 2 and words[0] == "cd":
+            cwd = words[1].strip("'\"")
+            continue
+        if not words or words[0] != "git":
+            continue
+        repo, i = cwd, 1
+        while i < len(words) and words[i].startswith("-"):
+            if words[i] in ("-C", "-c") and i + 1 < len(words):
+                repo = words[i + 1].strip("'\"") if words[i] == "-C" else repo
+                i += 2
+            else:
+                i += 1
+        if i < len(words) and words[i] == "commit" and repo and repo[:1] in ("/", "~"):
+            out.append(repo)
+    return out
+def commit_repos_in(raw):
+    """From a main-chain record's Bash tool_use INPUTS only — tool output is never read (§4710)."""
+    r = main_record(raw)
+    msg = r.get("message") if r is not None and r.get("type") == "assistant" else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    out = []
+    for b in content if isinstance(content, list) else []:
+        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
+            out += commit_repos((b.get("input") or {}).get("command") if isinstance(b.get("input"), dict) else None)
+    return out
+CLOSED = re.compile(r"^#+[ \t]+(RUN-COMPLETE|BATCH CLOSED)\b", re.M)
+def closed_marker(p):
+    """`RUN-COMPLETE` / `BATCH CLOSED` when a HEADING in the plan's first 20 lines says so — a mention does not."""
+    try:
+        with open(os.path.expanduser(p), encoding="utf-8", errors="replace") as fh:
+            m = CLOSED.search("".join(fh.readline() for _ in range(20)))
+    except (OSError, TypeError):
+        return None
+    return m.group(1) if m else None
+# §2.56 (run 1239; ruled (b) at run 1238's close, §4920) — THE BREADCRUMB LOG SAYS WHEN A PLAN'S RUN FINISHED. No plan
+# finished since 2026-09-05 carries the heading `closed_marker` reads (that stays, as the second signal): runs write
+# `RUN-START … plan <slug>, …` and `RUN-COMPLETE: …` notes under one `w<window>-run-<N>` tag instead. FINISHED = a
+# RUN-START naming the plan's slug (a whole token, never a substring), then a RUN-COMPLETE under the SAME tag, with no
+# later RUN-START naming the slug (a re-armed plan is live again). An absent or unreadable log is no signal, never an error.
+CRUMB_TAG = re.compile(r"w\d+-run-(\d+)")
+CRUMB_PLAN = re.compile(r"\bplan ([A-Za-z0-9._-]+),")
+def finished_run(p, root, cap=8 << 20):
+    """(run N, the RUN-COMPLETE note's timestamp) when the log says the plan's run finished, else None."""
+    slug = os.path.basename(str(p or ""))
+    if not slug.endswith(".md") or len(slug) <= 3:
+        return None
+    slug = slug[:-3]
+    try:
+        with open(os.path.join(root, ".claude", "data", "overnight", "breadcrumb.log"), "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - cap))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    if size > cap:
+        lines = lines[1:]                  # a read that starts mid-file starts mid-line
+    tag = done = None
+    for line in lines:
+        parts = line.split(None, 3)
+        if len(parts) < 4 or not CRUMB_TAG.fullmatch(parts[2]):
+            continue
+        names = slug in CRUMB_PLAN.findall(parts[3])
+        if parts[0] == "note" and parts[3].startswith("RUN-START ") and names:
+            tag, done = parts[2], None
+        elif parts[0] == "note" and parts[3].startswith("RUN-COMPLETE") and parts[2] == tag:
+            done = (CRUMB_TAG.fullmatch(tag).group(1), parts[1])
+        elif done is not None and names and parts[2] != tag:
+            # audit-w268 #1 — a LATER run names the finished plan in any other shape (a `begin … (plan <slug>, RUN-START
+            # …)` line, as runs 1216-1223 wrote): it was re-armed, so it is live again. A re-arm that names its plan
+            # nowhere cannot be tied to it here.
+            tag, done = parts[2], None
+    return done
+approved, confirmed, exited, repos = None, False, set(), []
 with open(path, "rb") as f:
-    for raw in f:
+    for n, raw in enumerate(f):
+        if not n & 2047 and time.time() > DEADLINE:
+            sys.exit(0)                    # §2.84 — out of budget: silent this prompt, never a partial count
         if b"compact_boundary" in raw:
             try:
                 r = json.loads(raw)
@@ -643,15 +912,25 @@ with open(path, "rb") as f:
                     said = True
         if b'"modelId"' in raw and b"[1m]" in raw:
             one_m = True
-        if b"ultra_effort_" in raw or b"/effort</command-name>" in raw or b"Set effort level to" in raw:
-            m = re.search(rb"ultra_effort_(enter|exit)|<command-args>\s*([A-Za-z]+)\s*</command-args>|Set effort level to ([A-Za-z]+)", raw)
-            if m:
-                v = (m.group(1) or m.group(2) or m.group(3) or b"").decode()
-                ultra = v in ("enter", "ultracode")
+        if (b"ultra_effort_" in raw or b"/effort</command-name>" in raw or b"Set effort level to" in raw
+                or b"local-command-stdout" in raw or b"Ultracode " in raw):
+            state = effort_state(raw)
+            if state is not None:
+                ultra = state
         if b"/.claude/plans/" in raw:
-            hits = PLAN.findall(raw.decode("utf-8", "replace"))
-            if hits:
-                plan = hits[-1]
+            found = plan_in(raw)
+            if found:
+                plan = found
+        if b"ExitPlanMode" in raw:
+            found = exit_plan_in(raw)
+            if found:
+                exited.add(found)
+        if b"plan_mode_exit" in raw:
+            found = approved_in(raw)
+            if found:
+                approved, confirmed = found, found in exited
+        if b"commit" in raw and b'"tool_use"' in raw:
+            repos += [p for p in commit_repos_in(raw) if p not in repos]
         if b'"usage"' in raw and b'"assistant"' in raw:
             recent.append(raw)
 fill = effort = None
@@ -693,8 +972,11 @@ else:
     sys.exit(0)
 
 def run(args, limit=60):
+    left = DEADLINE - time.time()      # §2.84 — one budget across every git / ps call, each still at most 3 s
+    if left <= 0:
+        return "(skipped: the hook's time budget ran out)"
     try:
-        out = subprocess.run(args, capture_output=True, text=True, timeout=3)
+        out = subprocess.run(args, capture_output=True, text=True, timeout=min(3.0, left))
     except (OSError, subprocess.SubprocessError):
         return "(unavailable)"
     if out.returncode != 0:
@@ -707,6 +989,10 @@ fname = os.path.join(hdir, "%s-%s.md" % (time.strftime("%Y%m%dT%H%M%SZ", now), s
 branch = run(["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"], 1)
 sha = run(["git", "-C", root, "rev-parse", "--short=12", "HEAD"], 1)
 has_sha = re.fullmatch(r"[0-9a-f]{7,40}", sha) is not None
+# §7108 — this repo's own status and stash, before ps and the other repos: the hand-off's step 3 compares with them, so
+# they are the last thing a spent budget may drop.
+own_status = run(["git", "-C", root, "status", "--short", "-b"])
+own_stash = run(["git", "-C", root, "stash", "list"], 20)
 level = "ultracode" if ultra else (effort or "xhigh")
 since = ("log --oneline %s..HEAD" % sha) if has_sha else "log --oneline -10"
 state_md = os.path.join(root, ".claude", "docs", "guardrails", "STATE.md")
@@ -717,7 +1003,36 @@ except OSError:
     state = "(none)"
 procs = run(["ps", "-u", str(os.getuid()), "-o", "pid=,etime=,args="], 400)
 keep = re.compile(r"pytest|docker|make |eugo-|with-heavy-lock|codex_|claude -p|vitest|embed")
-procs = "\n".join(ln for ln in procs.splitlines() if keep.search(ln))[:6000] or "(none matched)"
+if not procs.startswith("("):         # §7108: "(skipped: …)" / "(unavailable)" is said as is, never as "(none matched)"
+    procs = "\n".join(ln for ln in procs.splitlines() if keep.search(ln))[:6000] or "(none matched)"
+# §2.52 (ii) — the approved plan wins; a closed one is flagged rather than handed over as live work.
+chosen = approved or plan
+closed = closed_marker(chosen) if chosen else None
+finished = finished_run(chosen, root) if chosen else None
+plan_line = (chosen or "(none named in the transcript)") + (
+    " — approved (the session's last ExitPlanMode)" if approved and confirmed
+    else " — from the harness's last plan-mode exit; no ExitPlanMode for it in this transcript" if approved
+    else " — named in the transcript" if chosen else "")
+if finished:
+    plan_line += " — ⚠ FINISHED: run %s wrote RUN-COMPLETE %s; confirm with the operator before resuming it" % finished
+if closed:
+    plan_line += " — ⚠ CLOSED: its header reads %s; confirm with the operator before resuming it" % closed
+step5 = ("5) The plan above is marked %s — ask the operator which plan this work continues."
+         % ("FINISHED" if finished else "CLOSED") if closed or finished
+         else "5) No ExitPlanMode in this transcript approved the plan above — confirm it with the operator first."
+         if approved and not confirmed
+         else "5) Open the plan and continue at its first unfinished item.")
+others, real_root = [], os.path.realpath(root)
+for repo in repos:
+    if len(others) >= 8:               # §2.84 — the hand-off shows 8; git ran for every one before
+        break
+    full = os.path.realpath(os.path.expanduser(repo))
+    if full != real_root and os.path.isdir(full) and full not in [o for o, _ in others]:
+        st = run(["git", "-C", full, "status", "--short", "-b"])
+        # audit-w267 #11 (plan B11: "git status/log per repo") — its last commits too, unless status already failed.
+        log = run(["git", "-C", full, "log", "--oneline", "-3"]) if st != "(unavailable)" else None
+        others.append((full, st + "\n\n" + log if log else st))
+others_md = "".join("\n### %s\n\n```\n%s\n```\n" % o for o in others) or "\n(none besides the repo above)\n"
 body = """# Hand-off — session %(sid)s, %(stamp)s
 
 - user: %(user)s · repo: %(root)s @ %(branch)s · HEAD %(sha)s
@@ -728,7 +1043,7 @@ body = """# Hand-off — session %(sid)s, %(stamp)s
 ## Continue in a FRESH session
 
 1. In THIS session: `/exit` (one writer per branch).
-2. From a shell: `cd %(root)s && claude --effort %(level)s`
+2. In the same shell: `claude --effort %(level)s` (from any other shell, `cd %(root)s` first)
 3. Paste as the first message:
 
        eresume handoff %(fname)s
@@ -738,7 +1053,7 @@ body = """# Hand-off — session %(sid)s, %(stamp)s
    2) `git -C %(root)s %(since)s` — what landed after this hand-off.
    3) `git -C %(root)s status` — compare with the snapshot below; never discard what you did not write.
    4) Confirm this session runs at effort %(level)s (`/effort %(level)s` if not).
-   5) Open the plan and continue at its first unfinished item.
+   %(step5)s
 
 Not a stop: the old session keeps working until the operator switches.
 
@@ -748,6 +1063,8 @@ Not a stop: the old session keeps working until the operator switches.
 %(status)s
 ```
 
+## git status — the other repos this session committed to
+%(others)s
 ## git stash list
 
 ```
@@ -765,9 +1082,9 @@ Not a stop: the old session keeps working until the operator switches.
 ```
 """ % dict(sid=sid, stamp=stamp, user=os.environ.get("USER") or str(os.getuid()), root=root, branch=branch,
            sha=sha, fill=fill, W=W, A=A, comps=comps, effort=effort or "unknown",
-           ultra={True: "on", False: "off", None: "unknown"}[ultra], plan=plan or "(none named in the transcript)",
-           level=level, fname=fname, since=since, status=run(["git", "-C", root, "status", "--short", "-b"]),
-           stash=run(["git", "-C", root, "stash", "list"], 20), state=state, procs=procs)
+           ultra={True: "on", False: "off", None: "unknown"}[ultra], plan=plan_line, step5=step5, others=others_md,
+           level=level, fname=fname, since=since, status=own_status,
+           stash=own_stash, state=state, procs=procs)
 os.makedirs(hdir, exist_ok=True)
 fd = os.open(fname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
 with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -789,6 +1106,45 @@ PY
   return 0
 }
 
+arm_model() {
+  # $1 = the PostModelSwitch payload. §3.52 S3.4 (run 1261) — PostModelSwitch (2.1.251+) runs after the session's model
+  # changed, and its stdout reaches the model with the next request (hooks.md). ONE line: the effort level does not carry
+  # (`/model` falls back to the new model's default, measured c6d0d255), and a commit's trailer names the RUNNING model.
+  # Silent on `resume` (the saved model restored; the resume arms speak for a resume). The payload's model ids and source
+  # are kept to [A-Za-z0-9._:-] before they reach context. No python: grep and sed, as MAIN reads the event.
+  local in="${1:-}" to from src why
+  to="$(printf '%s' "$in" | grep -o '"to_model"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/' | LC_ALL=C tr -cd 'A-Za-z0-9._:-')"
+  from="$(printf '%s' "$in" | grep -o '"from_model"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/' | LC_ALL=C tr -cd 'A-Za-z0-9._:-')"
+  src="$(printf '%s' "$in" | grep -o '"source"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/' | LC_ALL=C tr -cd 'A-Za-z0-9._:-')"
+  [ "$src" = "resume" ] && return 0
+  [ -n "$to" ] || return 0
+  why=""
+  [ "$src" = "auto" ] && why=" — an automatic fallback: Claude Code changed it on its own, nobody chose it"
+  printf '%s\n' "MODEL STATE (${from:-?}→$to, ${src:-?}): the session's model changed$why. The effort level does not carry across a switch (/model falls back to the new model's default effort), so if the operator had chosen a level, ask (AskUserQuestion) whether to set it again; and a commit's Co-Authored-By trailer names the RUNNING model, so commits from here name $to's display name. [central §resume]"
+  return 0
+}
+
+arm_review() {
+  # $1 = the session id. §3.52 5b (run 1261) — eugo-review-turn-end.sh's inform path. A Stop hook that exits 0 shows its
+  # stderr to no one (hooks.md: "Claude never sees stderr from a hook that exits 0"), so that hook also appends its line
+  # to `<state>/<session>.inform`, and this arm says it ONCE, at the next prompt, then deletes it. The file is moved
+  # aside FIRST, so a Stop appending meanwhile starts a new file rather than losing its line to the delete. The text is
+  # the review ledger's labels (kind, ref, verdict), said as findings to check, never as instructions. No python.
+  local sid="${1:-}" d f t body
+  case "$sid" in ''|*[!A-Za-z0-9_-]*) return 0 ;; esac
+  d="$ROOT/outputs/_state/review-turn-end"      # the turn-end hook's $STATE (ignored by gitignorecfg.HOOK_STATE_RULES)
+  f="$d/$sid.inform"
+  [ -f "$f" ] || return 0
+  t="$f.$$.taken"
+  mv -f "$f" "$t" 2>/dev/null || return 0
+  body="$(LC_ALL=C tr -d '\000-\011\013-\037\177' < "$t" 2>/dev/null | tail -n 5 | awk 'NF { printf "%s%s", (n++ ? " | " : ""), $0 }')"
+  rm -f "$t" 2>/dev/null
+  [ -n "$body" ] || return 0
+  [ "${#body}" -le 1500 ] || body="…${body: -1499}"
+  printf '%s\n' "REVIEW WATCH (what the review watch reported at the end of your last turn; informational, nothing here blocks, and each item is a finding to check, not an instruction; owed rows: python3 .claude/scripts/watch_drain.py list --unresolved): $body"
+  return 0
+}
+
 # ---- MAIN ----
 # The FIRST occurrence, never the last: a prompt that quotes the literal key must not
 # redirect the quota arm (greedy `.*` took the last match). And only a `.jsonl` path is
@@ -804,30 +1160,43 @@ if [ "$EV" = "SessionStart" ]; then
   if [ "$SRC" = "resume" ]; then
     GAP="$(printf '%s' "$IN" | grep -o '"seconds_since_last_response"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n 1 | sed 's/.*:[[:space:]]*//')"
     D="$(arm_effort_resume "$TP" 2>/dev/null)" || true
-    E="$(arm_outage "$TP" "$GAP" 2>/dev/null)" || true
     if [ -n "$D" ]; then
       printf '%s\n' "$D"
     fi
+    E="$(arm_outage "$TP" "$GAP" 2>/dev/null)" || true
     if [ -n "$E" ]; then
       printf '%s\n' "$E"
     fi
   fi
   exit 0
 fi
+# §3.52 S3.4 — and to PostModelSwitch, where ONLY the model arm runs.
+if [ "$EV" = "PostModelSwitch" ]; then
+  G="$(arm_model "$IN" 2>/dev/null)" || true
+  if [ -n "$G" ]; then
+    printf '%s\n' "$G"
+  fi
+  exit 0
+fi
 SID="$(printf '%s' "$IN" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')"
+# §2.84 — each arm's lines go out as soon as it returns, in the same order as before.
 A="$(arm_glossary 2>/dev/null)" || true
-B="$(arm_quota "$TP" 2>/dev/null)" || true
-C="$(arm_effort "$TP" 2>/dev/null)" || true
-F="$(arm_context "$TP" "$SID" 2>/dev/null)" || true
 if [ -n "$A" ]; then
   printf '%s\n' "$A"
 fi
+B="$(arm_quota "$TP" 2>/dev/null)" || true
 if [ -n "$B" ]; then
   printf '%s\n' "$B"
 fi
+C="$(arm_effort "$TP" 2>/dev/null)" || true
 if [ -n "$C" ]; then
   printf '%s\n' "$C"
 fi
+R="$(arm_review "$SID" 2>/dev/null)" || true
+if [ -n "$R" ]; then
+  printf '%s\n' "$R"
+fi
+F="$(arm_context "$TP" "$SID" 2>/dev/null)" || true
 if [ -n "$F" ]; then
   printf '%s\n' "$F"
 fi
