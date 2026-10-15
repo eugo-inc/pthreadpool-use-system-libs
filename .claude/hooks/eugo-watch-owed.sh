@@ -83,7 +83,8 @@ fi
 
 # `status` puts some fields alone on a line and others together (`owed=N unresolved=M`),
 # so split on spaces first: an anchored line match silently found neither of those two.
-field() { printf '%s\n' "$OUT" | tr ' ' '\n' | grep "^$1=" | head -1 | cut -d= -f2-; }
+# §1.187 — no `| head` after the grep (a SIGPIPE'd producer is rc 141 under pipefail): the first line by expansion.
+field() { local v; v="$(printf '%s\n' "$OUT" | tr ' ' '\n' | grep "^$1=")"; v="${v%%$'\n'*}"; printf '%s\n' "${v#*=}"; }
 
 UNRESOLVED="$(field unresolved)"
 LOCK="$(field watch_lock)"

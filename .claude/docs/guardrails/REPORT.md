@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.2.7 (§7107 R7e corrected: 30 words, widget rows, labels, F5; §7103 R7e: what is RUNNING apart from what is owed NEXT; §3609 R7b: no NEXT inbox — a report to athena is its own channel) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
+<!-- guardrails-kit: v1.2.8 (§7308 R7f: a blocked NEXT item says (blocked) and its body names the blocker; §7107 R7e corrected: 30 words, widget rows, labels, F5; §7103 R7e: what is RUNNING apart from what is owed NEXT; §3609 R7b: no NEXT inbox — a report to athena is its own channel) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
 You are here because you are about to write a verdict, finding, recommendation, or the turn's final answer to the user.
 
 Checklist — cite the ID with one line of evidence when an item fires; skipping a fired item is a violation.
@@ -18,6 +18,9 @@ Checklist — cite the ID with one line of evidence when an item fires; skipping
   - A task-widget row that is in flight goes here, not into R7's sweep; never number a Running line -> instead: list it unnumbered under `**Running**`.
   - Then the `NEXT-N (owner): …` lines under a bold `**NEXT**` label, R7's shape unchanged; nothing in flight -> omit the `**Running**` label.
   - Never ANSI colour codes -> instead: the two bold labels (a list mixing what to wait for with what to do reads as all owed).
+- R7f. When an item's delivery is blocked: write `(blocked)` after its owner, `NEXT-2 (operator) (blocked): …`.
+  - Its backlog body gains a blockquote naming the blocker and why: the exact command or input, the verbatim error, the mechanism and the smallest unblocking step.
+  - Its index row (athena: FUTURE_INDEX.md) leads with `BLOCKED`.
 - R8. Any `NEXT:` item needing the user's ACTION, INPUT or ATTENTION goes through AskUserQuestion in THIS turn, not the next one — .claude/docs/guardrails/PLAN.md P10 owns the rule; this is its report-time trigger (a NEXT line is a record, and the record is not the ask).
 
 --- reference ---

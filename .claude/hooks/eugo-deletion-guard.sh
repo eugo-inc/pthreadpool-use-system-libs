@@ -147,11 +147,13 @@
 # Contract (each line is a test in tools/tests/test_deletion_guard_hook.py):
 #   - every path exits 0 but one; a deny is ONE JSON line on stdout, an allow prints nothing
 #   - a command with no `rm` word, no `-delete` and no `rmtree` never starts python
-#   - a CRASH in the checker (python ran and raised) FAILS CLOSED: ONE stderr line and exit 1, which the row's
-#     `onFailure: "block"` makes a block on Claude Code 2.1.295+ (an older client reports a hook error and runs the
-#     command) — §3.52 S3.7, ruled 2026-10-11. A dead checker (python3 that cannot run: a macOS stub, a broken
-#     install) and a missing python3 still FAIL OPEN with ONE stderr line, or such a box would block every rm. A
-#     command nested past MAX_NEST (100) levels is DENIED before it can crash the checker (§1.176)
+#   - a raise inside `check_text` (the checker reading the command) FAILS CLOSED: ONE stderr line and exit 1, which
+#     the row's `onFailure: "block"` makes a block on Claude Code 2.1.295+ (an older client reports a hook error and
+#     runs the command) — §3.52 S3.7, ruled 2026-10-11. Anything else that stops python — a raise at module scope or
+#     in an import, a SyntaxError on an older python3, a BaseException — and a dead checker (python3 that cannot run:
+#     a macOS stub, a broken install) or a missing python3 FAIL OPEN with ONE stderr line, or such a box would block
+#     every rm (§2.93 (d), ruled 2026-10-13: the text narrowed, the behaviour kept). A command nested past MAX_NEST
+#     (100) levels is DENIED before it can crash the checker (§1.176)
 #   - a payload that is not a Bash hook JSON object is allowed silently
 #   - EUGO_DELETION_GUARD=off in the HOOK's environment disables it; an inline
 #     `EUGO_DELETION_GUARD=off rm …` in the command does not
@@ -318,7 +320,8 @@ class Word(object):
 
     def flush(self):
         """§1.175 — join the pieces the lexer appended. Grown one character at a time on the `text` attribute, a word
-        was copied at every step: one 1 MB word cost 6.4 s of CPU, and a hook that times out ALLOWS."""
+        was copied at every step: one 1 MB word cost 6.4 s of CPU, and a hook that timed out then ALLOWED (since §3.52
+        S3.7 the row carries onFailure block: a timeout BLOCKS on Claude Code 2.1.295+, and still allows on an older one)."""
         if self.buf:
             self.text += "".join(self.buf)
             self.buf = []
@@ -695,7 +698,8 @@ class Lexer(object):
         cmd), so their bodies go to `w.subs`; a `'` there quotes nothing (`$(( '$(cmd)' ))` runs cmd). bash reads
         `$((cmd); x)` (the inner `(` closed by a `)` with no second `)` straight after it) as a command substitution
         that starts with a subshell, so that text is lexed as one. Memoized per start, as `run` is: a nest of those
-        re-reads each inner text, and unmemoized that doubled per level (16 deep took 6 s; the hook's timeout allows).
+        re-reads each inner text, and unmemoized that doubled per level (16 deep took 6 s; the hook's timeout then allowed,
+        and since §3.52 S3.7 blocks on Claude Code 2.1.295+).
         §1.181 (a) — bash and dash join a line continuation before they read either pair of parens, so one between the two
         `(` or the two `)` changes nothing: `$(\\<newline>(…))` is arithmetic, where a `'` quotes nothing, never a command
         substitution starting with a subshell, where it would."""
@@ -2278,13 +2282,14 @@ _MODE = {"posix": False, "noexit": False, "nocd": False, "split": False}    # #2
 #: `nested`), every text it checks (a substitution's body, a fed heredoc, a -c string) and every docker/runuser/flock
 #: wrapper `check_command` recurses through counts one; a `${…}` nested in another's operand and `peel`'s wrappers
 #: (`sudo`, `env`, …) recurse nowhere, so they need no count (audit-w286 #14). Past it the command is DENIED: reading on,
-#: the stack overflowed near 500 levels, and a crash fails open by design (`rm -rf /` at the centre ran unchecked).
+#: the stack overflowed near 500 levels, and the crash failed open then (`rm -rf /` at the centre ran unchecked; since
+#: §3.52 S3.7 a raise in `check_text` fails closed, but a deny names its reason).
 MAX_NEST = 100
 _NEST = [0]
 
 
 class TooDeep(Exception):
-    """§1.176 — the command nests past MAX_NEST: a deny, never the crash's fail-open."""
+    """§1.176 — the command nests past MAX_NEST: a deny that names why, never the crash path."""
 
 
 class TooMuch(TooDeep):
@@ -2293,7 +2298,8 @@ class TooMuch(TooDeep):
 
 #: §1.180 — a fed heredoc, a string run by a shell or a substitution is checked as a text of its own, so a nest of them
 #: re-reads the rest of the command at every level: MAX_NEST stops the depth at 100, which still leaves about 100 times
-#: the command's size (90 levels around a 1 MB body took 5.3 s of CPU in-process, and a hook that times out ALLOWS).
+#: the command's size (90 levels around a 1 MB body took 5.3 s of CPU in-process, and a hook that timed out then ALLOWED;
+#: since §3.52 S3.7 the row's onFailure block makes a timeout a BLOCK on Claude Code 2.1.295+).
 #: Every text checked counts its length (the POSIX re-read too) against WORK_MULT times the whole command's length,
 #: never under WORK_FLOOR characters; past it the command is denied. Measured on 27,962 real Bash commands from local
 #: transcripts (run 1259): the most any was read is 4.8 times its length.

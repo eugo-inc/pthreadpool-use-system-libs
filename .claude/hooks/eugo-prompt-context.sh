@@ -68,7 +68,8 @@
 #   - review arm (§3.52 5b, run 1261): `outputs/_state/review-turn-end/<session_id>.inform` — the
 #     review watch's end-of-turn inform line(s), which eugo-review-turn-end.sh hands over because a
 #     Stop hook's exit-0 stderr reaches no one — is moved aside, said as ONE `REVIEW WATCH` line (its
-#     newest 5 lines, C0 controls and DEL stripped, at most 1,500 characters) and deleted; only this
+#     newest 5 non-blank lines, C0 controls and DEL stripped, the text after the line's fixed prefix cut
+#     to its last 1,500 characters — bytes outside a UTF-8 locale) and deleted; only this
 #     prompt's session, only a session id of [A-Za-z0-9_-]; no python
 #   - SESSION START (§3801): the same script bound to SessionStart `resume` runs ONLY the two
 #     resume arms. Effort-resume: ultracode on before the resume (the newest `ultra_effort_enter|exit` or
@@ -1106,6 +1107,16 @@ PY
   return 0
 }
 
+model_field() {
+  # $1 = a key, $2 = the PostModelSwitch payload: the key's first string value, kept to [A-Za-z0-9._:-]. Run 1261 (the
+  # protomolecule gate's F1216 scanner) — `grep -o` reads a here-string and the first match is taken by expansion, so no
+  # early-exit reader (`head`) sits behind a writer that could take SIGPIPE under an inherited pipefail.
+  local v
+  v="$(grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" <<<"$2" 2>/dev/null)"
+  v="${v%%$'\n'*}"
+  sed 's/.*"\([^"]*\)"$/\1/' <<<"$v" | LC_ALL=C tr -cd 'A-Za-z0-9._:-'
+}
+
 arm_model() {
   # $1 = the PostModelSwitch payload. §3.52 S3.4 (run 1261) — PostModelSwitch (2.1.251+) runs after the session's model
   # changed, and its stdout reaches the model with the next request (hooks.md). ONE line: the effort level does not carry
@@ -1113,9 +1124,9 @@ arm_model() {
   # Silent on `resume` (the saved model restored; the resume arms speak for a resume). The payload's model ids and source
   # are kept to [A-Za-z0-9._:-] before they reach context. No python: grep and sed, as MAIN reads the event.
   local in="${1:-}" to from src why
-  to="$(printf '%s' "$in" | grep -o '"to_model"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/' | LC_ALL=C tr -cd 'A-Za-z0-9._:-')"
-  from="$(printf '%s' "$in" | grep -o '"from_model"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/' | LC_ALL=C tr -cd 'A-Za-z0-9._:-')"
-  src="$(printf '%s' "$in" | grep -o '"source"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/' | LC_ALL=C tr -cd 'A-Za-z0-9._:-')"
+  to="$(model_field to_model "$in")"
+  from="$(model_field from_model "$in")"
+  src="$(model_field source "$in")"
   [ "$src" = "resume" ] && return 0
   [ -n "$to" ] || return 0
   why=""
@@ -1137,7 +1148,8 @@ arm_review() {
   [ -f "$f" ] || return 0
   t="$f.$$.taken"
   mv -f "$f" "$t" 2>/dev/null || return 0
-  body="$(LC_ALL=C tr -d '\000-\011\013-\037\177' < "$t" 2>/dev/null | tail -n 5 | awk 'NF { printf "%s%s", (n++ ? " | " : ""), $0 }')"
+  # §2.93 (c) — blank lines go BEFORE the tail, so "the newest 5" are five findings, not five lines of spacing.
+  body="$(LC_ALL=C tr -d '\000-\011\013-\037\177' < "$t" 2>/dev/null | awk 'NF' | tail -n 5 | awk '{ printf "%s%s", (n++ ? " | " : ""), $0 }')"
   rm -f "$t" 2>/dev/null
   [ -n "$body" ] || return 0
   [ "${#body}" -le 1500 ] || body="…${body: -1499}"
@@ -1149,16 +1161,16 @@ arm_review() {
 # The FIRST occurrence, never the last: a prompt that quotes the literal key must not
 # redirect the quota arm (greedy `.*` took the last match). And only a `.jsonl` path is
 # ever read.
-TP="$(printf '%s' "$IN" | grep -o '"transcript_path"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')"
+TP="$(grep -o '"transcript_path"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$IN" 2>/dev/null)"; TP="${TP%%$'\n'*}"; TP="$(sed 's/.*"\([^"]*\)"$/\1/' <<<"$TP")"
 case "$TP" in *.jsonl) ;; *) TP="" ;; esac
 # §3801 — the same script is bound to SessionStart `resume`; there ONLY the resume arm runs
 # (a prompt arm would speak twice: once now, once at the first prompt). A quoted key inside
 # the prompt is JSON-escaped (`\"`), so it cannot match these patterns.
-EV="$(printf '%s' "$IN" | grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')"
+EV="$(grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$IN" 2>/dev/null)"; EV="${EV%%$'\n'*}"; EV="$(sed 's/.*"\([^"]*\)"$/\1/' <<<"$EV")"
 if [ "$EV" = "SessionStart" ]; then
-  SRC="$(printf '%s' "$IN" | grep -o '"source"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')"
+  SRC="$(grep -o '"source"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$IN" 2>/dev/null)"; SRC="${SRC%%$'\n'*}"; SRC="$(sed 's/.*"\([^"]*\)"$/\1/' <<<"$SRC")"
   if [ "$SRC" = "resume" ]; then
-    GAP="$(printf '%s' "$IN" | grep -o '"seconds_since_last_response"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n 1 | sed 's/.*:[[:space:]]*//')"
+    GAP="$(grep -o '"seconds_since_last_response"[[:space:]]*:[[:space:]]*[0-9]*' <<<"$IN" 2>/dev/null)"; GAP="${GAP%%$'\n'*}"; GAP="$(sed 's/.*:[[:space:]]*//' <<<"$GAP")"
     D="$(arm_effort_resume "$TP" 2>/dev/null)" || true
     if [ -n "$D" ]; then
       printf '%s\n' "$D"
@@ -1178,7 +1190,7 @@ if [ "$EV" = "PostModelSwitch" ]; then
   fi
   exit 0
 fi
-SID="$(printf '%s' "$IN" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')"
+SID="$(grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$IN" 2>/dev/null)"; SID="${SID%%$'\n'*}"; SID="$(sed 's/.*"\([^"]*\)"$/\1/' <<<"$SID")"
 # §2.84 — each arm's lines go out as soon as it returns, in the same order as before.
 A="$(arm_glossary 2>/dev/null)" || true
 if [ -n "$A" ]; then

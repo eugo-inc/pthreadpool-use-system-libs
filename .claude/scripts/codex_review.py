@@ -403,6 +403,16 @@ REVIEW_SUBPROCESS_ENV = "EUGO_REVIEW_SUBPROCESS"
 CLAUDE_MCP_ISOLATION = ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}')
 CLAUDE_NO_CONNECTORS_ENV = "ENABLE_CLAUDEAI_MCP_SERVERS"
 
+#: §3.44 M7 — EVERY CLAUDE REVIEWER WRITES 5-MINUTE CACHE, keyed or not (operator: "After the
+#: baseline day"; M4's baseline, §7016: the subscription default writes 1-hour cache, and the pin
+#: would have saved 27.1% per review; a review re-reads almost nothing of the one before). FIRST in
+#: the CLI's precedence and it covers every request of the child, so it outranks an inherited
+#: CLAUDE_CODE_*_PROMPT_CACHE_TTL (the allowlist forwards those) and any settings file's
+#: `promptCacheTtl`. Set AFTER the allowlist, like the marker. Measured on the subscription path
+#: (§7014): with it, cw1 = 0. `EUGO_REVIEW_CACHE_TTL=default` leaves the CLI's own default.
+CLAUDE_CACHE_PIN_ENV = "FORCE_PROMPT_CACHING_5M"
+REVIEW_CACHE_TTL_ENV = "EUGO_REVIEW_CACHE_TTL"
+
 #: §2.38 (b) — THE REVIEW CHILD GETS AN ALLOWLISTED ENVIRONMENT, NOT THE SESSION'S WHOLE ONE.
 #:
 #: Both engines' children were spawned with `env={**os.environ, …}`, so every credential the
@@ -1045,11 +1055,15 @@ def _usage_take(out_file) -> list[dict]:
         return _USAGE_ATTEMPTS.pop(str(out_file), [])
 
 
-def _record_attempt(out_file, prompt: str, *, env=None, proc=None, outcome: str = "") -> None:
-    """§3.44 M1 — note one child run under its capture path.
+def _record_attempt(out_file, prompt: str, *, env=None, proc=None, outcome: str = "",
+                    extra: dict | None = None) -> dict | None:
+    """§3.44 M1 — note one child run under its capture path, and return the note (None on failure).
 
     Measurement never fails a review: whatever goes wrong in here is dropped, and the run's own
-    result is returned to the caller unchanged.
+    result is returned to the caller unchanged. §3.44 M7 — `extra` merges fixed codes in: `key`
+    (the keyring label a keyed attempt used) or `gate` (why an attempt carried no key). A keyed
+    attempt's `extra` also carries its lease's `id`, which replaces the one minted here: the vending
+    machine journals the run's start and end under that id, and the report pairs them by it (§7031).
     """
     try:
         attempt: dict = {"id": secrets.token_hex(6), "pb": len(prompt.encode("utf-8", "replace"))}
@@ -1062,9 +1076,12 @@ def _record_attempt(out_file, prompt: str, *, env=None, proc=None, outcome: str 
             attempt.update(_envelope_usage(proc.stdout or ""))
         if outcome:
             attempt["outcome"] = outcome
+        if extra:
+            attempt.update(extra)
         _usage_put(out_file, attempt)
     except Exception:  # noqa: BLE001 — see the docstring
-        pass
+        return None
+    return attempt
 
 
 def _usage_token(out_file, verdict: str, note: str) -> str:
@@ -1089,14 +1106,18 @@ def _usage_token(out_file, verdict: str, note: str) -> str:
     return "" if any(c.isspace() for c in token) else token
 
 
-def _run_one_claude(
-    model: str, prompt: str, review_type: str, effort: str, repo: str, out_file: Path
+def _claude_attempt(
+    model: str, prompt: str, review_type: str, effort: str, repo: str, out_file: Path, *,
+    key: str | None = None, deny: str = "", extra: dict | None = None, info: dict | None = None,
 ) -> tuple[str, str, str]:
-    """Run the Claude CLI headless for one model. Returns (model, verdict, note). Never raises.
+    """ONE headless Claude CLI child for one model: (model, verdict, note). Never raises.
 
-    SIGNATURE-COMPATIBLE with `_run_one` on purpose, so `main` dispatches on `--engine`
-    alone rather than branching at the call site. `_build_prompt` and `_verdict` are
-    already engine-agnostic — only the subprocess invocation differs.
+    §3.44 M7 — `_run_one_claude` decides how many attempts run; this runs one. `key` goes into
+    THIS child's environment only (as ANTHROPIC_API_KEY); `deny` is appended to the one denied-
+    tools token (the keyring directory, `_credits_deny`); `extra` is merged into its usage record;
+    `info`, when given, receives `rc`, the parsed `envelope`, the usage `attempt` and `timeout`.
+    The child's stdout and stderr are scrubbed of the key, and of anything key-shaped, before
+    anything reads them (`_scrub_keys`).
 
     Flag set VERIFIED against `claude --help` on CLI 2.1.246, not recalled:
       * `-p/--print` with the prompt on STDIN. Unlike `codex exec`, NO `-` argument is
@@ -1138,6 +1159,11 @@ def _run_one_claude(
         # dispatches reviews: the SessionStart `--full` hook fires in every one).
         child_env = {**_review_child_env("claude"), REVIEW_SUBPROCESS_ENV: "1",
                      CLAUDE_NO_CONNECTORS_ENV: "false"}
+        # §3.44 M7 — see CLAUDE_CACHE_PIN_ENV.
+        if (os.environ.get(REVIEW_CACHE_TTL_ENV) or "").strip() != "default":
+            child_env[CLAUDE_CACHE_PIN_ENV] = "1"
+        if key is not None:
+            child_env["ANTHROPIC_API_KEY"] = key
         proc = subprocess.run(
             [
                 binary, "-p",
@@ -1151,7 +1177,7 @@ def _run_one_claude(
                 # §2.38 (a1) — see CLAUDE_MCP_ISOLATION; kept ahead of another flag.
                 *CLAUDE_MCP_ISOLATION,
                 # §2.38 (e) — see CLAUDE_DENIED_TOOLS; one token, kept ahead of another flag.
-                "--disallowed-tools", CLAUDE_DENIED_TOOLS,
+                "--disallowed-tools", CLAUDE_DENIED_TOOLS + deny,
                 "--permission-mode", CLAUDE_PERMISSION_MODE,
                 "--allowed-tools", CLAUDE_READONLY_TOOLS,
             ],
@@ -1162,9 +1188,15 @@ def _run_one_claude(
             env=child_env,
             timeout=CLAUDE_TIMEOUT_S,
         )
+        # §3.44 M7 — scrubbed where it enters: the usage note, the envelope, the capture and every
+        # note below see `[key withheld]`, never the key or anything key-shaped.
+        proc.stdout = _scrub_keys(proc.stdout, key)
+        proc.stderr = _scrub_keys(proc.stderr, key)
         # §3.44 M1 — noted HERE, ahead of the rc branch: a failed run bills tokens too.
-        _record_attempt(out_file, prompt, env=child_env, proc=proc)
+        attempt = _record_attempt(out_file, prompt, env=child_env, proc=proc, extra=extra)
         recorded = True
+        if info is not None:
+            info.update(rc=proc.returncode, envelope=_envelope_object(proc.stdout), attempt=attempt)
         # Same fail-safe rule as the codex path (dogfood f2): a nonzero exit is a FAILED
         # run — never let partial output masquerade as a clean review (a sweep would
         # otherwise report a false NO_FINDINGS).
@@ -1226,25 +1258,178 @@ def _run_one_claude(
             return (model, "ERROR", "no verdict line")
         return (model, _verdict(review_type, text), "")
     except subprocess.TimeoutExpired:
-        _record_attempt(out_file, prompt, env=child_env, outcome="timeout")
+        attempt = _record_attempt(out_file, prompt, env=child_env, outcome="timeout", extra=extra)
+        if info is not None:
+            info.update(timeout=True, attempt=attempt)
         return (model, "ERROR", f"timeout after {CLAUDE_TIMEOUT_S}s")
     except FileNotFoundError:
         if not recorded:
-            _record_attempt(out_file, prompt, env=child_env, outcome="no_cli")
+            attempt = _record_attempt(out_file, prompt, env=child_env, outcome="no_cli", extra=extra)
+            if info is not None:
+                info.update(attempt=attempt)
         return (model, "ERROR", "claude CLI not found on PATH")
     except Exception as exc:  # noqa: BLE001 — isolate any per-model failure
         if not recorded:
-            _record_attempt(out_file, prompt, env=child_env, outcome="error")
-        return (model, "ERROR", str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
+            attempt = _record_attempt(out_file, prompt, env=child_env, outcome="error", extra=extra)
+            if info is not None:
+                info.update(attempt=attempt)
+        return (model, "ERROR", _scrub_keys(str(exc).splitlines()[0], key) if str(exc) else type(exc).__name__)
+
+
+#: §3.44 M7 — what a reviewer's output shows in place of a key: JSON-safe (no quote, no backslash),
+#: so a scrubbed envelope still parses. The shape is the one every key Anthropic issues carries
+#: (`sk-ant-api03-…`, `sk-ant-usr-…`, `sk-ant-admin01-…`; measured 2026-10-12).
+_KEY_WITHHELD = "[key withheld]"
+_KEY_SHAPE = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
+#: §3.44 M7 — a keyed attempt whose class is one of these settled the review: the key worked (a
+#: review, or a capture with no verdict line, which the watcher retries) or its time ran out (the
+#: half hour is spent either way). Any other class falls back to the unkeyed attempt.
+_KEYED_SETTLED = ("ok", "timeout")
+#: §3.44 M7 — the vend refusals that print a WARNING line on the review (operator ruling
+#: 2026-10-12, "Pool empty + vendor down"): no key is usable, or the vending machine cannot be
+#: reached or trusted. Every other refusal (a caller tripwire, a request error) is only recorded.
+_VEND_EMPTY = frozenset({"pool", "nokey", "headroom", "keyfile"})
+_VEND_DOWN = frozenset({"nosock", "refused", "timeout", "peer"})
+#: A path the denied-tools token cannot carry: a comma or a parenthesis would split the one
+#: comma-separated value, whitespace would end it.
+_CREDITS_DENY_UNSAFE = re.compile(r"[\s,()]")
+
+
+def _scrub_keys(text, key=None):
+    """§3.44 M7 — `text` with the exact `key` (when one was handed out) and anything key-shaped
+    replaced by `_KEY_WITHHELD`; anything that is not a non-empty string comes back as it is."""
+    if not isinstance(text, str) or text == "":
+        return text
+    if isinstance(key, str) and key:
+        text = text.replace(key, _KEY_WITHHELD)
+    return _KEY_SHAPE.sub(_KEY_WITHHELD, text)
+
+
+def _envelope_object(stdout) -> dict | None:
+    """The CLI's JSON envelope as a dict, or None (plain text, a wrapper, nothing)."""
+    try:
+        obj = json.loads(stdout or "")
+    except (ValueError, RecursionError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _credits_deny(env) -> str:
+    """§3.44 M7 — `,Read(//<dir>/**)` for the keyring directory, as given and as resolved, for the
+    reviewer's one denied-tools token, whenever EUGO_REVIEW_CREDITS_DIR names an absolute path:
+    neither attempt may read a keyring file even if a setting reopened reads outside the repo
+    (§7014: Read/Grep/Glob of an outside file were open before the deny tokens). "" when unset,
+    `off`, relative, `/`, or a path the token cannot carry. Never raises."""
+    try:
+        value = _credits_dir(env)
+        if value is None or not os.path.isabs(value):
+            return ""
+        out = ""
+        for path in sorted({os.path.abspath(value), os.path.realpath(value)}):
+            if path != os.sep and not _CREDITS_DENY_UNSAFE.search(path):
+                out += f",Read(/{path}/**)"
+    except Exception:  # noqa: BLE001 — see the docstring
+        return ""
+    return out
+
+
+def _credits_say(lines) -> None:
+    """§3.44 M7 — print the vending machine's warning lines to stderr, each only if it is one of
+    `_CREDIT_REPORTS`' shapes: the watcher files a `WARNING:` line on the review's entry."""
+    for line in lines or []:
+        if isinstance(line, str) and _VEND_WARNING.fullmatch(line):
+            print(line, file=sys.stderr)
+
+
+def _credits_refused_line(why: str) -> None:
+    """§3.44 M7 — the one WARNING line a vend refusal prints, if any (`_VEND_EMPTY`, `_VEND_DOWN`)."""
+    code = "POOL-EMPTY" if why in _VEND_EMPTY else "POOL-NO-VENDOR" if why in _VEND_DOWN else None
+    if code is not None:
+        print(_credit_report(code, "pool"), file=sys.stderr)
+
+
+def _keyed_class(result, info: dict) -> str:
+    """§3.44 M7 — a keyed attempt's class for its end event: `timeout` when its time ran out; `ok`
+    when it produced a review or a capture with no verdict line (the key worked); else
+    `_classify_keyed`'s reading of the run's note and envelope."""
+    _model, verdict, note = result
+    if info.get("timeout"):
+        return "timeout"
+    if verdict != "ERROR" or note == "no verdict line":
+        return "ok"
+    return _classify_keyed(info.get("rc"), info.get("envelope"), note)
+
+
+def _claude_keyed(model, prompt, review_type, effort, repo, out_file, home, meta, lease, deny):
+    """§3.44 M7 — the keyed attempt with the lease's key, its end ALWAYS reported (a `finally`: a
+    lease left open keeps its $5 reserved for the rest of the cycle), then — unless that attempt
+    settled the review (`_KEYED_SETTLED`) — the unkeyed attempt, from a fresh environment, whose
+    result is the review's. The keyed attempt's usage note carries `key` (the label), the lease's
+    `id` (the journal's own, §7031) and, when it fell back, its class as `outcome`: a bad key reads
+    [key:auth, sub:ok]."""
+    info: dict = {}
+    cls, result = "unknown", (model, "ERROR", "keyed attempt did not run")
+    key = lease.pop("key", None)
+    _credits_say(lease.get("warnings"))
+    try:
+        result = _claude_attempt(model, prompt, review_type, effort, repo, out_file, key=key, deny=deny,
+                                 extra={"key": lease.get("label"), "id": lease.get("id")}, info=info)
+        cls = _keyed_class(result, info)
+    finally:
+        key = None
+        warnings, _why = _credits_end(home, meta, lease, cls, info.get("attempt"))
+        _credits_say(warnings)
+    if cls in _KEYED_SETTLED:
+        return result
+    if isinstance(info.get("attempt"), dict):
+        info["attempt"]["outcome"] = cls
+    return _claude_attempt(model, prompt, review_type, effort, repo, out_file, deny=deny)
+
+
+def _run_one_claude(
+    model: str, prompt: str, review_type: str, effort: str, repo: str, out_file: Path
+) -> tuple[str, str, str]:
+    """Run the Claude CLI headless for one model. Returns (model, verdict, note). Never raises.
+
+    SIGNATURE-COMPATIBLE with `_run_one` on purpose, so `main` dispatches on `--engine`
+    alone rather than branching at the call site. `_build_prompt` and `_verdict` are
+    already engine-agnostic — only the subprocess invocation differs (`_claude_attempt`).
+
+    §3.44 M7 — when `_credits_gate` says this review may pay from a keyring key, the vending
+    machine (§3.48) is asked for one and `_claude_keyed` runs the keyed attempt, falling back to
+    today's unkeyed attempt on any key-side failure. On every other gate answer, and on any vend
+    refusal (recorded as `gate=vend-<code>`; an empty pool or an unreachable vending machine also
+    prints a WARNING line), only the unkeyed attempt runs. With EUGO_REVIEW_CREDITS_DIR unset the
+    gate reads no file and the one attempt is today's; a credits failure never stops a review.
+    """
+    deny, extra = "", None
+    try:
+        deny = _credits_deny(os.environ)
+        meta, gate = _credits_gate(repo)
+        if gate == "ok":
+            home = os.path.realpath(_credits_dir(os.environ) or "")
+            lease, why = _credits_vend(home, meta, repo=os.fspath(repo),
+                                       writer=(os.environ.get(_CREDITS_WRITER_ENV) or "").strip(),
+                                       capture=str(out_file))
+            if lease is not None:
+                return _claude_keyed(model, prompt, review_type, effort, repo, out_file, home, meta, lease, deny)
+            gate = f"vend-{why}"
+            _credits_refused_line(why)
+        if gate != "unset":
+            extra = {"gate": gate}
+    except Exception:  # noqa: BLE001 — see the docstring
+        extra = {"gate": "error"}
+    return _claude_attempt(model, prompt, review_type, effort, repo, out_file, deny=deny, extra=extra)
 
 
 _ENGINE_RUNNERS = {"codex": _run_one, "claude": _run_one_claude}
 
 
-# --- §3.44 review credits: keyring loader + gate (M5, dark) ----------------------------------
+# --- §3.44 review credits: keyring loader + gate (M5) ----------------------------------------
 # Each Max plan's API credits sit in a Console organization of their own; the review watch is to
 # pay from those keys, pooled and soonest-expiry first, with the subscription as the fallback.
-# DARK until M7: nothing in the review path calls this block, so it cannot change a review.
+# Since M7 (§7030) `_run_one_claude` asks `_credits_gate` on every claude review; with
+# EUGO_REVIEW_CREDITS_DIR unset it reads no file, and only a listed, armed repo is admitted.
 
 #: §3.44 M5 — where the keyring lives. A DIRECTORY, never a key. NO default: unset or empty is
 #: the feature OFF and not one file is read; the value `off` is the kill switch.
@@ -1649,11 +1834,11 @@ def _pick_key(meta, states, now) -> str | None:
         return None
 
 
-# --- §3.44 review credits: journal, key state, classifier, reports (M6, dark) ---------------------
+# --- §3.44 review credits: journal, key state, classifier, reports (M6) ---------------------------
 # A key's state is DERIVED from an append-only journal, never kept in a state file: six UNIX users
 # and two lanes write at once, and a read-modify-write file loses one writer's update. Each user
 # appends to a shard of its own under flock; every reader merges every shard.
-# DARK until M7, like the M5 block above.
+# Since M7 (§7030) the keyed attempt uses the classifier, and the vending machine (§3.48) the rest.
 
 #: §3.44 M6 — journal events, v1. Every event: {"v": 1, "t": "<UTC YYYY-MM-DDTHH:MM:SSZ>", "ev"}.
 #:   start  id (the SAME 12 hex as that child run's ledger usage object), key, fp, user, repo,
@@ -1963,9 +2148,10 @@ def _journal_read(path_to_dir, now) -> list[dict]:
 
 
 #: §3.44 M6 — what a FAILED keyed attempt says, first match wins: (class, phrases, HTTP statuses).
-#: ⚠ PROVISIONAL. These are the API's documented error types and the CLI's wording as read on
-#: 2026-10-09, not shapes recorded under a key: preflight row 2 (a made-up key) records the real
-#: exit code, envelope and text, and this table is re-pinned from it before M7 relies on it.
+#: ⚠ PARTLY PROVISIONAL. These are the API's documented error types and the CLI's wording as read
+#: on 2026-10-09. One class is recorded under a real call: preflight row 2's made-up key
+#: (2026-10-12) answered rc 1, `is_error` true, `api_error_status` 401 and "Invalid API key · Fix
+#: external API key", which classifies as `auth` (pinned since §7030). The others are not recorded.
 _KEYED_FAULTS = (
     ("credit", ("credit balance is too low", "credit balance too low", "billing_error"), ()),
     ("auth", ("invalid x-api-key", "invalid api key", "authentication_error", "permission_error",
@@ -2347,6 +2533,11 @@ _CREDIT_REPORTS = {
                    " spend_usd={spend_usd} grant_usd={grant_usd} limit_usd={limit_usd}"),
     "POOL-PAUSED": "WARNING: review-credits {label} POOL-PAUSED minutes={minutes}",
     "POOL-DISABLED": "WARNING: review-credits {label} POOL-DISABLED parked={parked} keys={keys}",
+    # §3.44 M7 — printed by the DRIVER on a vend refusal (operator ruling 2026-10-12, "Pool empty +
+    # vendor down"): a refusal carries no alert (§3.48 review M3), so without these an empty pool
+    # or a vending machine that is down would fall back to the subscription in silence.
+    "POOL-EMPTY": "WARNING: review-credits {label} POOL-EMPTY",
+    "POOL-NO-VENDOR": "WARNING: review-credits {label} POOL-NO-VENDOR",
 }
 _CREDIT_REPORT_FIELD = re.compile(r"\{([a-z_]+)\}")
 
@@ -2462,13 +2653,13 @@ def _due_reports(meta, states, events, now) -> list[tuple[str, str, str]]:
     return due
 
 
-# --- §3.48 review credits: the key vending machine's client (dark) -------------------------------
+# --- §3.48 review credits: the key vending machine's client --------------------------------------
 # One host-side server, `tools/scripts/review_credits_vend.py`, run as the keyring's owner (its own
-# compose project), is the ONLY reader of `keys/`. At §3.44 M7 the driver asks it for one key for
-# one child's environment (`_credits_vend`) and reports that run's end (`_credits_end`); the server
-# picks the key, reserves its cap and writes the journal. Nothing in the review path calls this
-# block yet. Every function here never raises, and the key never enters os.environ, argv, a log,
-# the ledger or the journal: it lives in the returned lease only.
+# compose project), is the ONLY reader of `keys/`. Since §3.44 M7 (§7030) the driver asks it for one
+# key for one child's environment (`_credits_vend`) and reports that run's end (`_credits_end`); the
+# server picks the key, reserves its cap and writes the journal. A review asks only when
+# `_credits_gate` says `ok`. Every function here never raises, and the key never enters os.environ,
+# argv, a log, the ledger or the journal: it lives in the returned lease only.
 
 CREDITS_VEND_SOCKET = "vend.sock"
 CREDITS_VEND_PROTOCOL = 1
@@ -2482,6 +2673,12 @@ _VEND_SUN_MAX = 107                             # sockaddr_un.sun_path: 108 byte
 _VEND_ID = re.compile(r"[0-9a-f]{12}")
 _VEND_TOKEN = re.compile(r"[0-9a-f]{32}")
 _VEND_FP = re.compile(r"[0-9a-f]{8}")
+#: Every verdict `review_credits._read_key` gives a key file, besides an errno name (`_VEND_ERRNO`).
+_VEND_FILE_VERDICTS = frozenset({
+    "ok", "empty", "more than one line", "contains whitespace", "not printable ASCII",
+    "too short to be an API key", "too large", "not a regular file", "wrong owner", "keys/ not the owner's",
+    "keys/ writable by others", "linked elsewhere"})
+_VEND_ERRNO = re.compile(r"E[A-Z0-9]{1,15}")
 #: The server's refusal codes; a reply naming any other is `reply`. The client's own reasons are
 #: unsupported, path, nosock, refused, peer, timeout, reply, error (and `class` from `_credits_end`).
 _VEND_REFUSALS = frozenset({
@@ -2520,7 +2717,9 @@ def _vend_call(home, request, owner_uid, timeout: float = _VEND_TIMEOUT_S) -> tu
     """§3.48 — one request to the vending machine: (reply, "") or (None, reason). Never raises.
 
     Checks before a byte is sent: AF_UNIX and SO_PEERCRED exist (`unsupported`); `owner_uid` is a
-    uid (`peer`); the path fits sun_path (`path`); the socket file exists (`nosock`), is a socket
+    uid (`peer`); the path fits sun_path (`path`); the keyring directory is `owner_uid`'s (`peer`:
+    keyring.json alone could be a member's swap — a swap of the WHOLE directory needs a writable
+    parent, which runbook §13 says to avoid); the socket file exists (`nosock`), is a socket
     and belongs to `owner_uid` (`peer`); the connect succeeds (`refused`, `nosock`, `timeout`); and
     the LISTENING process runs as `owner_uid` (`peer`) — a member who renamed the socket aside and
     bound their own gets nothing. Then one JSON line goes out, the reply is read to EOF (at most
@@ -2539,6 +2738,10 @@ def _vend_call(home, request, owner_uid, timeout: float = _VEND_TIMEOUT_S) -> tu
         if len(os.fsencode(path)) > _VEND_SUN_MAX:
             return None, "path"
         try:
+            # §3.48 S2: owner_uid comes from keyring.json, which a member can swap; the keyring
+            # directory itself must be that owner's too, or nothing in it is trusted.
+            if os.stat(os.fspath(home)).st_uid != owner_uid:
+                return None, "peer"
             st = os.lstat(path)
         except FileNotFoundError:
             return None, "nosock"
@@ -2556,8 +2759,8 @@ def _vend_call(home, request, owner_uid, timeout: float = _VEND_TIMEOUT_S) -> tu
                 sock.connect(path)
             except FileNotFoundError:
                 return None, "nosock"
-            except (ConnectionRefusedError, PermissionError):
-                return None, "refused"
+            except (ConnectionRefusedError, PermissionError, BlockingIOError):
+                return None, "refused"   # BlockingIOError: EAGAIN, the server's backlog is full (retryable)
             peer = _vend_peer(sock)
             if peer is None or peer[1] != owner_uid:
                 return None, "peer"
@@ -2608,10 +2811,11 @@ def _vend_warnings(lines) -> list:
     return [w for w in lines if isinstance(w, str) and _VEND_WARNING.fullmatch(w)]
 
 
-def _credits_vend(home, meta, *, repo, writer, capture="", cap_usd=None, batch=False) -> tuple[dict | None, str]:
+def _credits_vend(home, meta, *, repo, writer, capture="", cap_usd=None, batch=False,
+                  lease_s=None) -> tuple[dict | None, str]:
     """§3.48 — ask the vending machine for one key for one run: ({id, tok, label, key, fp, lease_s,
-    warnings}, "") or (None, reason). Never raises. `cap_usd`, `batch` and a longer lease are
-    lanes' to ask for; a review's cap is the server's (O6). A reply is accepted only when every
+    warnings}, "") or (None, reason). Never raises. `cap_usd`, `batch` and `lease_s` (a Batch job
+    outlives a review's 2400 s) are lanes' to ask for; a review's are the server's (O6). A reply is accepted only when every
     field checks out — an id and token of the right shape, a label in `meta`, a key that is
     printable ASCII and whose fingerprint is the reply's `fp`, a positive lease — else `reply`.
     At M7 the caller puts `key` into ONE child's environment and passes the lease to
@@ -2624,6 +2828,8 @@ def _credits_vend(home, meta, *, repo, writer, capture="", cap_usd=None, batch=F
             request["cap_usd"] = float(cap_usd)
         if batch:
             request["batch"] = True
+        if lease_s is not None:
+            request["lease_s"] = lease_s
         reply, why = _vend_call(home, request, owner)
         if reply is None:
             return None, why
@@ -2646,9 +2852,9 @@ def _credits_vend(home, meta, *, repo, writer, capture="", cap_usd=None, batch=F
 def _credits_end(home, meta, lease, cls, usage=None) -> tuple[list, str]:
     """§3.48 — report a keyed run's end to the vending machine: (warnings, "") or ([], reason). Never
     raises. `cls` is one of `_KEYED_CLASSES` (else `class`, nothing sent); `usage` is that run's
-    usage object, reduced to `_journal_meters`. Up to three tries inside one `_VEND_TIMEOUT_S`
-    budget, retried only on nosock, refused or timeout; `ended` counts as done (an earlier try
-    landed). An end never reported leaves its start open: the server keeps its cap reserved (O5)."""
+    usage object, reduced to `_journal_meters`. Retried with backoff (0.5 s doubling to 4 s) for one
+    `_VEND_TIMEOUT_S` budget, only on nosock, refused or timeout; `ended` counts as done (an earlier
+    try landed). An end never reported leaves its start open: the server keeps its cap reserved (O5)."""
     import time
 
     try:
@@ -2662,7 +2868,11 @@ def _credits_end(home, meta, lease, cls, usage=None) -> tuple[list, str]:
                    "class": cls, "meters": _journal_meters(usage)}
         deadline = time.monotonic() + _VEND_TIMEOUT_S
         why = "timeout"
-        for attempt in range(3):
+        # §3.48 F2: retried with backoff for the whole budget, not three quick tries — a vendor that
+        # is restarting or has a full backlog usually answers within seconds.
+        # backoff 0.5, 1, 2, 4, 4, ... s: an unreachable vendor costs this call at most ~30 s.
+        pause = 0.5
+        while True:
             left = deadline - time.monotonic()
             if left <= 0:
                 break
@@ -2671,9 +2881,10 @@ def _credits_end(home, meta, lease, cls, usage=None) -> tuple[list, str]:
                 return _vend_warnings(reply.get("warnings")), ""
             if why == "ended":
                 return [], ""
-            if why not in ("nosock", "refused", "timeout") or attempt == 2:
+            if why not in ("nosock", "refused", "timeout"):
                 break
-            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+            time.sleep(min(pause, max(0.0, deadline - time.monotonic())))
+            pause = min(pause * 2, 4.0)
     except Exception:  # noqa: BLE001 — see the docstring
         return [], "error"
     return [], why
@@ -2695,8 +2906,10 @@ def _vend_fps(home, meta) -> tuple[tuple[dict, dict] | None, str]:
         if not all(_credits_label_ok(k) and (v is None or (isinstance(v, str) and _VEND_FP.fullmatch(v)))
                    for k, v in fps.items()):
             return None, "reply"
-        if not all(_credits_label_ok(k) and isinstance(v, str) and len(v) <= 80 for k, v in files.items()):
-            return None, "reply"
+        if not all(_credits_label_ok(k) and isinstance(v, str)
+                   and (v in _VEND_FILE_VERDICTS or _VEND_ERRNO.fullmatch(v) is not None)
+                   for k, v in files.items()):
+            return None, "reply"   # S2: only the reader's own vocabulary is ever printed
         return (dict(fps), dict(files)), ""
     except Exception:  # noqa: BLE001 — see the docstring
         return None, "error"
@@ -3256,7 +3469,8 @@ def main(argv: list[str] | None = None) -> int:
             "engines": sorted(VALID_ENGINES),
             "efforts": sorted(VALID_EFFORTS),
             "codex_binaries": sorted(CODEX_BINARIES) + ["kiro3..kiro9 (derived)"],
-            "env": [SESSION_CODEX_BIN_ENV, REVIEW_ENV_PASS_ENV, REVIEW_CREDITS_DIR_ENV, CODEX_HOME_PARENT_ENV],
+            "env": [SESSION_CODEX_BIN_ENV, REVIEW_ENV_PASS_ENV, REVIEW_CREDITS_DIR_ENV, CODEX_HOME_PARENT_ENV,
+                    REVIEW_CACHE_TTL_ENV],
             # §2.38 (b) — lets a caller tell this driver from one that hands the reviewer the
             # session's whole environment (the key is absent there).
             "child_env": "allowlist",

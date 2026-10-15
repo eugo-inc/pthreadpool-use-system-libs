@@ -138,8 +138,9 @@ else
   # absent. Costs one interpreter start per SessionStart — startup, resume, clear and
   # compact each fire `--full` (§3143, §1.94 L7: this said "ONCE per session") — against
   # a review at ~151s.
-  UNREV="$(python3 "$WATCH_DRAIN" status 2>/dev/null \
-            | grep -o 'unreviewed=[^ ]*' | head -1 | cut -d= -f2)"
+  # §1.187 — the first match by expansion, never `| head` after the grep (rc 141 under pipefail).
+  UNREV="$(python3 "$WATCH_DRAIN" status 2>/dev/null | grep -o 'unreviewed=[^ ]*')"
+  UNREV="${UNREV%%$'\n'*}"; UNREV="$(cut -d= -f2 <<<"$UNREV")"
   if [ "$UNREV" = "0" ]; then
     exit 0
   fi

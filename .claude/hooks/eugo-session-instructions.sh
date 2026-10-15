@@ -3,8 +3,8 @@
 #
 # Keeps .claude/rules/eugo-central.md — the FULL eugo-kb central instructions, which
 # Claude Code loads natively at launch and re-injects after compaction — fresh, because
-# Claude Code injects only the first 2,048 characters of an MCP server's `instructions`
-# and caps hook stdout at ~10 KB (both measured; see the carrier's SKILL.md).
+# Claude Code injects only the first 2,048 characters of an MCP server's `instructions` (4,096 by default since
+# 2.1.296; CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH lifts it, and init-hooks sets it, §3.52) and caps hook stdout at ~10 KB (both measured; see the carrier's SKILL.md).
 #
 # Contract (each line is a test in athena's tools/tests/test_session_hook_script.py):
 #   - every path exits 0: a session is NEVER blocked by this hook
@@ -24,7 +24,12 @@
 #     refused one is never printed and leaves the old rules file in place (§1.126 (a))
 #   - EUGO_REVIEW_SUBPROCESS set → silent exit 0: no fetch, no write, no output (§2.38 a2)
 #   - a user-only skill this checkout lacks is restored from a local athena checkout (§3.47): never a tracked
-#     file, never through a symlink; a restore or a failure is SAID (§3.52 S2): stdout becomes ONE JSON object —
+#     file, never through a symlink, never into a directory already there; without the CLI it is copied the way
+#     pull copies and carries pull's marker (no tree_hash), and its line names athena's short HEAD and the files
+#     copied (§2.96); a copy that cannot finish is removed, so the next session tries again; a copy made before
+#     §2.96 (no `pulled_from` in its eugo-skill.json) is left as it is, and the operator repairs it with
+#     `eugo-skills pull --from <athena> --into <repo> --name <skill> --force` or by deleting it (the next session
+#     restores it); each restore or failure is SAID (§3.52 S2): stdout becomes ONE JSON object —
 #     `systemMessage` for the operator, the hook's own output plus that line as `additionalContext` for Claude,
 #     and `reloadSkills` after a restore. With nothing to say, stdout is the plain text it always was
 #   - an errexit or xtrace INHERITED through BASH_ENV is disarmed first — the bearer never
@@ -106,8 +111,9 @@ cleanup_tmps() {
 # §3.52 S2 (run 1261) — WHAT THE RE-PULL HAS TO SAY GOES WHERE SOMEONE READS IT. §3.47 said it on stderr, and
 # "Claude never sees stderr from a hook that exits 0" (hooks.md); the operator does not see it either. A
 # SessionStart hook's plain stdout is context for Claude only, a `systemMessage` is the operator's, and a restored
-# skill needs `reloadSkills`: discovery runs before the SessionStart hooks finish, so the skill is otherwise missing
-# until the next session (probe P11, 2.1.295: "NO" without the flag, "YES" with it; the field is 2.1.152's). The
+# skill needs `reloadSkills`: discovery runs before the SessionStart hooks finish, so in `-p` the skill is otherwise missing
+# until the next session (probe P11, 2.1.295: "NO" without the flag, "YES" with it; the field is 2.1.152's); an
+# interactive session also hot-reloads it, timing-dependent (P11i). The
 # JSON is read only when the WHOLE stdout is one object, so every line this hook prints is collected in OUT and
 # written once by `finish`: plain text, byte for byte as before, when SAID is empty.
 OUT=""
@@ -158,13 +164,75 @@ budget_query() { case "$BUDGET" in ''|0|*[!0-9]*) ;; *) printf -- '&budget=%s' "
 # So each session start restores any such skill this checkout lacks, from a local athena checkout — this repo when it
 # is athena, else EUGO_ATHENA_PATH, else /opt/eugo/athena, else $HOME/eugo/athena (pull-shared-skills.sh's probe;
 # never a relative guess, §2935), each holding skills/README.md and tools/eugo_kb/. `eugo-skills pull --name` does it
-# when that CLI is on PATH; else plain bash copies the skill's directory, links the aliases its frontmatter names, and
-# keeps both out of git through .git/info/exclude (never a tracked file). A restore or a failed one is `say`d (§3.52
-# S2, above `fallback`), and nothing here can stop the session. NO ATHENA CHECKOUT stays one stderr line: it is a
+# when that CLI is on PATH; else plain bash copies the skill's directory the way pull does (`copy_like_pull`), writes
+# pull's marker (`write_pull_marker`), links the aliases its frontmatter names, and keeps both out of git through
+# .git/info/exclude (never a tracked file). A restore — naming athena's short HEAD as provenance and the files copied —
+# or a failed one is `say`d (§3.52 S2, above `fallback`), and nothing here can stop the session. It never writes into
+# a directory that is already there (§2.96), so a copy made BEFORE §2.96 (its eugo-skill.json has no `pulled_from`) is
+# left as it is, and doctor keeps calling it a local copy that shadows the catalog skill. The operator repairs it with
+# `eugo-skills pull --from <athena> --into <repo> --name <skill> --force` (without `--force` pull refuses a directory
+# that has no `pulled_from` marker; with it pull replaces the directory and writes its own marker), or deletes the
+# directory, and the next session restores it with this hook's marker. NO ATHENA CHECKOUT stays one stderr line: it is a
 # standing fact of the machine, not an event, and said aloud it would repeat at every session start on every
 # machine without athena (the test container is one: every hook test turned JSON when it was said).
+# §2.96 (run 1262) — pull.py's `_copy_skill` walk in shell, for the restore without the CLI. `cp -R` took what pull
+# never copies, and doctor then called the copy a shadow to delete. A source symlink is never followed (`find -type f`
+# lists none and does not descend into a linked directory); `__pycache__/`, `*.pyc` and `*.pyo` are skipped
+# (`catalog.is_build_artifact`); athena's own eugo-skill.json and a retired .skillfish.json, at any depth, are not
+# copied; nothing is written through a symlink in the destination; then pull's marker is written (`write_pull_marker`).
+# Prints the number of files copied.
+# w291 review of §2.96 — $2 must not exist yet: a plain `mkdir` makes it, so everything under it is this call's, and a
+# copy that cannot finish removes it and returns 1: a mkdir or a cp that fails, a `find` whose listing did not finish
+# (the NUL sentinel after it never arrived), no regular SKILL.md copied (a linked source directory or SKILL.md), or a
+# marker that cannot be written. A half copy left in place was the skill for good when it held SKILL.md (no marker, so
+# doctor's "shadow, delete it") and was refused at every later session when it did not. The caller runs this inside
+# `$(…)`, so a `${dst:?}` that fired would end that subshell, never the hook. NOT closed: a hook KILLED mid-walk still
+# leaves a half copy.
+copy_like_pull() {
+  local src="$1" dst="$2" f rel n=0 listed=0
+  if [ -e "$dst" ] || [ -L "$dst" ]; then return 1; fi
+  mkdir -p "${dst%/*}" && mkdir "$dst" || return 1
+  while IFS= read -r -d '' f; do
+    if [ -z "$f" ]; then listed=1; continue; fi     # the sentinel: find listed the whole tree
+    rel="${f:${#src}+1}"
+    case "/$rel" in */__pycache__/*|*.pyc|*.pyo|*/eugo-skill.json|*/.skillfish.json) continue ;; esac
+    case "$rel" in */*) [ -L "$dst/${rel%/*}" ] && continue; mkdir -p "$dst/${rel%/*}" || { rm -rf "${dst:?}"; return 1; } ;; esac
+    [ -L "$dst/$rel" ] && continue
+    cp -p "$f" "$dst/$rel" || { rm -rf "${dst:?}"; return 1; }
+    n=$((n + 1))
+  done < <(find "$src" -type f -print0 2>/dev/null && printf '\0')
+  if [ "$listed" != 1 ] || [ ! -f "$dst/SKILL.md" ] || [ -L "$dst/SKILL.md" ] || ! write_pull_marker "$src" "$dst"; then
+    rm -rf "${dst:?}"; return 1
+  fi
+  printf '%s' "$n"
+}
+
+# §2.96 — pull's marker shape (`pulled_from`, `owner`, `source_repo`, `domains`), so doctor reads the copy as a STALE
+# pulled mirror ("refresh with `pull --name`") and `pull --name` refreshes it, never "shadow, delete it". No
+# `tree_hash`: only a byte-exact `sync.tree_hash` would do, and the shell cannot compute that one. owner: the source
+# sidecar's, else `loader.infer_owner`'s fallback ("athena" when the frontmatter declares domains, else "unknown");
+# source_repo: the sidecar's, else null; domains: the frontmatter's `domains: [...]` (the catalog's map is not read).
+write_pull_marker() {
+  local src="$1" dst="$2" owner="" repo="" doms="" d="" list="" rj="null"
+  if [ -f "$src/eugo-skill.json" ]; then
+    owner="$(sed -n 's/.*"owner"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' "$src/eugo-skill.json" 2>/dev/null)"
+    owner="${owner%%$'\n'*}"
+    repo="$(sed -n 's/.*"source_repo"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' "$src/eugo-skill.json" 2>/dev/null)"
+    repo="${repo%%$'\n'*}"
+  fi
+  doms="$(awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } NR > 1 && sub(/^domains: *\[/, "") { sub(/\].*$/, ""); print; exit }' "$src/SKILL.md" 2>/dev/null | tr ',' ' ' | tr -cd 'A-Za-z0-9._ -')"
+  for d in $doms; do list="${list:+$list, }\"$d\""; done
+  if [ -z "$owner" ]; then
+    if [ -n "$list" ]; then owner="athena"; else owner="unknown"; fi
+  fi
+  [ -n "$repo" ] && rj="$(json_str "$repo")"
+  printf '{\n  "pulled_from": "athena",\n  "owner": %s,\n  "source_repo": %s,\n  "domains": [%s]\n}\n' \
+    "$(json_str "$owner")" "$rj" "$list" > "$dst/eugo-skill.json"
+}
+
 repull_user_only_skills() {
   local athena="" cand="" sk="" fm="" name="" missing="" dirs="" d="" a="" al="" excl="" sroot="$ROOT/.claude/skills"
+  local head="" prov="" restored="" n="" nfiles=0
   for cand in "$ROOT" "${EUGO_ATHENA_PATH:-}" /opt/eugo/athena "${HOME:+$HOME/eugo/athena}"; do
     if [ -n "$cand" ] && [ -f "$cand/skills/README.md" ] && [ -d "$cand/tools/eugo_kb" ]; then athena="$cand"; break; fi
   done
@@ -175,8 +243,8 @@ repull_user_only_skills() {
   while IFS= read -r sk; do
     [ -n "$sk" ] || continue
     fm="$(awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } NR > 1 { print }' "$sk" 2>/dev/null)"
-    printf '%s\n' "$fm" | grep -qx 'disable-model-invocation: true' || continue   # in the frontmatter, not the body
-    name="$(printf '%s\n' "$fm" | sed -n 's/^name: *//p' | head -n 1)"
+    grep -qx 'disable-model-invocation: true' <<<"$fm" || continue   # in the frontmatter, not the body; a here-string, so grep -q quitting early SIGPIPEs no writer
+    name="$(sed -n 's/^name: *//p' <<<"$fm")"; name="${name%%$'\n'*}"     # §1.187: no `| head` after the sed
     case "$name" in ''|.*|*[!A-Za-z0-9._-]*) continue ;; esac                      # one safe path segment only
     [ -f "$sroot/$name/SKILL.md" ] && continue
     if [ -L "$sroot/$name" ] || [ -L "$sroot" ]; then
@@ -202,11 +270,20 @@ EOF_SKILLS
   fi
   excl="$(git -C "$ROOT" rev-parse --git-path info/exclude 2>/dev/null)" || excl=""
   case "$excl" in ''|/*) ;; *) excl="$ROOT/$excl" ;; esac
+  # §2.96 (3) — provenance only: `rev-parse --short HEAD` alone (athena's .git/config is group-writable, and a status
+  # or a diff could run its core.fsmonitor); never blocking.
+  head="$(git -C "$athena" rev-parse --short HEAD 2>/dev/null)"; head="${head%%$'\n'*}"
+  case "$head" in ''|*[!0-9a-f]*) prov="commit unknown" ;; *) prov="athena $head" ;; esac
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     name="$(awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } NR > 1 && sub(/^name: */, "") { print; exit }' "$d/SKILL.md" 2>/dev/null)"
-    mkdir -p "$sroot/$name" && cp -R "$d/." "$sroot/$name/" || {
-      say "eugo-session-hooks: could not copy user-only skill $name into $sroot"; return 0; }
+    if [ -e "$sroot/$name" ] || [ -L "$sroot/$name" ]; then
+      say "eugo-session-hooks: $sroot/$name exists without SKILL.md, so user-only skill $name is not restored (the restore never writes into a directory)"
+      continue
+    fi
+    n="$(copy_like_pull "$d" "$sroot/$name")" || {   # w291: the next skill is still tried, a restore before this one said
+      say "eugo-session-hooks: could not copy user-only skill $name into $sroot"; continue; }
+    restored="$restored $name"; nfiles=$((nfiles + n))
     al="$(awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } NR > 1 && sub(/^aliases: *\[/, "") { sub(/\].*$/, ""); print; exit }' "$d/SKILL.md" 2>/dev/null | tr ',' ' ')"
     for a in $name $al; do
       case "$a" in ''|.*|*[!A-Za-z0-9._-]*) continue ;; esac
@@ -218,7 +295,8 @@ EOF_SKILLS
   done <<EOF_DIRS
 $dirs
 EOF_DIRS
-  say "eugo-session-hooks: restored user-only skill(s)$missing from $athena"; RELOAD=1
+  [ -n "$restored" ] || return 0
+  say "eugo-session-hooks: restored user-only skill(s)$restored from $athena ($prov, $nfiles file(s))"; RELOAD=1
   return 0
 }
 repull_user_only_skills || true

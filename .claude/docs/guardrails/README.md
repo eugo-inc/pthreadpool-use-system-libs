@@ -8,6 +8,12 @@ an entry below.
 
 ## Upgrade notes
 
+- **2026-10-14 §7308 (REPORT.md v1.2.7 → v1.2.8)** — R7f (§2.98, operator ruling 2026-10-13): a NEXT line whose
+  delivery is blocked says `(blocked)` after its owner, `NEXT-2 (operator) (blocked): …`; its backlog body names
+  the blocker and why, to central principle 2's bar (the exact command or input, the verbatim error, the mechanism,
+  the smallest unblocking step), and its index row leads with `BLOCKED`. A reader could not tell "owed and doable"
+  from "owed and waiting". No ID changed (F12).
+
 - **2026-10-10 §7107 (REPORT.md v1.2.6 → v1.2.7)** — R7e corrected after run 1260's close audit: the head line is
   30 words and opens with a trigger (F1; the §7103 note below claimed the ~30-word limit and the line was 37), an
   in-flight task-widget row now goes under Running instead of into R7's sweep (the two rules disagreed about it), the

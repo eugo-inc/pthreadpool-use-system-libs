@@ -56,15 +56,6 @@ WATCH="$ROOT/.claude/scripts/codex_watch.py"
 ADVICE="$ROOT/.adversarial-review/watch"
 STATE="$ROOT/outputs/_state/review-turn-end"
 
-# §3.52 5b — the same function as eugo-session-instructions.sh's (§7209; byte-identical output on bash 3.2-5.2, §7211).
-json_str() { # $1 as a JSON string literal; C0 controls other than tab, LF and CR are dropped (bash 3.2 safe)
-  local s
-  s="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037'; printf x)"; s="${s%x}"
-  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
-  s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
-  printf '"%s"' "$s"
-}
-
 IN="$(cat 2>/dev/null || true)"
 
 # ⚠ §2121 — THE REVIEWER IS NOT A SESSION TO REVIEW. This guard is first because it is
@@ -86,6 +77,16 @@ IN="$(cat 2>/dev/null || true)"
 if [ -n "${EUGO_REVIEW_SUBPROCESS:-}" ]; then
   exit 0
 fi
+
+# §3.52 5b — the same function as eugo-session-instructions.sh's (§7209; byte-identical output on bash 3.2-5.2, §7211).
+# §1.191 — BELOW the exit above, never above it: a fork's static guard reads every line before the exit as work.
+json_str() { # $1 as a JSON string literal; C0 controls other than tab, LF and CR are dropped (bash 3.2 safe)
+  local s
+  s="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037'; printf x)"; s="${s%x}"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
+  printf '"%s"' "$s"
+}
 
 # §2.45 (run 1231) — A CLOUD SESSION IS NOT REVIEWED AT ITS TURN BOUNDARY UNLESS ASKED (operator
 # ruling 2026-09-27; `CLAUDE_CODE_REMOTE=true` is `session-start.sh`'s signal). The whole hook
