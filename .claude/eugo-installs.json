@@ -2,8 +2,8 @@
   "version": 1,
   "installs": {
     "eugo-session-hooks": {
-      "tree_hash": "1a5ce5f26864174a2852eaed529b586be05cb664334b40e9e379d57569d6e675",
-      "source_commit": "497c71b4b7f99279a3b0c58e11df419ba06899b4",
+      "tree_hash": "b6cb873ac9a254937e67adb07734cb9195a3fa59af7ddacf90a890033a692009",
+      "source_commit": "25a191e0dd36b15bfd5e264bd0274e8501ea7182",
       "files": [
         ".claude/hooks/eugo-cloud-setup.sh",
         ".claude/hooks/eugo-deletion-guard.sh",
@@ -20,19 +20,19 @@
         ".claude/hooks/eugo-cloud-setup.sh": "76b08692b380b1e3f0ad4e36434975c2324aaf004fb9c43588794e3a1f386d79",
         ".claude/hooks/eugo-deletion-guard.sh": "360da91c074f0145f34f1c6195689a5bf422da7edf9d45d624e42bac8fbe504c",
         ".claude/hooks/eugo-external-publish-guard.sh": "1d2820a0c68ba17b39f85ca2b8126978a1ea3076753cf92682fd0bddebe5f717",
-        ".claude/hooks/eugo-lane-guard.sh": "131ecb9eba250a049930a6dff4de61b8d89141848946d7a896bec825c7cd500f",
-        ".claude/hooks/eugo-prompt-context.sh": "d770f7558c01e6849b09a8499dd2c6d71adacc8f0e26256cc6f579ca23fafbc7",
+        ".claude/hooks/eugo-lane-guard.sh": "ff92b2b2e34a8cc7a61f36475c0542cbae905be6bcf547892a28e27a0b2fed1d",
+        ".claude/hooks/eugo-prompt-context.sh": "eaa69268d114448b6bf01557ab6a9508fef9d655dd413fc25b52a80e5ce4a82f",
         ".claude/hooks/eugo-review-on-commit.sh": "65afbc9688de3b8cfdd75f2f8c632b3158c74055373e0275d95a11f236448470",
         ".claude/hooks/eugo-review-turn-end.sh": "0aee18f24b306a807d840a1eb5bee8156e364acf31d0002f36e31992911cfede",
-        ".claude/hooks/eugo-session-instructions.sh": "857dee0e8a3fbc6e8112f09602471d9709f7ef57d358d9d796deac6a82273ddb",
+        ".claude/hooks/eugo-session-instructions.sh": "459e2cfc7806a70cf092ed55721eb6a1e41537bd3e3e0284812702ea1b152137",
         ".claude/hooks/eugo-watch-owed.sh": "d5896af72547ece576b2d6347fe494f5299a71ce4c8923040ab1b025a4dfafcd",
         ".claude/hooks/eugo-wip-snapshot.sh": "b561a30574b9cadbdb73dcb2df54c1047fe334a3064910a531fb185397e89c87"
       },
-      "installed_at": "2026-10-15T00:33:00+00:00"
+      "installed_at": "2026-10-16T18:53:27+00:00"
     },
     "eugo-guardrails-kit": {
-      "tree_hash": "a82d1224b945186c469efef1f2e2004e1dbd143306163d2b8c3f76b186bcc813",
-      "source_commit": "497c71b4b7f99279a3b0c58e11df419ba06899b4",
+      "tree_hash": "10fbd5fddb463526a827a1746cbf0aa7fc5e0903bad118e6c8976195a812a373",
+      "source_commit": "25a191e0dd36b15bfd5e264bd0274e8501ea7182",
       "files": [
         ".claude/docs/guardrails/CODE.md",
         ".claude/docs/guardrails/DEBUG.md",
@@ -46,33 +46,33 @@
         ".claude/docs/guardrails/_FORMAT.md"
       ],
       "file_hashes": {
-        ".claude/docs/guardrails/CODE.md": "e7d094e3b33cc58d8346a31513f8f8ad4cb0c3ad0fa568f98f8086f83e82ec98",
+        ".claude/docs/guardrails/CODE.md": "bf15e897f852be5d2fe4ee59928f459c9dcd3463986cd0be1bdaacaf8498bdf9",
         ".claude/docs/guardrails/DEBUG.md": "9779c980e0eb1c0f985dd967589e05d6ac1e8f8b9a9fd9568766f50bd9da83c6",
         ".claude/docs/guardrails/EFFICIENCY.md": "85338a7919b246841c3570c7ccd45f29eb11c37acf4e502a928f634c741cbe22",
         ".claude/docs/guardrails/PLAN.md": "d5b2eb478b23cf9e1f8f0b491daa76915230ae0dd5a76a6b4198d256d10f37c3",
-        ".claude/docs/guardrails/README.md": "672be251006295bdac83ccda910b54b9f2ccedbcf25798462388ebab138921d6",
+        ".claude/docs/guardrails/README.md": "a212e9edb6c2947e6e785f53a54e1655a45dec5483e8756dff9e585488a98bdb",
         ".claude/docs/guardrails/REPORT.md": "900e1ecd81b0568b08c1b429f90f29c68cc4969f18e5179e961ff67f2b457f03",
         ".claude/docs/guardrails/SESSION.md": "2cda8431fa9c33ed49e6213673d3280303d3292744d9532164f520b8db83f903",
         ".claude/docs/guardrails/TRAPS.md": "1df11e2c8f2859c5baa0c90cfbadb74b2ac159218f8816a64c84ae28b48ca0eb",
         ".claude/docs/guardrails/VERIFY.md": "d8fe4ac37ce435f356bdfef8cc4c8a013994d651037d540571b4fcbda825e349",
         ".claude/docs/guardrails/_FORMAT.md": "49d34514d716f21647a9285b376697693ef01e4668f4001023e0e0ba4b8bd31c"
       },
-      "installed_at": "2026-10-15T00:33:04+00:00"
+      "installed_at": "2026-10-16T18:53:28+00:00"
     },
     "eugo-agentic-scripts": {
-      "tree_hash": "8ce3d727605bf5c5d7b044c66cc2358073d22397c2a9f2be8659da718c8083bf",
-      "source_commit": "497c71b4b7f99279a3b0c58e11df419ba06899b4",
+      "tree_hash": "b9ec8e8207f17292d136f026a028b363c6d0b7a156d96470f1800e5d29fab57a",
+      "source_commit": "25a191e0dd36b15bfd5e264bd0274e8501ea7182",
       "files": [
         ".claude/scripts/codex_review.py",
         ".claude/scripts/codex_watch.py",
         ".claude/scripts/watch_drain.py"
       ],
       "file_hashes": {
-        ".claude/scripts/codex_review.py": "2bccc71bb5a3b4c1e99911ab4ebe573a6f2b713199b91e09b0b7d884ee39a009",
+        ".claude/scripts/codex_review.py": "564e7fb3ba8a39db4a490390ad0d7a04baf72b652d2cce5a70f29006fd3077a0",
         ".claude/scripts/codex_watch.py": "b8dca94779a04fb29cbe6bada8ed37254a0835101648df8a10a070ec8970a56c",
         ".claude/scripts/watch_drain.py": "61638206fb465a240b8dc7c1f9a9ffc0274852c6bc16f10c2952a258ef90ab36"
       },
-      "installed_at": "2026-10-15T00:33:02+00:00"
+      "installed_at": "2026-10-16T18:53:28+00:00"
     }
   }
 }

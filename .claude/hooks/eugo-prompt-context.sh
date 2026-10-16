@@ -86,6 +86,30 @@
 #   - MODEL SWITCH (§3.52 S3.4, run 1261): the same script bound to PostModelSwitch runs ONLY the
 #     model arm: ONE `MODEL STATE (<from>→<to>, <source>)` line, silent on `resume`, the ids and
 #     source kept to [A-Za-z0-9._:-]; no python
+#   - STATE SOURCES (§3.57, run 1262): the same script bound to Stop, StopFailure (matcher `rate_limit`) and
+#     PostCompact only WRITES: one line per event to ${XDG_CACHE_HOME:-$HOME/.cache}/eugo-session-state/<session>.events
+#     (folder 700, file 600; a relative XDG_CACHE_HOME or HOME is ignored; a session id outside [A-Za-z0-9_-] writes
+#     nothing), nothing on stdout, no python, no prompt arm. A line is `<epoch> <transcript bytes> <compact_boundary
+#     count> <SessionStart:resume count> <$CLAUDE_PID> <kind> <arg>`; the counts are RUNNING totals over the
+#     transcript, each stretch read from 32 bytes before the last line's bytes (an overlap can count a word twice,
+#     never miss one); a transcript shorter than those bytes starts the log over. The SessionStart `resume` and
+#     PostModelSwitch branches add `resume` / `model` after their lines; files untouched for 30 days go when a log
+#     starts. The prompt arms read the log FIRST — only a FRESH one: every line parses, and the transcript is no
+#     shorter than the last line's bytes and at most 1 MiB past them — and a source does only three things: let an arm
+#     skip work that would print nothing, widen what it reads, or hand python the status line's window, which replaces
+#     the `[1m]`/200k guess and so can change the verdict either way (a 1M session no longer warns at 150k; a status
+#     saying 200k warns where a `[1m]` line silenced it). Quota: a `limit` with no `stop` after it reads from 256 KiB
+#     before it, or from today's 1 MiB floor when that starts earlier, to the end with no line cap (the transcript
+#     still decides). Effort: no resume counted, or the same Stop level on both sides of this `$CLAUDE_PID`'s start, no
+#     `limit` and no other recorded effort in the transcript between them (a turn ended by Esc writes no Stop), and no
+#     model switch since: no python. Context: no compaction counted, or the line already said this cycle (`said
+#     warn|imminent` against the count): no python; a status line written at most 60 s before the newest turn end gives
+#     the WINDOW, never the fill (that stays the transcript's newest usage). A source missing, stale or unreadable:
+#     today's scans, unchanged
+#   - STATUS LINE (§3.57; a per-user opt-in, never in a repo's settings): `--statusline [command …]` caches
+#     <session>.status (`<epoch> <fill> <window> <percent> <effort> <5h %> <5h reset> <7d %> <7d reset>`, `-` for
+#     absent) FIRST, then prints the wrapped command's output, fed the same bytes, or one short line of its own.
+#     Interactive only and blank before the trust dialog (statusline.md), so a `-p` session keeps the scans
 #   - EUGO_REVIEW_SUBPROCESS set -> silent (a reviewer is not a session to inform);
 #     EUGO_PROMPT_CONTEXT_OFF set -> silent (the kill switch, every arm)
 #   - malformed or empty stdin, no python3, unreadable transcript -> silent
@@ -112,10 +136,11 @@ IN="$(cat 2>/dev/null || true)"
 if [ -n "${EUGO_REVIEW_SUBPROCESS:-}" ]; then
   exit 0
 fi
-if [ -n "${EUGO_PROMPT_CONTEXT_OFF:-}" ]; then
+# §3.57 — the `--statusline` mode still runs the command it wraps under the kill switch and on empty input.
+if [ -n "${EUGO_PROMPT_CONTEXT_OFF:-}" ] && [ "${1:-}" != "--statusline" ]; then
   exit 0
 fi
-if [ -z "$IN" ]; then
+if [ -z "$IN" ] && [ "${1:-}" != "--statusline" ]; then
   exit 0
 fi
 
@@ -221,16 +246,30 @@ arm_quota() {
   # limit means the session already resumed: silent. Measured shapes: 991 session/weekly
   # records with `quotaLimits.status="rejected"`, 44 model-limit records with quotaLimits
   # NULL, 50+ throttles sharing the 429 — so neither field alone is the discriminator.
-  local tp="${1:-}" cap hits
+  local tp="${1:-}" cap hits lines=300 from=0 lf=0
   [ -n "$tp" ] || return 0
   [ -r "$tp" ] || return 0
   cap="${EUGO_QUOTA_TAIL_BYTES:-1048576}"
   case "$cap" in ''|*[!0-9]*) cap=1048576 ;; esac
-  # cheap gate: python never starts on the common path (grep -c, not -q: no SIGPIPE)
-  hits="$(tail -c "$cap" "$tp" 2>/dev/null | grep -a -c -e 'isApiErrorMessage' -e 'Usage limit reached' 2>/dev/null)" || true
-  case "${hits:-0}" in ''|0|*[!0-9]*) return 0 ;; esac
+  if [ "$ST_OK" = 1 ] && [ -n "$ST_LIMIT_AT" ]; then
+    # §3.57 — the StopFailure row logged a rate-limit turn end with no Stop after it: read from 256 KiB before that
+    # point, or from today's floor (the last $cap bytes) when that starts earlier, to the end, no line cap (300 lines
+    # of hook and system records after a limit hid it). Only the window widens, never narrows: a floor at the limit
+    # line alone missed a hard limit 300 KB before a throttle's line, inside today's window (review of §3.57). The
+    # transcript below still decides limit vs throttle and whether a real turn followed.
+    [ "$ST_SIZE" -gt "$cap" ] && from=$((ST_SIZE - cap))
+    [ "$ST_LIMIT_AT" -gt 262144 ] && lf=$((ST_LIMIT_AT - 262144))
+    [ "$lf" -lt "$from" ] && from=$lf
+    cap=$((ST_SIZE - from))
+    lines=1000000
+    [ "$cap" -gt 0 ] || return 0
+  else
+    # cheap gate: python never starts on the common path (grep -c, not -q: no SIGPIPE)
+    hits="$(tail -c "$cap" "$tp" 2>/dev/null | grep -a -c -e 'isApiErrorMessage' -e 'Usage limit reached' 2>/dev/null)" || true
+    case "${hits:-0}" in ''|0|*[!0-9]*) return 0 ;; esac
+  fi
   command -v python3 >/dev/null 2>&1 || return 0
-  python3 -S - "$tp" "$cap" 300 <<'PY' 2>/dev/null || true
+  python3 -S - "$tp" "$cap" "$lines" <<'PY' 2>/dev/null || true
 import json, re, sys, time
 path, cap, max_lines = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 QUOTA_TEXT = re.compile(r"^You've (hit|reached) your .{0,60}limit")
@@ -304,6 +343,13 @@ arm_effort() {
   local tp="${1:-}" cap hits
   [ -n "$tp" ] || return 0
   [ -r "$tp" ] || return 0
+  # §3.57 — the log first: no `SessionStart:resume` in the whole transcript (its running count is an upper bound), or
+  # the same Stop level on both sides of this process's start with no model switch since: python could only exit
+  # silent. Anything short of that proof runs the scan below.
+  if [ "$ST_OK" = 1 ]; then
+    [ "$ST_RES" -gt 0 ] || return 0
+    [ "$ST_EFF_SKIP" = 1 ] && return 0
+  fi
   cap="${EUGO_EFFORT_TAIL_BYTES:-4194304}"
   case "$cap" in ''|*[!0-9]*) cap=4194304 ;; esac
   hits="$(tail -c "$cap" "$tp" 2>/dev/null | grep -a -c -e 'SessionStart:resume' 2>/dev/null)" || true
@@ -649,18 +695,39 @@ arm_context() {
   # left a heavy floor) and near the next one: warn ONCE per compaction cycle, once more when
   # it is imminent, and write a hand-off file. Never a stop. The gate: the newest usage numbers
   # in the last 1 MiB against the smallest window's warning point (no python below it).
-  local tp="${1:-}" sid="${2:-}" u w fill gate
+  local tp="${1:-}" sid="${2:-}" u w fill gate imm
   [ -n "$tp" ] || return 0
   [ -r "$tp" ] || return 0
+  w="${EUGO_CONTEXT_WINDOW:-}"
+  case "$w" in ''|*[!0-9]*) w="" ;; esac
+  # §3.57 — the state sources first. No compaction counted in the whole transcript (an upper bound) leaves python
+  # nothing to warn about; nor does the imminent line already said this cycle. A fresh status line gives the REAL
+  # window, handed to python too, in place of the `[1m]` guess below — the scan took a 1M session with no 1M evidence
+  # for 200k and warned at 150k, and the converse. Never the FILL: a status written before the turn's last API call
+  # can hold less than the transcript's newest usage and so hide a warning (review of §3.57); the fill is the tail's.
+  if [ "$ST_OK" = 1 ]; then
+    [ "$ST_COMPS" -gt 0 ] || return 0
+    [ "$ST_SAID_IMM" = 1 ] && return 0
+    if [ -z "$w" ] && [ "$ST_STATUS_OK" = 1 ]; then
+      w=$((ST_WINDOW))
+    fi
+  fi
   u="$(tail -c 1048576 "$tp" 2>/dev/null | grep -a -v -E '"isSidechain"[[:space:]]*:[[:space:]]*true' | grep -a -o -E '"usage"[[:space:]]*:[[:space:]]*[{][[:space:]]*"input_tokens"[[:space:]]*:[[:space:]]*[0-9]+[[:space:]]*,[[:space:]]*"cache_creation_input_tokens"[[:space:]]*:[[:space:]]*[0-9]+[[:space:]]*,[[:space:]]*"cache_read_input_tokens"[[:space:]]*:[[:space:]]*[0-9]+' 2>/dev/null | tail -n 1)" || true
   [ -n "$u" ] || return 0
   set -- $(printf '%s' "$u" | sed 's/[^0-9][^0-9]*/ /g')
   [ $# -eq 3 ] || return 0
   fill=$(($1 + $2 + $3))
-  w="${EUGO_CONTEXT_WINDOW:-}"
-  case "$w" in ''|*[!0-9]*) w="" ;; esac
   gate=$(((${w:-200000} - 33000) * 4 / 5))
   [ "$fill" -ge "$gate" ] || return 0
+  # §3.57 — said this cycle and below the imminent point of the window python will use: the override or the status
+  # line's, else 1M once the fill passes 200k (python's own rule), else the smallest one it may be (200k)
+  imm=${w:-200000}
+  if [ -z "$w" ] && [ "$fill" -gt 200000 ]; then
+    imm=1000000
+  fi
+  if [ "$ST_SAID_WARN" = 1 ] && [ "$fill" -lt $(((imm - 33000) * 95 / 100)) ]; then
+    return 0
+  fi
   # §2.84 — a session whose transcript names a `[1m]` model is read against the 1M window by
   # the python below whatever else it finds, so below that window's warning point it can only
   # exit silently: in a 1M session it started on every prompt past 133.6k and scanned the whole
@@ -679,7 +746,8 @@ arm_context() {
   [ "$SECONDS" -lt "$b" ] || return 0
   dl="$(date +%s 2>/dev/null)"
   case "$dl" in ''|*[!0-9]*) dl="" ;; *) dl=$((dl + b - SECONDS)) ;; esac
-  python3 -S - "$tp" "$sid" "${CLAUDE_PROJECT_DIR:-.}" "$w" "$dl" "$b" <<'PY' 2>/dev/null || true
+  # §3.57 — through ctx_mark, which passes the line on and logs that it was said this cycle.
+  python3 -S - "$tp" "$sid" "${CLAUDE_PROJECT_DIR:-.}" "$w" "$dl" "$b" <<'PY' 2>/dev/null | ctx_mark
 import calendar, collections, json, os, re, subprocess, sys, time
 path, sid, root, wover, dl, budget = sys.argv[1:7]
 DEADLINE = float(dl) if dl else time.time() + float(budget)
@@ -1157,7 +1225,321 @@ arm_review() {
   return 0
 }
 
+# ---- §3.57: the cheap state sources (see STATE SOURCES and STATUS LINE in the header) --------------------------
+STATE_SLACK=1048576   # the transcript grew past this since the log's last line: its writers stopped, the log is stale
+STATUS_SLACK=60       # a status line written this long before the newest turn end has stopped running
+ST_OK=0 ST_SIZE=0 ST_COMPS=0 ST_RES=0 ST_LIMIT_AT="" ST_SAID_WARN=0 ST_SAID_IMM=0 ST_EFF_SKIP=0
+ST_STATUS_FRESH=0 ST_STATUS_OK=0 ST_WINDOW="" ST_SEFF="-" ST_DIR=""
+
+is_num() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
+
+state_dir() {
+  # Sets ST_DIR to the per-user folder, found as eugo-wip-snapshot.sh finds its own: XDG_CACHE_HOME when it is an
+  # absolute path, else $HOME/.cache when HOME is one; "" otherwise (and then no state is read or written). A variable,
+  # not `$(…)` output: the prompt path pays no fork for it (the 4 s budget test runs on that path).
+  local base="${XDG_CACHE_HOME:-}"
+  ST_DIR=""
+  case "$base" in /*) ;; *) base="" ;; esac
+  if [ -z "$base" ]; then
+    case "${HOME:-}" in /*) base="$HOME/.cache" ;; *) return 0 ;; esac
+  fi
+  ST_DIR="$base/eugo-session-state"
+}
+
+state_counts() {
+  # $1 = transcript, $2 = from byte, $3 = to byte: "<compact_boundary> <SessionStart:resume>", each word counted
+  # every time it occurs in [from, to) — quotes included, so a count is an UPPER bound on the records python counts.
+  # From byte 0 (a new log) the file is read straight, to its end: piping 70 MB through tail and head cost 2.8 s at
+  # load 52, and a seed that outran the row's timeout would be killed before its line — then re-run at every turn. The
+  # bytes past `to` it may read are counted again by the next line: an over-count, the safe side. A missing tool
+  # prints nothing (the callers then use no state), never a `0 0` that an empty pipeline would read as.
+  command -v tail >/dev/null 2>&1 && command -v head >/dev/null 2>&1 && command -v awk >/dev/null 2>&1 || return 0
+  if [ "$2" -eq 0 ]; then
+    LC_ALL=C grep -a -o -F -e 'compact_boundary' -e 'SessionStart:resume' "$1" 2>/dev/null
+  else
+    tail -c +$(($2 + 1)) "$1" 2>/dev/null | head -c $(($3 - $2)) 2>/dev/null \
+      | LC_ALL=C grep -a -o -F -e 'compact_boundary' -e 'SessionStart:resume' 2>/dev/null
+  fi | LC_ALL=C awk '$0 == "compact_boundary" { c++ } $0 == "SessionStart:resume" { r++ } END { printf "%d %d\n", c, r }'
+}
+
+state_append() {
+  # $1 = kind, $2 = its argument (kept to [A-Za-z0-9_-], else `-`): ONE line in <state>/<session>.events. The counts
+  # carry on from the last line, reading only the stretch since its bytes; a last line that does not parse, or a
+  # transcript shorter than its bytes, starts the log over from byte 0. No python: Stop fires at every turn end.
+  local kind="$1" arg="${2:-}" d f size now pid prev=0 pc=0 pr=0 start last
+  [ -n "$SSID" ] && [ -n "$TP" ] && [ -r "$TP" ] || return 0
+  case "$arg" in ''|*[!A-Za-z0-9_-]*) arg="-" ;; esac
+  state_dir
+  d="$ST_DIR"
+  [ -n "$d" ] || return 0
+  if [ ! -d "$d" ]; then
+    (umask 077 && mkdir -p -- "$d") 2>/dev/null || return 0
+  fi
+  chmod 700 -- "$d" 2>/dev/null
+  f="$d/$SSID.events"
+  size="$(wc -c <"$TP" 2>/dev/null | tr -d ' ')"
+  is_num "$size" || return 0
+  now="$(date +%s 2>/dev/null)"
+  is_num "$now" || return 0
+  pid="${CLAUDE_PID:-}"
+  is_num "$pid" || pid="-"
+  if [ -s "$f" ]; then
+    last="$(tail -n 1 "$f" 2>/dev/null | LC_ALL=C awk 'NF == 7 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ { printf "%d %d %d\n", $2, $3, $4 }')"
+    set -- $last
+    if [ $# -eq 3 ] && [ "$1" -le "$size" ]; then
+      prev=$1 pc=$2 pr=$3
+    else
+      : 2>/dev/null >"$f" || return 0
+    fi
+  fi
+  if [ ! -s "$f" ]; then
+    # A new log: this user's logs and status files untouched for 30 days go (sessions are parked for days, not
+    # months). Named files in this folder only, never a directory.
+    find "$d" -maxdepth 1 -type f \( -name '*.events' -o -name '*.status' -o -name '*.status.tmp*' \) -mtime +30 \
+      -exec rm -f {} + 2>/dev/null
+  fi
+  start=0
+  [ "$prev" -gt 32 ] && start=$((prev - 32))
+  set -- $(state_counts "$TP" "$start" "$size")
+  [ $# -eq 2 ] && is_num "$1" && is_num "$2" || return 0
+  (umask 077 && printf '%s %s %s %s %s %s %s\n' "$now" "$size" "$((pc + $1))" "$((pr + $2))" "$pid" "$kind" "$arg" \
+    >>"$f") 2>/dev/null
+  return 0
+}
+
+state_load() {
+  # Read this session's log and status line ONCE, before the arms, into ST_*. Only a fresh, whole log sets ST_OK=1;
+  # its counts are then brought up to now from the transcript itself (the stretch after the last line).
+  local d f sf size pid line start lb lc lr lim te sw si brk prior cur model inrun lsb rsb limb sts sfill swin spct seff rest
+  [ -n "$SSID" ] && [ -n "$TP" ] && [ -r "$TP" ] || return 0
+  # every tool the reads below need, or no state at all (an empty pipeline must never read as "nothing there")
+  command -v tail >/dev/null 2>&1 && command -v head >/dev/null 2>&1 && command -v awk >/dev/null 2>&1 \
+    && command -v wc >/dev/null 2>&1 || return 0
+  state_dir
+  d="$ST_DIR"
+  [ -n "$d" ] || return 0
+  f="$d/$SSID.events"
+  [ -r "$f" ] || return 0
+  size="$(wc -c <"$TP" 2>/dev/null | tr -d ' ')"
+  is_num "$size" || return 0
+  pid="${CLAUDE_PID:-}"
+  is_num "$pid" || pid=""
+  # One pass. The effort boundary is where THIS process's lines start (`$CLAUDE_PID` differs from the line before)
+  # or its `resume` line: `prior` is the newest Stop level before it, `cur` the newest after, `model` a switch after;
+  # `lsb` / `rsb` the bytes of that Stop and of the run's first line, `limb` a `limit` line between them.
+  line="$(LC_ALL=C awk -v P="$pid" '
+    BEGIN { lim = -1; te = -1; sw = -1; si = -1; brk = 0; prior = "-"; cur = "-"; model = 0; inrun = 0
+            last = "-"; prevpid = ""; lss = -1; lsince = 0; lsb = -1; rsb = -1; limb = 0 }
+    function lvl(x) { return (x ~ /^[a-z]+$/) ? x : "-" }
+    NF != 7 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ { bad = 1; next }
+    {
+      n++; lb = $2 + 0; lc = $3 + 0; lr = $4 + 0
+      if ($6 == "stop" || $6 == "limit") te = $1 + 0
+      if ($6 == "limit") lim = $2 + 0
+      if ($6 == "stop") lim = -1
+      if ($6 == "said" && $7 == "warn") sw = $3 + 0
+      if ($6 == "said" && $7 == "imminent") si = $3 + 0
+      if (P != "" && $5 == P) {
+        if (!inrun || $6 == "resume") {
+          brk = ($6 == "resume" || (prevpid ~ /^[0-9]+$/ && prevpid != P)) ? 1 : 0
+          prior = last; cur = "-"; model = 0; inrun = 1; lsb = lss; rsb = $2 + 0; limb = lsince
+        }
+        if ($6 == "stop") cur = lvl($7)
+        if ($6 == "model") model = 1
+      } else {
+        inrun = 0
+      }
+      if ($6 == "stop") { last = lvl($7); lss = $2 + 0; lsince = 0 }
+      if ($6 == "limit") lsince = 1
+      prevpid = $5
+    }
+    END {
+      if (bad || !n) { print "0"; exit }
+      printf "1 %d %d %d %d %d %d %d %d %s %s %d %d %d %d %d\n", lb, lc, lr, lim, te, sw, si, brk, prior, cur, model,
+        inrun, lsb, rsb, limb
+    }' "$f" 2>/dev/null)"
+  set -- $line
+  [ $# -eq 16 ] && [ "$1" = 1 ] || return 0
+  lb=$2 lc=$3 lr=$4 lim=$5 te=$6 sw=$7 si=$8 brk=$9 prior=${10} cur=${11} model=${12} inrun=${13}
+  lsb=${14} rsb=${15} limb=${16}
+  [ "$size" -ge "$lb" ] && [ $((size - lb)) -le "$STATE_SLACK" ] || return 0
+  start=0
+  [ "$lb" -gt 32 ] && start=$((lb - 32))
+  set -- $(state_counts "$TP" "$start" "$size")
+  [ $# -eq 2 ] && is_num "$1" && is_num "$2" || return 0
+  ST_SIZE=$size ST_COMPS=$((lc + $1)) ST_RES=$((lr + $2)) ST_OK=1
+  if is_num "$lim"; then ST_LIMIT_AT=$lim; fi
+  if [ "$sw" = "$ST_COMPS" ] || [ "$si" = "$ST_COMPS" ]; then ST_SAID_WARN=1; fi
+  if [ "$si" = "$ST_COMPS" ]; then ST_SAID_IMM=1; fi
+  sf="$d/$SSID.status"
+  if is_num "$te" && [ -r "$sf" ]; then
+    read -r sts sfill swin spct seff rest <"$sf"
+    if is_num "$sts" && [ $((10#$sts + STATUS_SLACK)) -ge "$te" ]; then
+      ST_STATUS_FRESH=1
+      case "$seff" in ''|*[!a-z]*) ST_SEFF="-" ;; *) ST_SEFF="$seff" ;; esac
+      # the WINDOW only: its fill (`sfill`, read to keep the fields in place) may predate the turn's last API call,
+      # and it is `-` after a /compact (statusline.md), when the window still holds
+      if is_num "$swin" && [ $((10#$swin)) -gt 33000 ]; then
+        ST_STATUS_OK=1 ST_WINDOW=$((10#$swin))
+      fi
+    fi
+  fi
+  if [ "$brk" = 1 ] && [ "$inrun" = 1 ] && [ "$model" = 0 ] && [ "$limb" = 0 ] && [ "$prior" != "-" ] \
+      && [ "$prior" = "$cur" ] && [ "$lsb" -ge 0 ] && [ "$rsb" -ge "$lsb" ] && [ $((rsb - lsb)) -le "$STATE_SLACK" ]; then
+    if [ "$ST_STATUS_FRESH" != 1 ] || [ "$ST_SEFF" = "-" ] || [ "$ST_SEFF" = "$cur" ]; then
+      # A turn that ended with no Stop (Esc writes none; a rate limit writes `limit`) leaves no line, and python reads
+      # the transcript's last turn: every effort the transcript recorded between that Stop and this process's start
+      # (64 bytes past it, so no record is cut) must be the prior level too. A quoted value can only cancel the skip.
+      line="$(tail -c +$((lsb + 1)) "$TP" 2>/dev/null | head -c $((rsb + 64 - lsb)) 2>/dev/null \
+        | LC_ALL=C grep -a -o -E '"effort"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null \
+        | LC_ALL=C awk -v P="$prior" '{ v = $0; sub(/^.*:[[:space:]]*"/, "", v); sub(/"$/, "", v); if (v != P) odd++ }
+                                     END { print (odd ? "odd" : "same") }')"
+      if [ "$line" = "same" ]; then
+        ST_EFF_SKIP=1
+      fi
+    fi
+  fi
+  return 0
+}
+
+ctx_mark() {
+  # The context arm's python output passes through; a CONTEXT STATE line it printed is logged as said this cycle —
+  # only into a log state_load found fresh (an append from its last line), never by seeding a new one here: that would
+  # read the whole transcript on the prompt path (the 64 MiB bound test went from under 5 s to 6.4 s at load ~50).
+  local line kind=""
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    case "$line" in
+      "CONTEXT STATE (imminent):"*) kind=imminent ;;
+      "CONTEXT STATE:"*) [ -n "$kind" ] || kind=warn ;;
+    esac
+  done
+  if [ -n "$kind" ] && [ "$ST_OK" = 1 ]; then
+    state_append said "$kind" 2>/dev/null
+  fi
+  return 0
+}
+
+json_word() {
+  # $1 = a key: its first `"key": "<value>"` in the payload when the value is all [a-z_], else `-`. A key quoted
+  # inside a string value is JSON-escaped (`\"key\"`), so it cannot match.
+  local v
+  v="$(grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" <<<"$IN" 2>/dev/null)"
+  v="${v%%$'\n'*}"
+  v="${v%\"}"
+  v="${v##*\"}"
+  case "$v" in ''|*[!a-z_]*) v="-" ;; esac
+  printf '%s' "$v"
+}
+
+effort_level() {
+  # The Stop payload's `effort.level` (hooks.md: "Object with a `level` field") when it is all [a-z], else `-`.
+  local o v
+  o="$(grep -o '"effort"[[:space:]]*:[[:space:]]*{[^}]*}' <<<"$IN" 2>/dev/null)"
+  o="${o%%$'\n'*}"
+  v="$(grep -o '"level"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$o" 2>/dev/null)"
+  v="${v%%$'\n'*}"
+  v="${v%\"}"
+  v="${v##*\"}"
+  case "$v" in ''|*[!a-z]*) v="-" ;; esac
+  printf '%s' "$v"
+}
+
+statusline_cache() {
+  # $1 = the state folder ("" = cache nothing). Caches <session>.status, then prints the default display line.
+  # statusline.md: `current_usage` is null before the first API call and after /compact, `effort` and `rate_limits`
+  # may be absent, `used_percentage` may be null — each is `-` then, never a guess.
+  printf '%s' "$IN" | PC_STATE_DIR="${1:-}" PYTHONUTF8=1 python3 -S /dev/fd/3 3<<'PY' 2>/dev/null || true
+import json, os, re, sys, time
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+def obj(v):
+    return v if isinstance(v, dict) else {}
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else None
+def txt(v):
+    return "-" if v is None else ("%d" % v if float(v).is_integer() else "%.1f" % v)
+cw = obj(d.get("context_window"))
+cu = cw.get("current_usage")
+fill = None
+if isinstance(cu, dict):
+    parts = [num(cu.get(k)) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+    if None not in parts:
+        fill = sum(parts)
+window, pct = num(cw.get("context_window_size")), num(cw.get("used_percentage"))
+level = obj(d.get("effort")).get("level")
+level = level if isinstance(level, str) and re.fullmatch(r"[a-z]{1,16}", level) else None
+rl = obj(d.get("rate_limits"))
+five, week = obj(rl.get("five_hour")), obj(rl.get("seven_day"))
+sid, sdir = d.get("session_id"), os.environ.get("PC_STATE_DIR", "")
+if isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid) and sdir.startswith("/"):
+    line = " ".join([str(int(time.time())), txt(fill), txt(window), txt(pct), level or "-",
+                     txt(num(five.get("used_percentage"))), txt(num(five.get("resets_at"))),
+                     txt(num(week.get("used_percentage"))), txt(num(week.get("resets_at")))]) + "\n"
+    tmp = os.path.join(sdir, "%s.status.tmp%d" % (sid, os.getpid()))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(line)
+        os.replace(tmp, os.path.join(sdir, sid + ".status"))
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+name = obj(d.get("model")).get("display_name")
+out = [re.sub(r"[\x00-\x1f\x7f]", "", name)[:40]] if isinstance(name, str) and name.strip() else []
+if pct is not None:
+    of = (" of 1M" if window == 1000000 else " of %dk" % (window // 1000)) if window else ""
+    out.append("ctx %d%%%s" % (round(pct), of))
+if level:
+    out.append(level)
+for tag, w in (("5h", five), ("7d", week)):
+    p = num(w.get("used_percentage"))
+    if p is not None:
+        out.append("%s %d%%" % (tag, round(p)))
+if out:
+    print(" · ".join(out))
+PY
+  return 0
+}
+
+statusline() {
+  # `--statusline [command …]`, from a user's OWN ~/.claude/settings.json (statusline.md "Manually configure a status
+  # line"). Caches FIRST (the client cancels a run still going when the next update comes), then prints the wrapped
+  # command's output, fed the very bytes read here — or, with no command, one short line of its own.
+  local d="" out=""
+  if [ -z "${EUGO_PROMPT_CONTEXT_OFF:-}" ] && [ -n "$IN" ] && command -v python3 >/dev/null 2>&1; then
+    state_dir
+    d="$ST_DIR"
+    if [ -n "$d" ] && [ ! -d "$d" ]; then
+      (umask 077 && mkdir -p -- "$d") 2>/dev/null || d=""
+    fi
+    [ -z "$d" ] || chmod 700 -- "$d" 2>/dev/null
+    out="$(statusline_cache "$d" 2>/dev/null)"
+  fi
+  if [ $# -gt 0 ]; then
+    printf '%s' "$IN" | "$@"
+    return 0
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out"
+  return 0
+}
+
 # ---- MAIN ----
+# §3.57 — the status line mode: no hook payload, no arm.
+if [ "${1:-}" = "--statusline" ]; then
+  shift
+  statusline "$@"
+  exit 0
+fi
 # The FIRST occurrence, never the last: a prompt that quotes the literal key must not
 # redirect the quota arm (greedy `.*` took the last match). And only a `.jsonl` path is
 # ever read.
@@ -1167,6 +1549,18 @@ case "$TP" in *.jsonl) ;; *) TP="" ;; esac
 # (a prompt arm would speak twice: once now, once at the first prompt). A quoted key inside
 # the prompt is JSON-escaped (`\"`), so it cannot match these patterns.
 EV="$(grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$IN" 2>/dev/null)"; EV="${EV%%$'\n'*}"; EV="$(sed 's/.*"\([^"]*\)"$/\1/' <<<"$EV")"
+SID="$(grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$IN" 2>/dev/null)"; SID="${SID%%$'\n'*}"; SID="$(sed 's/.*"\([^"]*\)"$/\1/' <<<"$SID")"
+# §3.57 — the state files are named by session id, so only a plain one (and not an absurdly long one) names a file.
+SSID="$SID"
+case "$SSID" in ''|*[!A-Za-z0-9_-]*) SSID="" ;; esac
+[ "${#SSID}" -le 128 ] || SSID=""
+# §3.57 — the three writer rows: ONE log line each, nothing on stdout, no python, and no prompt arm (before this, a
+# StopFailure payload fell through to them and the quota arm spoke into an event that shows nobody its output).
+case "$EV" in
+  Stop) state_append stop "$(effort_level)" 2>/dev/null; exit 0 ;;
+  StopFailure) state_append limit "$(json_word error)" 2>/dev/null; exit 0 ;;
+  PostCompact) state_append compact "$(json_word trigger)" 2>/dev/null; exit 0 ;;
+esac
 if [ "$EV" = "SessionStart" ]; then
   SRC="$(grep -o '"source"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$IN" 2>/dev/null)"; SRC="${SRC%%$'\n'*}"; SRC="$(sed 's/.*"\([^"]*\)"$/\1/' <<<"$SRC")"
   if [ "$SRC" = "resume" ]; then
@@ -1179,6 +1573,7 @@ if [ "$EV" = "SessionStart" ]; then
     if [ -n "$E" ]; then
       printf '%s\n' "$E"
     fi
+    state_append resume - 2>/dev/null          # §3.57 — after the lines, so a slow first log costs none of them
   fi
   exit 0
 fi
@@ -1188,9 +1583,13 @@ if [ "$EV" = "PostModelSwitch" ]; then
   if [ -n "$G" ]; then
     printf '%s\n' "$G"
   fi
+  # §3.57 — a switch someone made (not the saved model a resume restores) ends the effort arm's shortcut this process
+  if [ "$(model_field source "$IN" 2>/dev/null)" != "resume" ]; then
+    state_append model - 2>/dev/null
+  fi
   exit 0
 fi
-SID="$(grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$IN" 2>/dev/null)"; SID="${SID%%$'\n'*}"; SID="$(sed 's/.*"\([^"]*\)"$/\1/' <<<"$SID")"
+state_load 2>/dev/null                        # §3.57 — the state sources, read once for every arm below
 # §2.84 — each arm's lines go out as soon as it returns, in the same order as before.
 A="$(arm_glossary 2>/dev/null)" || true
 if [ -n "$A" ]; then

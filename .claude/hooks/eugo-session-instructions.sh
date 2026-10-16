@@ -36,7 +36,7 @@
 #     reaches a trace (§3142)
 #   - the bearer is sent only to an https EUGO_KB_EDGE_URL whose host is the default's or is
 #     listed in EUGO_KB_EDGE_HOSTS, and curl is held to https with URL globbing off (§3142)
-#   - the rules tmp is created O_EXCL at 0644 under an unpredictable name and is only ever
+#   - the rules tmp is created O_EXCL (0664 in a shared folder, 0644 elsewhere) under an unpredictable name, only ever
 #     renamed; the rules dir keeps its group-write and setgid bits, loses other-write, and
 #     stays readable by every account (§3142)
 # §3142 — the publish guard's disarm (protomolecule f73c6ba408), which this hook lacked (eugo-kb
@@ -426,7 +426,7 @@ fetch_into() {
 write_rules_from() { # atomic: tmp in the same dir, then rename; WORLD-READABLE —
   # on a shared checkout other accounts' sessions must load this file, and the
   # mktemp source is 0600 (a cp preserves it; measured 2026-08-30 on two live trees),
-  # so the tmp below is CREATED 0644 rather than copied.
+  # so the tmp below is CREATED (0664 in a shared folder, else 0644; §2.102) rather than copied.
   # A DIRECTORY at $RULES is refused: `mv -f` would move the tmp INTO it and return 0,
   # so the rules file would be reported written while it does not exist (eugo-grpc G013).
   [ -d "$RULES" ] && return 1
@@ -443,7 +443,9 @@ write_rules_from() { # atomic: tmp in the same dir, then rename; WORLD-READABLE 
   # mv left the tmp inside the repo (eugo-grpc G017, protomolecule F521(a)). §1.114 — it is
   # `cleanup_tmps`, which removes the caller's fetch tmp too: `trap … EXIT` REPLACES the earlier
   # trap, so a trap naming only $RULES_TMP dropped $TMP for the rest of the run.
-  # §3142 — the tmp is CREATED by the write itself, O_EXCL (`set -C`) at 0644 (`umask 022`),
+  # §3142 — the tmp is CREATED by the write itself, O_EXCL (`set -C`), at 0644 (`umask 022`) — or 0664 (`umask 002`)
+  # when the rules folder is setgid or group-writable, a checkout several accounts share (§2.102, operator ruling
+  # 2026-10-16), so another account's session can replace it; never group-writable elsewhere (a Mac's `staff`),
   # under an unpredictable name that `mktemp -u` only picks, and afterwards it is only renamed:
   # never copied onto, reopened or chmod'ed. The old `.eugo-central.md.$$.tmp` was predictable,
   # and cp + chmod 644 followed a symlink planted there (fact 2bf43927d313). A name mktemp
@@ -460,7 +462,9 @@ write_rules_from() { # atomic: tmp in the same dir, then rename; WORLD-READABLE 
   # directory planted there in between made plain `mv -f` move the tmp INTO that directory and
   # return 0, so the rules file was reported written while it did not exist. Each mv rejects
   # the other's flag, so only one of the two can move anything.
-  ( umask 022; set -C; cat "$1" > "$RULES_TMP" ) 2>/dev/null &&
+  RULES_UMASK=022
+  { [ -g "$RULES_DIR" ] || [ -n "$(find "$RULES_DIR" -maxdepth 0 -perm -020 2>/dev/null)" ]; } && RULES_UMASK=002
+  ( umask "$RULES_UMASK"; set -C; cat "$1" > "$RULES_TMP" ) 2>/dev/null &&
     { mv -fT "$RULES_TMP" "$RULES" 2>/dev/null || mv -fh "$RULES_TMP" "$RULES" 2>/dev/null; }
 }
 

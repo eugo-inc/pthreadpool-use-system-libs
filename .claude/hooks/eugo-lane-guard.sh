@@ -137,6 +137,12 @@ ASSIGN_RE = re.compile(r"(" + NAME + r")=(.*)\Z", re.S)
 ABS_RE = re.compile(r"(?<![A-Za-z0-9_.~$-])/[^\s'\";|&()<>`]*")
 EXPAND_RE = re.compile(r"\$(?:\{(" + NAME + r")(?::?[?\-=+][^}]*)?\}|(" + NAME + r"))")
 GIT_OPT_ARG = frozenset(("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"))
+#: §3.43 (b) — `-c KEY=VALUE` keys whose value can move the repository or work tree git acts on, or pull in a config file
+#: that can (lowercase; git config keys are case-insensitive): their value must resolve. Any other key's value changes
+#: nothing about WHERE git acts, so an expansion in it is no reason to refuse (`git -c user.email="$(…)" commit` in a
+#: lane's own clone); its `$( … )` still runs and is still walked (nested()).
+CONFIG_REDIRECT = ("core.worktree", "core.bare")
+CONFIG_INCLUDE = ("include.", "includeif.")
 ENV_OK = ("HOME", "TMPDIR", "USER")
 SQ = "\x00"                                                    # a `$` inside single quotes: never expanded
 
@@ -559,6 +565,15 @@ def bind(d, text, cwd):
     return None
 
 
+def inert_config(word, env):
+    """A `-c` operand whose KEY reads plainly and cannot redirect the repository (CONFIG_REDIRECT, CONFIG_INCLUDE)."""
+    try:
+        key = expand(word.split("=", 1)[0], env).strip().lower()
+    except Unresolved:
+        return False
+    return bool(key) and key not in CONFIG_REDIRECT and not key.startswith(CONFIG_INCLUDE)
+
+
 def git_target(words, cwd, env, genv=None):
     """(subcommand, directory, git dir, work tree) of a git invocation, or None when it is not one. The git dir and work
     tree are what --git-dir / --work-tree (or GIT_DIR / GIT_WORK_TREE in `genv`; a None value is one this guard cannot
@@ -570,6 +585,9 @@ def git_target(words, cwd, env, genv=None):
     while i < len(words):
         w = expand(words[i], env)
         if w in GIT_OPT_ARG and i + 1 < len(words):
+            if w == "-c" and inert_config(words[i + 1], env):
+                i += 2                                         # §3.43 (b): its value cannot move where git acts
+                continue
             val = expand(words[i + 1], env)
             if w == "-C":
                 target = absol(target, val)
@@ -684,13 +702,14 @@ def nxt(cmds, k):
     return getattr(cmds, "before", {}).get(k, cmds[k][0])
 
 
-def list_bg(cmds, k, words=None):
+def list_scan(cmds, k, words=None):
     """Whether the `&&`/`||` list the command before index k belongs to runs as a background job: past it, the first
     joiner at its own nesting level that is not `&&`, `||` or `|` is `&`. A `&` backgrounds the WHOLE list, not its last
     command — `cd X && popd & git reset --hard` resets in the shared checkout (escape fuzz, run 1262). A compound command
     or a `( … )` in the list is stepped over to its closer (`cd X || { echo no; exit 1; }; git …` ends at the `;`);
     `words`, the command's own, counts the compound IT opens (`{ exit 1; } & git …`: the list is the whole group).
-    True / False, or None when the nesting never closes."""
+    (True / False, or None when the nesting never closes; and the index of the command after the joiner that
+    ended the list — for a background list, where the shell goes on)."""
     stack = []                                               # open compounds; a `(` mark pushes "("
 
     def step(word):                                          # False when it closes a block the list sits in
@@ -714,7 +733,7 @@ def list_bg(cmds, k, words=None):
             continue
         op = getattr(cmds, "before", {}).get(k, j)
         if not stack and op not in ("&&", "||", "|"):
-            return op == "&"
+            return op == "&", k                           # (and the index of the command after it)
         if w is None:
             if j == "(":
                 stack.append("(")
@@ -722,15 +741,20 @@ def list_bg(cmds, k, words=None):
                 if stack and stack[-1] == "(":               # pattern's (`case y in y) …`, review of 3ddeb61d1)
                     stack.pop()
                 elif not stack:
-                    return False                             # the `( … )` the list sits in ends
+                    return False, k                          # the `( … )` the list sits in ends
         else:
             for word in w:                                   # the reserved words a command starts with
                 if word not in STRUCT:
                     break
                 if not step(word):
-                    return False                             # the list ends inside an enclosing block
+                    return False, k                          # the list ends inside an enclosing block
         k += 1
-    return None if stack else False
+    return (None if stack else False), k
+
+
+def list_bg(cmds, k, words=None):
+    """list_scan()'s answer alone: True / False / None."""
+    return list_scan(cmds, k, words)[0]
 
 
 def bg_here(cmds, k, words):
@@ -738,10 +762,27 @@ def bg_here(cmds, k, words):
     background one, that is the list its own first command runs in (the review of the §7327 tree); else the list of the
     compound it opens (`{ exit 1; } & git …`)."""
     if words and words[0] in OPENERS:
-        inner = list_bg(cmds, k)
-        if inner is not False:
-            return inner
-    return list_bg(cmds, k, words)
+        inner = list_scan(cmds, k)
+        if inner[0] is not False:
+            return inner[0]
+    return list_scan(cmds, k, words)[0]
+
+
+def bg_lists(cmds, k, words):
+    """Every list that STARTS at the command before index k, as list_scan() pairs, outermost first: at a command that
+    opens compounds, the list of each compound it opens (`{ … } &`) and the list that starts inside the last one
+    (`{ true & …`). They all begin here, so each must be tracked from here — keeping only the inner one let a cd later
+    in the group count past the outer `&` (reviews of 44bf92a3934e and e548d7fac4ed: `cd <shared>; { true & cd <clone>;
+    } & git reset --hard` reset the shared checkout)."""
+    lead = []
+    for word in words or ():
+        if word not in STRUCT:
+            break
+        lead.append(word)
+    opens = [i for i, word in enumerate(lead) if word in OPENERS]
+    if not opens:
+        return [list_scan(cmds, k, words)]
+    return [list_scan(cmds, k, words[i:]) for i in opens] + [list_scan(cmds, k, words[len(lead):])]
 
 
 def moved(states, dirs, env):
@@ -811,7 +852,8 @@ def check(text, start_states, shared, shared_commons, lane, depth=0, lost=None, 
     states = list(start_states)                              # [(cwd or None, ok: True/False/None)]
     frames, env, fundef, cmds, k = [], {}, False, commands(text, flat), 0
     dirstack, gitenv = [list(d) for d in pushed or ()], {}   # pushd's saved cwds; an exported GIT_DIR / GIT_WORK_TREE
-    bg_from, bg_back = None, None                            # a background `&&`/`||` list: the states it began from
+    bg_open = []                                             # open background lists: (the states each began from,
+                                                             # the index of the command after its own `&`)
     while k < len(cmds):
         joiner, words = cmds[k]
         k += 1
@@ -820,12 +862,15 @@ def check(text, start_states, shared, shared_commons, lane, depth=0, lost=None, 
             # A list behind a `&` runs in a subshell of its own: inside it every command runs in order (a cd in it
             # moves the commands after it IN the list), and at the `&` the shell goes on from the states the list
             # began with (the review of §7326's tree: `cd <shared> && git commit &` commits in the shared checkout)
-            if bg_back is not None:
-                states, bg_back = unknown(bg_back), None
-            if bg_from is None and bg_here(cmds, k, words) is True:
-                bg_from = list(states)
-            if bg_from is not None and nxt(cmds, k) == "&":
-                bg_back, bg_from = bg_from, None
+            # Each list ends at the `&` at ITS OWN nesting level — an inner `{ true & }` does not end it (the review
+            # of §7327: `cd <shared> && { true & } && git commit &` committed in the shared checkout). A command that
+            # opens a group starts the group's list AND the one inside it: both open here, the outer first so the
+            # inner, which ends sooner, sits on top (bg_lists(); a list seen again at the `}` is already open)
+            while bg_open and k - 1 >= bg_open[-1][1]:
+                states = unknown(bg_open.pop()[0])
+            for found, ends in bg_lists(cmds, k, words):
+                if found is True and all(e != ends for _, e in bg_open):
+                    bg_open.append((list(states), ends))
         if joiner in HEREDOC:                                # a here-document no command owns: a script of its own
             if depth < 4 and states:
                 why = lost if lost is not None or joiner == "<<" else "a here-document whose delimiter line is missing"

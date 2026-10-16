@@ -61,7 +61,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_MODELS = ["gpt-5.5", "gpt-5.3-codex-spark"]
@@ -412,6 +412,17 @@ CLAUDE_NO_CONNECTORS_ENV = "ENABLE_CLAUDEAI_MCP_SERVERS"
 #: (§7014): with it, cw1 = 0. `EUGO_REVIEW_CACHE_TTL=default` leaves the CLI's own default.
 CLAUDE_CACHE_PIN_ENV = "FORCE_PROMPT_CACHING_5M"
 REVIEW_CACHE_TTL_ENV = "EUGO_REVIEW_CACHE_TTL"
+
+#: §7043 (§3.72) — NO BACKGROUND TASKS IN A REVIEWER. A Bash call that outlives its timeout (120 s by default) is
+#: otherwise MOVED to the background, and when it ends the CLI wakes the reviewer with a task notification: that
+#: turn's short reply becomes the run's `result`, so a review that had already ended on its bare verdict line is
+#: recorded as ERROR "no verdict line" (athena d415140aee7e, 2026-10-15: APPROVED at 10:52:30Z, its backgrounded
+#: grep killed at the 10-minute limit at 11:01:42Z, the 324-character wake-up reply kept; reviewed and paid twice).
+#: With the CLI's own switch the call is killed at its timeout inside the turn and the reviewer carries on. Measured
+#: on 2.1.301 with a 135 s command at the default timeout: without it, "moved to the background" and the result was
+#: the wake-up reply; with it, "Command timed out after 2m 0s" and one reply, the answer. Set AFTER the allowlist,
+#: like the marker, so an inherited value cannot undo it.
+CLAUDE_NO_BACKGROUND_ENV = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
 
 #: §2.38 (b) — THE REVIEW CHILD GETS AN ALLOWLISTED ENVIRONMENT, NOT THE SESSION'S WHOLE ONE.
 #:
@@ -1158,7 +1169,7 @@ def _claude_attempt(
         # HERE, after the filter, so no allowlist edit can drop it (a reviewer without it
         # dispatches reviews: the SessionStart `--full` hook fires in every one).
         child_env = {**_review_child_env("claude"), REVIEW_SUBPROCESS_ENV: "1",
-                     CLAUDE_NO_CONNECTORS_ENV: "false"}
+                     CLAUDE_NO_CONNECTORS_ENV: "false", CLAUDE_NO_BACKGROUND_ENV: "1"}  # §7043
         # §3.44 M7 — see CLAUDE_CACHE_PIN_ENV.
         if (os.environ.get(REVIEW_CACHE_TTL_ENV) or "").strip() != "default":
             child_env[CLAUDE_CACHE_PIN_ENV] = "1"
@@ -1564,6 +1575,11 @@ def _credits_meta(doc) -> tuple[dict | None, str]:
     owner = doc.get("owner_uid")
     if owner is not None and (type(owner) is not int or owner < 0):
         return None, "owner_uid"
+    # §7040 — every key's deadline offset unless the key names its own (see CREDITS_DEADLINE_DAYS). Both appear in
+    # the result only when set, so a keyring without them loads exactly as before §7040.
+    deadline = doc.get("deadline_days", CREDITS_DEADLINE_DAYS)
+    if not _credits_days_ok(deadline):
+        return None, "deadline_days"
     keys = doc.get("keys", [])
     if not isinstance(keys, list):
         return None, "keys"
@@ -1592,9 +1608,18 @@ def _credits_meta(doc) -> tuple[dict | None, str]:
         org_id = key.get("org_id")
         if org_id is not None and (not isinstance(org_id, str) or not org_id):
             return None, f"keys[{i}].org_id"
-        out.append({"label": label, "enabled": enabled, "renews": renews, "org": org, "org_id": org_id})
-    return {"version": 1, "grant_usd": grant, "repos": list(repos), "writers": list(writers),
-            "owner_uid": owner, "keys": out}, ""
+        days = key.get("deadline_days", deadline)
+        if not _credits_days_ok(days):
+            return None, f"keys[{i}].deadline_days"
+        entry = {"label": label, "enabled": enabled, "renews": renews, "org": org, "org_id": org_id}
+        if days != CREDITS_DEADLINE_DAYS:
+            entry["deadline_days"] = days
+        out.append(entry)
+    meta = {"version": 1, "grant_usd": grant, "repos": list(repos), "writers": list(writers),
+            "owner_uid": owner, "keys": out}
+    if "deadline_days" in doc:
+        meta["deadline_days"] = deadline
+    return meta, ""
 
 
 def _load_keyring(path_to_dir, want_uid: int | None = None) -> tuple[dict | None, str]:
@@ -1805,10 +1830,52 @@ def _cycle_bounds(renews: str, now: datetime) -> tuple[datetime, datetime]:
     return _credits_boundary(prev[0], prev[1], day), here
 
 
+#: §7040 — a key's DEADLINE, kept apart from its expiry date (`renews`, the date the Console shows): the pool counts
+#: the old cycle until this many whole days after that date's 00:00 UTC. The operator, 2026-10-15: "an expiry date
+#: UTC 00:00 + 1 whole day". Measured 2026-10-16 (runbook §8): a credit ends AT 00:00 UTC on that date, so the
+#: default 0 matches it; with a day, each key's first try on its expiry date fails and parks it to the deadline.
+#: The keyring's top-level `deadline_days` is every key's default and a
+#: key's own `deadline_days` overrides it; 0 (no field) is the expiry date itself, as before §7040. At most ONE day:
+#: `_journal_scan` reads `now`'s UTC month and the one before, and a shift of two or more days can start a cycle on
+#: Jan 30 or 31 that is still running on Mar 1 or 2, outside that read (a sweep of every expiry day x 0-27 days x
+#: every 12 h of 2025-2030 found no such case at 0 or 1). A longer deadline needs a three-month read first.
+CREDITS_DEADLINE_DAYS = 0
+_CREDITS_DEADLINE_MAX = 1
+
+
+def _credits_days_ok(value) -> bool:
+    """A deadline offset: an int (never a bool) in [0, _CREDITS_DEADLINE_MAX] whole days."""
+    return type(value) is int and 0 <= value <= _CREDITS_DEADLINE_MAX
+
+
+def _credits_cycle(key: dict, now: datetime) -> tuple[datetime, datetime]:
+    """§7040 — the cycle [start, end) the pool counts for `key` (a `_credits_meta` key) at `now`: its expiry cycle
+    (`_cycle_bounds` on `renews`) moved by its `deadline_days`, so it ends at the deadline. The whole cycle moves; it
+    is never re-anchored on another day of the month, which keeps every month exact (expiry day 30 with one day:
+    Feb 28 -> Mar 1, where an anchor on day 31 would clamp to Feb 28). `now` is taken in UTC first, so a zone's
+    daylight-saving change never makes the day 23 or 25 hours. Raises ValueError as `_cycle_bounds` does, and for a
+    `deadline_days` `_credits_meta` would refuse, so `_pick_key` skips that key rather than failing the pick."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    days = key.get("deadline_days", CREDITS_DEADLINE_DAYS)
+    if not _credits_days_ok(days):
+        raise ValueError(f"deadline_days is not a whole number of days in 0-{_CREDITS_DEADLINE_MAX}: {days!r}")
+    shift = timedelta(days=days)
+    start, end = _cycle_bounds(key.get("renews"), now.astimezone(timezone.utc) - shift)
+    return start + shift, end + shift
+
+
+def _credits_lapse(key: dict, end: datetime) -> datetime:
+    """§7040 — 00:00 UTC on the expiry date of the `_credits_cycle` ending at `end`: its deadline less the key's
+    `deadline_days`. [lapse, end) is when the credit is due to end; with no deadline days it is empty."""
+    return end - timedelta(days=key.get("deadline_days", CREDITS_DEADLINE_DAYS))
+
+
 def _pick_key(meta, states, now) -> str | None:
     """§3.44 M5 — the label to pay from: None unless the pool is `ok`; else, over keys enabled in
-    `meta` whose state is `usable`, the minimum by (cycle end, label) — the credits that expire
-    soonest are spent first, one key drained before the next. Deterministic, so every UNIX user
+    `meta` whose state is `usable`, the minimum by (cycle end, label) — the soonest deadline (§7040:
+    the expiry date when none is set) is spent first, one key drained before the next.
+    Deterministic, so every UNIX user
     and lane picks the same key with no shared pointer. Never raises (None).
     """
     try:
@@ -1824,7 +1891,7 @@ def _pick_key(meta, states, now) -> str | None:
             if state.get("state") != "usable":
                 continue
             try:
-                end = _cycle_bounds(key.get("renews"), now)[1]
+                end = _credits_cycle(key, now)[1]
             except (TypeError, ValueError):
                 continue
             if best is None or (end, label) < best:
@@ -2093,8 +2160,10 @@ def _journal_scan(path_to_dir, now, users=None) -> tuple[list[dict], list[str]]:
     would have made for that owner — so a shard a member planted under another user's name is
     skipped (`wrong owner`), as is any hand-made shard named for no user on this box.
 
-    Two months always hold the current billing cycle, whose start is at most a month back. Older
-    events are never read, so every state built on them lasts at most that long (see `_key_states`).
+    Two months always hold the current billing cycle, whose start is at most a month back (§7040: a
+    deadline moves it one day at most, which keeps it in the month before `now`'s; see
+    `_CREDITS_DEADLINE_MAX`). Older events are never read, so every state built on them lasts at most
+    that long (see `_key_states`).
 
     §3.48 (O9): `users`, a set of shard-name users, reads only their shards; any other shard is
     left out silently, not named as a problem. The key vending machine reads its own shard only,
@@ -2284,7 +2353,8 @@ def _credits_pool(meta, timed, now) -> tuple[dict, str | None]:
       cycle and no ok end anywhere in it. A credit fault reads the same whether the key is spent or
       the credits do not cover this use, and two keys failing before either worked is the second.
       The trigger is the second key's first fault, so a third key mints no new alert. A fault in
-      the first 36 hours of its key's cycle never counts (D1: it may predate the grant).
+      the first 36 hours of its key's cycle never counts (D1: it may predate the grant), nor one
+      from its expiry date to its deadline (§7040: that is the credit ending on schedule).
     paused (unknown-streak): a pause begins at the second of two unknown-or-timeout end events in
       a row, pool-wide; it lasts an hour, and any other end after it lifts it. D7: the NEXT pause
       needs two more in a row after this one began — a lapsed pause plus one more unexplained
@@ -2294,7 +2364,8 @@ def _credits_pool(meta, timed, now) -> tuple[dict, str | None]:
       trigger is that third pause's start, so it alerts once.
     Order: credit-breaker, unknown-repeat, paused.
     """
-    cycles = {k["label"]: _cycle_bounds(k["renews"], now) for k in meta["keys"]}
+    cycles = {k["label"]: _credits_cycle(k, now) for k in meta["keys"]}
+    lapses = {k["label"]: _credits_lapse(k, cycles[k["label"]][1]) for k in meta["keys"]}
     reset_at = None
     ends = []
     for t, event in timed:
@@ -2309,7 +2380,7 @@ def _credits_pool(meta, timed, now) -> tuple[dict, str | None]:
     for t, event in live:
         label = event["key"]
         settled = _credits_plus(cycles[label][0], _CREDITS_RENEW_GRACE_S)
-        if event.get("class") == "credit" and t >= settled and label not in worked:
+        if event.get("class") == "credit" and settled <= t < lapses[label] and label not in worked:
             first.setdefault(label, t)
     if len(first) >= 2:
         trigger = sorted(first.values())[1]
@@ -2348,7 +2419,7 @@ def _credits_next_month(when: datetime) -> datetime:
     return datetime(year, month, 1, tzinfo=timezone.utc)
 
 
-def _credits_over_grant(label: str, renews: str, timed: list, limit: decimal.Decimal) -> bool:
+def _credits_over_grant(key: dict, timed: list, limit: decimal.Decimal) -> bool:
     """D2/D3 — True while the key's over-grant tripwire is latched. Walks its end events oldest
     first, adding each one's `usd` to its OWN cycle's running total (a new cycle starts the total
     at 0). The tripwire fires when a total reaches `limit` and then STAYS fired across cycle rolls
@@ -2356,7 +2427,9 @@ def _credits_over_grant(label: str, renews: str, timed: list, limit: decimal.Dec
     clears it and rebases the total: only spend after R counts again. A reset made before any
     firing changes nothing for the tripwire. Only events in the journal read window are seen,
     so a crossing older than the two months `_journal_read` covers no longer latches anything.
-    Ties: an end at the reset's own second is before the reset."""
+    Ties: an end at the reset's own second is before the reset. Cycles are the pool's (`_credits_cycle`)
+    under the key's deadline NOW, so a deadline change regroups past ends (runbook §8)."""
+    label = key["label"]
     rows = []
     for index, (t, event) in enumerate(timed):
         ev = event.get("ev")
@@ -2373,7 +2446,7 @@ def _credits_over_grant(label: str, renews: str, timed: list, limit: decimal.Dec
             if fired:
                 fired, total = False, decimal.Decimal(0)
             continue
-        cycle = _cycle_bounds(renews, t)[0]
+        cycle = _credits_cycle(key, t)[0]
         if cycle != total_cycle:
             total_cycle, total = cycle, decimal.Decimal(0)
         usd = _credits_usd(event.get("usd"))
@@ -2386,8 +2459,9 @@ def _credits_over_grant(label: str, renews: str, timed: list, limit: decimal.Dec
 def _credits_key_state(key: dict, timed: list, now: datetime, grant: decimal.Decimal, current_fp) -> dict:
     """One key's entry in `_key_states` (see there for the rules)."""
     label = key["label"]
-    start, end = _cycle_bounds(key["renews"], now)
+    start, end = _credits_cycle(key, now)
     settled = _credits_plus(start, _CREDITS_RENEW_GRACE_S)  # D1: [start, settled) is renewal day
+    lapse = _credits_lapse(key, end)  # §7040: [lapse, end) runs from the expiry date to the deadline
     reset_at = None
     for t, event in timed:
         if event.get("ev") == "reset" and event.get("scope") == label:
@@ -2396,7 +2470,7 @@ def _credits_key_state(key: dict, timed: list, now: datetime, grant: decimal.Dec
     runs = oks = review_oks = 0  # review_oks: §3.48 (O7) — `early` reads reviews' oks only
     fp = None
     start_fp: dict = {}
-    credit = None  # (spend, review ok ends) at the first credit fault this cycle that counts
+    credit = None  # (spend, review ok ends, time) at the first credit fault this cycle that counts
     auth = None    # (run id,) of the last auth fault that counts
     limit = None   # D5: when the latest spend_limit fault's park lifts (the next month's 1st)
     cool = None    # (until, reason) of the cool that counts and ends last
@@ -2429,7 +2503,7 @@ def _credits_key_state(key: dict, timed: list, now: datetime, grant: decimal.Dec
             if not lane:
                 rest = (_credits_plus(t, _CREDITS_RENEW_COOL_S), "credit-renewal")  # D1: no park, no early
         elif cls == "credit" and here and credit is None:
-            credit = (spend, review_oks)
+            credit = (spend, review_oks, t)
         elif cls == "auth":
             auth = (_credits_text(event, "id"),)
         elif cls == "spend_limit":
@@ -2441,14 +2515,15 @@ def _credits_key_state(key: dict, timed: list, now: datetime, grant: decimal.Dec
         # end the hour early.
         if rest is not None and (cool is None or rest[0] >= cool[0]):
             cool = rest
-    over_grant = _credits_over_grant(label, key["renews"], timed, grant * _CREDITS_OVER)
+    over_grant = _credits_over_grant(key, timed, grant * _CREDITS_OVER)
     # The auth park lifts on a KNOWN rotation only. One TRUE row: the faulting run's fingerprint is
     # known, the key file's current one is known, and they differ. A missing start event, fp or
     # key file keeps the park (fail closed: the next attempt would fail the same way) — while the
     # fault is still in the two-month journal read; past it the key is tried again (D6).
     bad = start_fp.get(auth[0]) if auth is not None and auth[0] is not None else None
     rotated = bool(bad) and isinstance(current_fp, str) and bool(current_fp) and current_fp != bad
-    early = credit is not None and credit[1] == 0 and credit[0] < grant * _CREDITS_EARLY
+    # §7040: a first fault on or after the expiry date is the credit ending on schedule, never early.
+    early = credit is not None and credit[2] < lapse and credit[1] == 0 and credit[0] < grant * _CREDITS_EARLY
     if key.get("enabled", True) is not True:
         state, reason, until = "off", None, None
     elif over_grant:
@@ -2491,7 +2566,9 @@ def _key_states(meta, events, now, fps=None) -> dict:
                 from the faulting run's (its start event, joined by id)
       parked    credit: a credit fault this cycle more than 36 hours after its start, until the
                 cycle ends. `early`: no ok end before it and spend at it < 0.5 x grant_usd — the
-                credits stopped long before the grant
+                credits stopped long before the grant. §7040: the cycle ends at the key's deadline,
+                and a first fault from its expiry date on is the credit ending on schedule: parked
+                to the deadline, never early
       parked    spend-limit: a spend_limit fault (the Console's monthly limit), until 00:00 UTC on
                 the 1st of the calendar month after it (D5)
       cooling   credit-renewal: a credit fault in the first 36 hours of the cycle, when the grant

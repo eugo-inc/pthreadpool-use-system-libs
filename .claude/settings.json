@@ -72,6 +72,15 @@
             "timeout": 20
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-prompt-context.sh",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -81,6 +90,20 @@
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-prompt-context.sh",
             "timeout": 30
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "eugo-kb",
+            "tool": "athena_report_counts",
+            "input": {
+              "origin_repo": "pthreadpool-use-system-libs",
+              "session": "${session_id}"
+            },
+            "timeout": 15
           }
         ]
       }
@@ -132,6 +155,29 @@
       }
     ],
     "PostModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-prompt-context.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "rate_limit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/eugo-prompt-context.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
       {
         "hooks": [
           {

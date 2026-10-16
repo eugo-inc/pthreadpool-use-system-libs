@@ -8,6 +8,13 @@ an entry below.
 
 ## Upgrade notes
 
+- **2026-10-16 §2.102 (CODE.md v1.0.4 → v1.0.5)** — C16 (operator rulings 2026-10-15 and 2026-10-16): on a shared
+  multi-account host, files are created group-writable (`umask 0002`), a new clone is `core.sharedRepository group`,
+  git's "dubious ownership" refusal is answered with `safe.directory`, nothing is created there as root, and private
+  files and read-only pinned trees are left alone. Measured on athena's box: a fast-forward run as one account stopped
+  halfway on a Permission-denied unlink, in a 2755 folder another account had created under umask 022. New ID; none
+  changed (F12). ⚠ CODE.md grows 1,140 -> ~1,220 words (`wc -w`), past F11's ~1,100 cap: not split here, since C16
+  is one conditional rule under CODE.md's existing trigger; the split owed under `## Parked` now carries C16 too.
 - **2026-10-14 §7308 (REPORT.md v1.2.7 → v1.2.8)** — R7f (§2.98, operator ruling 2026-10-13): a NEXT line whose
   delivery is blocked says `(blocked)` after its owner, `NEXT-2 (operator) (blocked): …`; its backlog body names
   the blocker and why, to central principle 2's bar (the exact command or input, the verbatim error, the mechanism,

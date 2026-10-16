@@ -1,4 +1,4 @@
-<!-- guardrails-kit: v1.0.4 (§2919 C11 separates your hunks from another writer's) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
+<!-- guardrails-kit: v1.0.5 (§2.102 C16 files on a shared multi-account host stay group-writable) | Editing this file? Read .claude/docs/guardrails/_FORMAT.md first. Never paraphrase kit text. -->
 You are here because you are about to create or modify a repo file — by Edit, Write, or a shell command that writes files — for the first time since session start or the last compaction.
 
 Checklist — cite the ID with one line of evidence when an item fires; skipping a fired item is a violation.
@@ -8,6 +8,11 @@ Before the FIRST edit of each file:
 - C2. Generated/vendored check: path contains dist/, build/, out/, gen/, .next/, target/, node_modules/, vendor/, coverage/, *.min.*, or a lockfile (package-lock.json, yarn.lock, pnpm-lock.yaml, poetry.lock, Cargo.lock) — or the first 10 lines say "DO NOT EDIT"/"@generated"? Do not edit -> find the source or generator, change that, re-run the generator, and name the generator command.
 - C3. Twin check: Grep the target file/symbol name repo-wide before the first edit. More than one hit defines it? List all candidates and paste the evidence for the live one (the import line or stack frame pointing at it).
 - C4. Constraint check: print `CONSTRAINT CHECK: <path> — none apply` or `CONSTRAINT CHECK: <path> — matches '<constraint>', skipping/asking` (against your task-widget Constraints, or .claude/docs/guardrails/STATE.md `## Constraints` if the task spans a compaction — STATE.md then needed but missing? create it per .claude/docs/guardrails/SESSION.md S2). This format is owned here; other docs point to C4.
+- C16. Shared multi-account host (group-owned checkout, setgid `2775` folders)? Before creating files there:
+    1. run `umask` -> must print `0002`, else prefix the command with `umask 0002 &&`.
+    2. new clone -> `git config core.sharedRepository group`; "dubious ownership" -> `git config --global --add safe.directory <checkout>`.
+    3. never as root by hand (sudo, a bare container exec) -> run as your own account: root starts at umask 0022.
+    4. private files (`.env`, tokens, keys) and read-only pinned trees -> leave their modes alone.
 
 While editing:
 - C5. Unfamiliar or third-party API with 2+ arguments: paste its real signature (from installed sources/type stubs, `python -c "import inspect,M; print(inspect.signature(M.fn))"`, node_modules/**/*.d.ts, or official docs) before writing the call. Cannot produce it? -> instead: write `SIGNATURE UNVERIFIED: <fn>` and either pick an API whose signature you can paste, or stop and ask the user for the docs. (Compressed as athena's CLAUDE.md iron rule 4.)
